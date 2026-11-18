@@ -16,6 +16,7 @@ h2{font-size:15px}
 input[type=search]{width:100%;height:40px;padding:0 14px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg);font:inherit}
 input[type=search]:focus{outline:2px solid var(--accent);outline-offset:-1px}
 main{padding:20px 0 40px}
+.note{margin:12px auto 0;padding:10px 16px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--muted)}
 .sub{color:var(--muted);margin:6px 0 18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px}
 .tabs{display:flex;gap:6px;margin:0 0 12px;flex-wrap:wrap}

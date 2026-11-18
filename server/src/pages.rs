@@ -136,6 +136,17 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
             r#"<header class="top"><div class="wrap"><a class="logo" href="/" aria-label="{SITE} home">{LOGO}<span>plain<b>screener</b></span></a><form action="/search" role="search"><input type="search" name="q" placeholder="Search token, pair or address" aria-label="Search tokens, pairs and addresses" autocomplete="off" enterkeyhint="search"></form></div></header>"#
         )
     };
+    // While the indexer replays history, say so instead of passing old data off as live.
+    let head = app.sh.state.read().map(|s| s.head_ts).unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let header = if !h.embed && now > head as u64 + 600 {
+        let at = if head == 0 { "the start".to_string() } else { s(|o| fmt::date_year(o, head as i64)) };
+        format!(
+            r#"{header}<p class="note wrap">Still replaying Base history, now at {at}. Prices and lists here are from that day until the indexer reaches the present.</p>"#
+        )
+    } else {
+        header
+    };
     let footer = if h.embed {
         String::new()
     } else {
