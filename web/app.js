@@ -12,6 +12,18 @@ document.addEventListener('click', (e) => {
   })
 })
 
+// Theme: follows the system until picked here; the choice is applied before paint by
+// an inline script in <head>.
+$('.theme')?.addEventListener('click', () => {
+  const r = document.documentElement
+  const dark = (r.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')) === 'dark'
+  r.dataset.theme = dark ? 'light' : 'dark'
+  document.querySelectorAll('meta[name=theme-color]').forEach((m) => (m.content = dark ? '#fafafa' : '#000000'))
+  try {
+    localStorage.setItem('theme', r.dataset.theme)
+  } catch {}
+})
+
 const el = $('#chart')
 if (el) chart(el)
 
@@ -38,6 +50,15 @@ async function chart(el) {
   }
   const redraw = () => frame || (frame = requestAnimationFrame(draw))
   const get = (q) => fetch(`/api/candles/${pool}?res=${res}${q}`).then((r) => r.json())
+
+  // Candles that closed while the page sat in a cache: take the latest from the API.
+  async function fill() {
+    const fresh = await get('')
+    if (!fresh.length) return
+    cs = cs.filter((x) => x[0] < fresh[0][0]).concat(fresh)
+    load()
+    redraw()
+  }
 
   async function older() {
     busy = true
@@ -116,7 +137,8 @@ async function chart(el) {
     const c = u.c[res]
     if (c) {
       const last = cs[cs.length - 1]
-      if (last && last[0] === c[0]) cs[cs.length - 1] = c
+      if (last && c[0] > last[0] + res) fill()
+      else if (last && last[0] === c[0]) cs[cs.length - 1] = c
       else if (!last || c[0] > last[0]) cs.push(c)
       load()
       redraw()

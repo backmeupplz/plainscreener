@@ -17,6 +17,10 @@ h2{font-size:15px;letter-spacing:-.01em}
 .logo svg{width:26px;height:26px}
 .top form{flex:1;max-width:440px;margin-left:auto}
 .gh{color:var(--muted);font-size:14px;white-space:nowrap}
+.theme{flex:none;width:38px;min-height:38px;padding:0;border-radius:10px;background:var(--card)}
+.theme svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.theme .sun{display:var(--sun)}
+.theme .moon{display:var(--moon)}
 input[type=search]{width:100%;height:38px;padding:0 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);font:inherit;font-size:14px;transition:border-color .15s}
 input[type=search]::placeholder{color:var(--muted)}
 input[type=search]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
@@ -61,6 +65,7 @@ th:first-child,td:first-child,th.l,td.l{text-align:left}
 .pairname small{color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:4px}
 .av{display:inline-flex;align-items:center;justify-content:center;flex:none;width:26px;height:26px;border-radius:50%;background:hsl(var(--h) 55% var(--avbg));color:hsl(var(--h) 70% var(--avfg));font-size:12px;font-weight:650;box-shadow:inset 0 0 0 1px var(--line)}
 .av.lg{width:40px;height:40px;font-size:17px}
+img.av{background:var(--raise);object-fit:cover}
 .u{color:var(--up)}
 .d{color:var(--down)}
 .m{color:var(--muted)}

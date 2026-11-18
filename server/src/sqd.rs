@@ -48,7 +48,10 @@ struct Tx {
 
 impl Sqd {
     pub fn new(url: &str) -> Sqd {
-        Sqd { url: format!("{url}/stream"), http: reqwest::Client::new() }
+        Sqd {
+            url: format!("{url}/stream"),
+            http: reqwest::Client::new(),
+        }
     }
 
     /// Our logs in `[from, to]`, ordered, with block timestamps and transaction senders.
@@ -71,7 +74,14 @@ impl Sqd {
                     {"address": [hex(&V4_POOL_MANAGER)], "topic0": topics(T.v4()), "transaction": true}
                 ]
             });
-            let resp = match self.http.post(&self.url).json(&body).timeout(Duration::from_secs(120)).send().await {
+            let resp = match self
+                .http
+                .post(&self.url)
+                .json(&body)
+                .timeout(Duration::from_secs(120))
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("sqd {next}: {e}");
@@ -94,16 +104,28 @@ impl Sqd {
             let mut last = None;
             for line in text.lines().filter(|l| !l.is_empty()) {
                 let b: Block = serde_json::from_str(line).context("sqd block")?;
-                let senders: HashMap<u32, &str> = b.transactions.iter().map(|t| (t.transaction_index, t.from.as_str())).collect();
+                let senders: HashMap<u32, &str> = b
+                    .transactions
+                    .iter()
+                    .map(|t| (t.transaction_index, t.from.as_str()))
+                    .collect();
                 for l in &b.logs {
                     out.push(RawLog {
                         block: b.header.number,
                         ts: b.header.timestamp,
                         index: l.log_index,
-                        address: unhex(&l.address).and_then(|a| a.try_into().ok()).context("log address")?,
-                        topics: l.topics.iter().filter_map(|t| unhex(t)?.try_into().ok()).collect(),
+                        address: unhex(&l.address)
+                            .and_then(|a| a.try_into().ok())
+                            .context("log address")?,
+                        topics: l
+                            .topics
+                            .iter()
+                            .filter_map(|t| unhex(t)?.try_into().ok())
+                            .collect(),
                         data: unhex(&l.data).unwrap_or_default(),
-                        tx: unhex(&l.transaction_hash).and_then(|h| h.try_into().ok()).context("tx hash")?,
+                        tx: unhex(&l.transaction_hash)
+                            .and_then(|h| h.try_into().ok())
+                            .context("tx hash")?,
                         from: senders
                             .get(&l.transaction_index)
                             .and_then(|f| unhex(f)?.try_into().ok())

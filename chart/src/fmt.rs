@@ -2,7 +2,9 @@
 //! Written without `core::fmt` so the wasm stays small.
 
 const SUB: [&str; 10] = ["₀", "₁", "₂", "₃", "₄", "₅", "₆", "₇", "₈", "₉"];
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 pub fn uint(out: &mut String, mut n: u64) {
     let mut buf = [0u8; 20];
@@ -137,7 +139,13 @@ pub fn compact(out: &mut String, x: f64) {
         x if x >= 1.0 || x == 0.0 => (x, ""),
         x => return price_sig(out, x, 2),
     };
-    let d = if v >= 100.0 || (unit.is_empty() && v.fract() == 0.0) { 0 } else if v >= 10.0 { 1 } else { 2 };
+    let d = if v >= 100.0 || (unit.is_empty() && v.fract() == 0.0) {
+        0
+    } else if v >= 10.0 {
+        1
+    } else {
+        2
+    };
     fixed(out, v, d);
     out.push_str(unit);
 }
@@ -163,7 +171,13 @@ pub fn pct(out: &mut String, r: f64) {
     if a >= 10_000.0 {
         compact(out, a);
     } else {
-        let d = if a >= 100.0 { 0 } else if a >= 10.0 { 1 } else { 2 };
+        let d = if a >= 100.0 {
+            0
+        } else if a >= 10.0 {
+            1
+        } else {
+            2
+        };
         fixed(out, a, d);
     }
     out.push('%');

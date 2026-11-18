@@ -1,10 +1,13 @@
 //! Share images: the same chart as the page, rasterized with resvg.
 
 use crate::model::RES;
-use crate::pages::{Esc, LOGO, PALETTE, change, chart_css, chart_data, default_res, metrics, price_parts};
+use crate::pages::{
+    Esc, LOGO, PALETTE, change, chart_css, chart_data, default_res, metrics, price_parts,
+};
 use crate::state::State;
 use crate::store::Store;
 use anyhow::{Context, Result};
+use base64::Engine;
 use chart::fmt;
 use resvg::{tiny_skia, usvg};
 use std::fmt::Write;
@@ -19,23 +22,60 @@ static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
 });
 
 fn dark(name: &str) -> String {
-    PALETTE.iter().find(|(n, ..)| *n == name).map(|(.., d)| d.to_string()).unwrap_or_default()
+    PALETTE
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(.., d)| d.to_string())
+        .unwrap_or_default()
 }
 
-pub fn png(svg: &str) -> Result<Vec<u8>> {
-    let opt = usvg::Options { fontdb: FONTS.clone(), font_family: "Inter".into(), ..Default::default() };
-    let tree = usvg::Tree::from_str(svg, &opt).context("parse svg")?;
+fn options() -> usvg::Options<'static> {
+    usvg::Options {
+        fontdb: FONTS.clone(),
+        font_family: "Inter".into(),
+        // Images come only from data URLs we put there, never from files.
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    }
+}
+
+fn render(svg: &str) -> Result<tiny_skia::Pixmap> {
+    let tree = usvg::Tree::from_str(svg, &options()).context("parse svg")?;
     let size = tree.size().to_int_size();
     let mut pix = tiny_skia::Pixmap::new(size.width(), size.height()).context("pixmap")?;
     resvg::render(&tree, tiny_skia::Transform::default(), &mut pix.as_mut());
-    pix.encode_png().context("encode png")
+    Ok(pix)
+}
+
+pub fn png(svg: &str) -> Result<Vec<u8>> {
+    render(svg)?.encode_png().context("encode png")
+}
+
+/// Redraws an untrusted PNG, JPEG, GIF, WebP or SVG as a `size` px square PNG (cropped
+/// to fill). `None` when it isn't an image, is huge, or draws nothing.
+pub fn icon_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
+    if imagesize::blob_size(bytes).is_ok_and(|d| d.width > 4096 || d.height > 4096) {
+        return None;
+    }
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let pix = render(&format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{size}" height="{size}"><image xlink:href="data:text/plain;base64,{data}" width="{size}" height="{size}" preserveAspectRatio="xMidYMid slice"/></svg>"#
+    ))
+    .ok()?;
+    if !pix.pixels().iter().any(|p| p.alpha() > 0) {
+        return None;
+    }
+    pix.encode_png().ok()
 }
 
 fn frame(w: u32, h: u32, body: &str) -> String {
     let css = chart_css(dark);
     format!(
         // Same backdrop as the site's hero: a faint 48 px grid fading out from the top.
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{FONT}"><style>{css}.fg{{fill:{fg}}}.mu{{fill:{mu}}}.up{{fill:{up}}}.dn{{fill:{dn}}}</style><defs><pattern id="gp" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="#ffffff" stroke-opacity="0.045"/></pattern><radialGradient id="gf" cx="0.5" cy="0.25" r="0.75"><stop offset="0.3" stop-color="#fff"/><stop offset="1" stop-color="#000"/></radialGradient><mask id="gm"><rect width="{w}" height="{h}" fill="url(#gf)"/></mask></defs><rect width="{w}" height="{h}" fill="{bg}"/><rect width="{w}" height="{h}" fill="url(#gp)" mask="url(#gm)"/>{body}</svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{FONT}"><style>{css}.fg{{fill:{fg}}}.mu{{fill:{mu}}}.up{{fill:{up}}}.dn{{fill:{dn}}}</style><defs><pattern id="gp" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="#ffffff" stroke-opacity="0.045"/></pattern><radialGradient id="gf" cx="0.5" cy="0.25" r="0.75"><stop offset="0.3" stop-color="#fff"/><stop offset="1" stop-color="#000"/></radialGradient><mask id="gm"><rect width="{w}" height="{h}" fill="url(#gf)"/></mask></defs><rect width="{w}" height="{h}" fill="{bg}"/><rect width="{w}" height="{h}" fill="url(#gp)" mask="url(#gm)"/>{body}</svg>"##,
         fg = dark("fg"),
         mu = dark("muted"),
         up = dark("up"),
@@ -45,7 +85,11 @@ fn frame(w: u32, h: u32, body: &str) -> String {
 }
 
 fn logo(x: u32, y: u32, size: u32) -> String {
-    LOGO.replacen("<svg ", &format!(r#"<svg x="{x}" y="{y}" width="{size}" height="{size}" "#), 1)
+    LOGO.replacen(
+        "<svg ",
+        &format!(r#"<svg x="{x}" y="{y}" width="{size}" height="{size}" "#),
+        1,
+    )
 }
 
 /// A pair card: name, price, change, key numbers and the 1 h chart.
@@ -60,12 +104,27 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let _ = write!(
         b,
         r#"{logo}<text x="128" y="96" font-size="54" font-weight="600" letter-spacing="-1.6" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="72" font-weight="600" letter-spacing="-2.4" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
-        logo = logo(56, 44, 56),
+        logo = match store
+            .icons
+            .get(st.tokens[pool.base() as usize].addr)
+            .ok()
+            .flatten()
+            .filter(|v| v.len() > 4)
+        {
+            Some(icon) => format!(
+                r#"<defs><clipPath id="ic"><circle cx="84" cy="72" r="28"/></clipPath></defs><image x="56" y="44" width="56" height="56" clip-path="url(#ic)" xlink:href="data:image/png;base64,{}"/>"#,
+                base64::engine::general_purpose::STANDARD.encode(&icon)
+            ),
+            None => logo(56, 44, 56),
+        },
         base = sym(pool.base()),
         quote = sym(pool.quote()),
         right = w - 56,
         price = match price_parts(st, p, &m) {
-            (n, Some(unit)) => format!(r#"{n}<tspan dx="12" font-size="32" font-weight="400" class="mu">{}</tspan>"#, Esc(unit)),
+            (n, Some(unit)) => format!(
+                r#"{n}<tspan dx="12" font-size="32" font-weight="400" class="mu">{}</tspan>"#,
+                Esc(unit)
+            ),
             (n, None) => n,
         },
         dex = pool.dex(),

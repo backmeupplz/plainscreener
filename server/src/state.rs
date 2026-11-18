@@ -52,13 +52,42 @@ pub struct State {
 
 impl State {
     pub fn load(store: &Store) -> Result<State> {
-        let mut s = State { tokens: store.load_tokens()?, pools: store.load_pools()?, ..Default::default() };
-        s.token_ix = s.tokens.iter().enumerate().map(|(i, t)| (t.addr, i as u32)).collect();
-        s.pool_ix = s.pools.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
+        let mut s = State {
+            tokens: store.load_tokens()?,
+            pools: store.load_pools()?,
+            ..Default::default()
+        };
+        s.token_ix = s
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.addr, i as u32))
+            .collect();
+        for g in store.icons.range::<&[u8], _>(..) {
+            let (k, v) = g.into_inner()?;
+            if v.len() > 4
+                && let Some(&t) = <[u8; 20]>::try_from(&*k)
+                    .ok()
+                    .and_then(|a| s.token_ix.get(&a))
+            {
+                s.tokens[t as usize].icon = true;
+            }
+        }
+        s.pool_ix = s
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, i as u32))
+            .collect();
         s.head_ts = store.cursor()?.map(|(_, ts)| ts).unwrap_or(0);
         // Rebuild 24 h stats from stored 1 m and 1 h candles.
         let now = s.head_ts;
-        for (i, _) in s.pools.iter().enumerate().filter(|(_, p)| p.last_ts + 86_400 > now) {
+        for (i, _) in s
+            .pools
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.last_ts + 86_400 > now)
+        {
             let st = s.stats.entry(i as u32).or_insert_with(Stats::new);
             for (ri, span) in [(0, 3600), (3, 86_400)] {
                 for (t, c) in store.candles(i as u32, ri, now.saturating_sub(span), now + 1, 60) {
@@ -99,6 +128,7 @@ impl State {
             ref_pool: NONE,
             best_pool: NONE,
             first_block: block,
+            icon: false,
         });
         self.token_ix.insert(addr, idx);
         self.dirty_tokens.insert(idx);
@@ -129,7 +159,9 @@ impl State {
 
     /// USD value of a pool's quote-side balance (0 when unknown).
     fn quote_liq(&self, p: u32) -> f64 {
-        let Some(pool) = self.pools.get(p as usize) else { return 0.0 };
+        let Some(pool) = self.pools.get(p as usize) else {
+            return 0.0;
+        };
         let v = pool.bal_quote() * self.tokens[pool.quote() as usize].usd;
         if v.is_finite() { v } else { 0.0 }
     }
@@ -141,13 +173,28 @@ impl State {
     }
 
     pub fn apply(&mut self, log: &RawLog, store: &Store) {
-        let Some((id, ev)) = abi::decode(log) else { return };
+        let Some((id, ev)) = abi::decode(log) else {
+            return;
+        };
         let ts = log.ts;
         self.head_ts = self.head_ts.max(ts);
-        if let Event::Created { kind, token0, token1, fee, sqrt_price, origin, .. } = ev {
-            return self.create(id, kind, token0, token1, fee, sqrt_price, origin, log.block, ts);
+        if let Event::Created {
+            kind,
+            token0,
+            token1,
+            fee,
+            sqrt_price,
+            origin,
+            ..
+        } = ev
+        {
+            return self.create(
+                id, kind, token0, token1, fee, sqrt_price, origin, log.block, ts,
+            );
         }
-        let Some(&p) = self.pool_ix.get(&id) else { return };
+        let Some(&p) = self.pool_ix.get(&id) else {
+            return;
+        };
         let (s0, s1) = {
             let pool = &self.pools[p as usize];
             (self.scale(pool.token0), self.scale(pool.token1))
@@ -159,11 +206,20 @@ impl State {
                 pool.bal1 = r1 / s1;
             }
             Event::SwapV2 { d0, d1 } => self.trade(p, log, ts, d0 / s0, d1 / s1, store),
-            Event::SwapCl { d0, d1, sqrt_price, fee } => {
+            Event::SwapCl {
+                d0,
+                d1,
+                sqrt_price,
+                fee,
+            } => {
                 let (d0, d1) = (d0 / s0, d1 / s1);
                 // LP fees stay in the pool until withdrawn; v4 withdrawals don't report
                 // them, so leave them out of v4 balances. v3 Collect includes them.
-                let keep = if pool.kind == Kind::V4 { 1.0 - fee as f64 / 1e6 } else { 1.0 };
+                let keep = if pool.kind == Kind::V4 {
+                    1.0 - fee as f64 / 1e6
+                } else {
+                    1.0
+                };
                 pool.bal0 += if d0 > 0.0 { d0 * keep } else { d0 };
                 pool.bal1 += if d1 > 0.0 { d1 * keep } else { d1 };
                 pool.sqrt_price = sqrt_price;
@@ -173,7 +229,11 @@ impl State {
                 pool.bal0 += d0 / s0;
                 pool.bal1 += d1 / s1;
             }
-            Event::Modify { tick_lower, tick_upper, liquidity } => {
+            Event::Modify {
+                tick_lower,
+                tick_upper,
+                liquidity,
+            } => {
                 let (a0, a1) = amounts(pool.sqrt_price / Q96, tick_lower, tick_upper, liquidity);
                 pool.bal0 += a0 / s0;
                 pool.bal1 += a1 / s1;
@@ -184,8 +244,22 @@ impl State {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn create(&mut self, id: Id, kind: Kind, t0: Addr, t1: Addr, fee: u32, sqrt: f64, origin: Addr, block: u32, ts: u32) {
-        let (Some(&token0), Some(&token1)) = (self.token_ix.get(&t0), self.token_ix.get(&t1)) else { return };
+    fn create(
+        &mut self,
+        id: Id,
+        kind: Kind,
+        t0: Addr,
+        t1: Addr,
+        fee: u32,
+        sqrt: f64,
+        origin: Addr,
+        block: u32,
+        ts: u32,
+    ) {
+        let (Some(&token0), Some(&token1)) = (self.token_ix.get(&t0), self.token_ix.get(&t1))
+        else {
+            return;
+        };
         if self.pool_ix.contains_key(&id) || token0 == token1 {
             return;
         }
@@ -246,14 +320,24 @@ impl State {
                     if let Some((pt, pc)) = previous
                         && self.dirty_candles.contains(&(p, ri))
                     {
-                        self.closed_candles.push((candle_key(p, ri, *pt), pc.encode()));
+                        self.closed_candles
+                            .push((candle_key(p, ri, *pt), pc.encode()));
                     }
                     Some(store.candles.get(candle_key(p, ri, t)).ok().flatten())
                 }
             };
-            let entry = self.candles.entry((p, ri)).or_insert((t, Candle::default()));
+            let entry = self
+                .candles
+                .entry((p, ri))
+                .or_insert((t, Candle::default()));
             if let Some(stored) = open {
-                let o = |prev: f64, cur: f64| if prev.is_finite() && prev > 0.0 { prev } else { cur };
+                let o = |prev: f64, cur: f64| {
+                    if prev.is_finite() && prev > 0.0 {
+                        prev
+                    } else {
+                        cur
+                    }
+                };
                 let mut c = Candle::open(o(prev_usd, usd), o(prev_native, native));
                 if let Some(b) = stored {
                     c = Candle::decode(&b);
@@ -264,7 +348,10 @@ impl State {
             self.dirty_candles.insert((p, ri));
         }
         let open = if prev_usd.is_finite() { prev_usd } else { usd };
-        self.stats.entry(p).or_insert_with(Stats::new).add(ts, open, vol, buy);
+        self.stats
+            .entry(p)
+            .or_insert_with(Stats::new)
+            .add(ts, open, vol, buy);
         let trade = Trade {
             ts,
             tx: log.tx,
@@ -276,7 +363,8 @@ impl State {
             price_usd: usd as f32,
             price_native: native as f32,
         };
-        self.trades.push((trade_key(p, log.block, log.index), trade.encode()));
+        self.trades
+            .push((trade_key(p, log.block, log.index), trade.encode()));
 
         let pool = &mut self.pools[p as usize];
         pool.price_native = native;
@@ -315,10 +403,18 @@ impl State {
     pub fn flush(&mut self, store: &Store, cursor: u32) -> Result<Vec<u32>> {
         let mut b = store.db.batch();
         for p in self.dirty_pools.drain() {
-            b.insert(&store.pools, p.to_be_bytes().to_vec(), self.pools[p as usize].encode());
+            b.insert(
+                &store.pools,
+                p.to_be_bytes().to_vec(),
+                self.pools[p as usize].encode(),
+            );
         }
         for t in self.dirty_tokens.drain() {
-            b.insert(&store.tokens, t.to_be_bytes().to_vec(), self.tokens[t as usize].encode());
+            b.insert(
+                &store.tokens,
+                t.to_be_bytes().to_vec(),
+                self.tokens[t as usize].encode(),
+            );
         }
         for (k, v) in self.closed_candles.drain(..) {
             b.insert(&store.candles, k.to_vec(), v);
@@ -355,7 +451,10 @@ fn amounts(sqrt_p: f64, tick_lower: i32, tick_upper: i32, liquidity: f64) -> (f6
     if sqrt_p <= sa {
         (liquidity * (sb - sa) / (sa * sb), 0.0)
     } else if sqrt_p < sb {
-        (liquidity * (sb - sqrt_p) / (sqrt_p * sb), liquidity * (sqrt_p - sa))
+        (
+            liquidity * (sb - sqrt_p) / (sqrt_p * sb),
+            liquidity * (sqrt_p - sa),
+        )
     } else {
         (0.0, liquidity * (sb - sa))
     }
@@ -377,11 +476,23 @@ mod tests {
     }
 
     fn log(block: u32, address: Addr, topics: Vec<[u8; 32]>, data: Vec<u8>) -> RawLog {
-        RawLog { block, ts: 1_794_992_700 + block, address, topics, data, ..Default::default() }
+        RawLog {
+            block,
+            ts: 1_794_992_700 + block,
+            address,
+            topics,
+            data,
+            ..Default::default()
+        }
     }
 
     fn meta(symbol: &str, decimals: u8) -> Meta {
-        Meta { decimals, symbol: symbol.into(), name: symbol.into(), supply: 1e9 }
+        Meta {
+            decimals,
+            symbol: symbol.into(),
+            name: symbol.into(),
+            supply: 1e9,
+        }
     }
 
     #[test]
@@ -399,12 +510,19 @@ mod tests {
         let created_by = |factory: Addr, pool: Addr, t0: Addr, t1: Addr| {
             let mut data = pad(&pool).to_vec();
             data.extend(word(1.0));
-            log(10, factory, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+            log(
+                10,
+                factory,
+                vec![T.v2_pair_created, pad(&t0), pad(&t1)],
+                data,
+            )
         };
         let created = |pool: Addr, t0: Addr, t1: Addr| created_by(uniswap, pool, t0, t1);
         // WETH/USDC with $3M on each side: 1000 WETH @ $3000.
         s.apply(&created(pool_a, WETH, usdc), &store);
-        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let sync = |pool: Addr, r0: f64, r1: f64| {
+            log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat())
+        };
         let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
             let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
             log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
@@ -412,22 +530,37 @@ mod tests {
         s.apply(&sync(pool_a, 1000e18, 3_000_000e6), &store);
         s.apply(&swap(pool_a, 0.0, 3000e6, 1e18, 0.0), &store); // buy 1 WETH for 3000 USDC
         let weth = &s.tokens[0];
-        assert!((weth.usd - 3000.0).abs() < 1e-6, "WETH priced from USDC: {}", weth.usd);
+        assert!(
+            (weth.usd - 3000.0).abs() < 1e-6,
+            "WETH priced from USDC: {}",
+            weth.usd
+        );
         assert!(!s.pools[0].quote0, "USDC (token1) is the quote");
 
         // A contract posing as a bigger WETH/USDC pool can't move WETH's price.
         s.apply(&created_by([1; 20], fake, WETH, usdc), &store);
         s.apply(&sync(fake, 1e6 * 1e18, 1e12 * 1e6), &store);
         s.apply(&swap(fake, 0.0, 1e6, 1e15, 0.0), &store); // "WETH at $1000"
-        assert!((s.tokens[0].usd - 3000.0).abs() < 1e-6, "untrusted pool ignored: {}", s.tokens[0].usd);
-        assert_eq!(s.tokens[0].best_pool, 0, "WETH still links to the real pool");
+        assert!(
+            (s.tokens[0].usd - 3000.0).abs() < 1e-6,
+            "untrusted pool ignored: {}",
+            s.tokens[0].usd
+        );
+        assert_eq!(
+            s.tokens[0].best_pool, 0,
+            "WETH still links to the real pool"
+        );
 
         // MEME/WETH: 1M MEME vs 10 WETH ($30k). Sell 1000 MEME for 0.01 WETH.
         s.apply(&created(pool_b, meme, WETH), &store);
         s.apply(&sync(pool_b, 1_000_000e18, 10e18), &store);
         s.apply(&swap(pool_b, 1000e18, 0.0, 0.0, 0.01e18), &store);
         let m = &s.tokens[2];
-        assert!((m.usd - 0.03).abs() < 1e-9, "MEME = 0.00001 WETH = $0.03, got {}", m.usd);
+        assert!(
+            (m.usd - 0.03).abs() < 1e-9,
+            "MEME = 0.00001 WETH = $0.03, got {}",
+            m.usd
+        );
         assert!((s.liq(2) - 60_000.0).abs() < 1.0);
         assert_eq!(s.flush(&store, 12).unwrap().len(), 3);
         let candles = store.candles(2, 0, 0, u32::MAX, 10);
@@ -442,7 +575,11 @@ mod tests {
             s.apply(&l, &store);
         }
         s.flush(&store, 13).unwrap();
-        assert_eq!(store.candles(2, 0, 0, u32::MAX, 10).len(), 4, "every closed candle is stored");
+        assert_eq!(
+            store.candles(2, 0, 0, u32::MAX, 10).len(),
+            4,
+            "every closed candle is stored"
+        );
 
         // A smaller pool can't move the price while the deep one holds liquidity…
         let pool_c = [5u8; 20];

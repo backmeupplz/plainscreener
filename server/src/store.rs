@@ -14,6 +14,8 @@ pub struct Store {
     pub candles: Keyspace,
     /// [pool u32][block u32][log index u32] → Trade
     pub trades: Keyspace,
+    /// [token addr] → 64 px PNG, or the 4-byte Unix time of a failed lookup
+    pub icons: Keyspace,
 }
 
 pub fn candle_key(pool: u32, res: usize, t: u32) -> [u8; 9] {
@@ -46,29 +48,50 @@ impl Store {
             pools: ks("pools")?,
             candles: ks("candles")?,
             trades: ks("trades")?,
+            icons: ks("icons")?,
             db,
         })
     }
 
     /// The next block to index and the timestamp of the last indexed one.
     pub fn cursor(&self) -> Result<Option<(u32, u32)>> {
-        Ok(self.meta.get("cursor")?.map(|v| (be32(&v[..4]), be32(v.get(4..8).unwrap_or_default()))))
+        Ok(self
+            .meta
+            .get("cursor")?
+            .map(|v| (be32(&v[..4]), be32(v.get(4..8).unwrap_or_default()))))
     }
 
     pub fn set_cursor(&self, batch: &mut fjall::OwnedWriteBatch, block: u32, ts: u32) {
-        batch.insert(&self.meta, "cursor", [block.to_be_bytes(), ts.to_be_bytes()].concat());
+        batch.insert(
+            &self.meta,
+            "cursor",
+            [block.to_be_bytes(), ts.to_be_bytes()].concat(),
+        );
     }
 
     pub fn load_tokens(&self) -> Result<Vec<Token>> {
-        self.tokens.range::<&[u8], _>(..).map(|g| Ok(Token::decode(&g.into_inner()?.1))).collect()
+        self.tokens
+            .range::<&[u8], _>(..)
+            .map(|g| Ok(Token::decode(&g.into_inner()?.1)))
+            .collect()
     }
 
     pub fn load_pools(&self) -> Result<Vec<Pool>> {
-        self.pools.range::<&[u8], _>(..).map(|g| Ok(Pool::decode(&g.into_inner()?.1))).collect()
+        self.pools
+            .range::<&[u8], _>(..)
+            .map(|g| Ok(Pool::decode(&g.into_inner()?.1)))
+            .collect()
     }
 
     /// Up to `limit` candles before `before` (exclusive), oldest first.
-    pub fn candles(&self, pool: u32, res: usize, from: u32, before: u32, limit: usize) -> Vec<(u32, Candle)> {
+    pub fn candles(
+        &self,
+        pool: u32,
+        res: usize,
+        from: u32,
+        before: u32,
+        limit: usize,
+    ) -> Vec<(u32, Candle)> {
         let mut out: Vec<_> = self
             .candles
             .range(candle_key(pool, res, from)..candle_key(pool, res, before))
