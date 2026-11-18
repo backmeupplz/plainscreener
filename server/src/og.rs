@@ -1,7 +1,7 @@
 //! Share images: the same chart as the page, rasterized with resvg.
 
 use crate::model::RES;
-use crate::pages::{Esc, LOGO, PALETTE, chart_css, chart_data, metrics};
+use crate::pages::{Esc, LOGO, PALETTE, change, chart_css, chart_data, default_res, metrics, price_parts};
 use crate::state::State;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -53,18 +53,20 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let pool = &st.pools[p as usize];
     let sym = |t: u32| Esc(&st.tokens[t as usize].symbol).to_string();
     let m = metrics(st, p);
-    let open = m.w[3].open;
-    let ch = if open > 0.0 { m.price / open - 1.0 } else { f64::NAN };
+    let ch = change(&m, 3);
     use fmt::s;
     let mut b = String::new();
     let _ = write!(
         b,
-        r#"{logo}<text x="128" y="96" font-size="54" font-weight="700" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="78" font-weight="700" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
+        r#"{logo}<text x="128" y="96" font-size="54" font-weight="700" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="72" font-weight="700" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
         logo = logo(56, 44, 56),
         base = sym(pool.base()),
         quote = sym(pool.quote()),
         right = w - 56,
-        price = s(|o| fmt::usd(o, m.price)),
+        price = match price_parts(st, p, &m) {
+            (n, Some(unit)) => format!(r#"{n}<tspan dx="12" font-size="32" font-weight="400" class="mu">{}</tspan>"#, Esc(unit)),
+            (n, None) => n,
+        },
         dex = pool.dex(),
         cls = if ch >= 0.0 { "up" } else { "dn" },
         change = s(|o| fmt::pct(o, ch)),
@@ -87,9 +89,10 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let (cx, cy) = (24u32, 280u32);
     let (cw, chh) = (w - 48, h - cy - 24);
     let scale = 1.6;
-    let candles = chart_data(st, store, p, 3, u32::MAX, 300);
+    let ri = default_res(st, p, 3);
+    let candles = chart_data(st, store, p, ri, u32::MAX, 300);
     let (vw, vh) = (cw as f64 / scale, chh as f64 / scale);
-    let mut view = chart::View::latest(candles.len(), vw, vh, RES[3] as f64);
+    let mut view = chart::View::latest(candles.len(), vw, vh, RES[ri] as f64);
     view.count = view.count.min(candles.len().max(30) as f64 + 2.0);
     view.start = candles.len() as f64 + 2.0 - view.count;
     let svg = s(|o| chart::render(&candles, &view, o));

@@ -45,7 +45,8 @@ pub const AXIS_W: f64 = 72.0;
 const AXIS_H: f64 = 22.0;
 const LEGEND_H: f64 = 26.0;
 const VOLUME: f64 = 0.2;
-const CHAR_W: f64 = 6.6;
+/// Approximate width of a 12 px label character.
+const CHAR_W: f64 = 7.2;
 /// Time-axis label steps in seconds.
 const STEPS: [f64; 14] = [
     60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0, 14_400.0, 21_600.0, 43_200.0, 86_400.0, 172_800.0, 604_800.0,
@@ -55,7 +56,8 @@ const STEPS: [f64; 14] = [
 impl View {
     /// The default view: the latest candles at ~9 px each, with two empty slots on the right.
     pub fn latest(n: usize, w: f64, h: f64, res: f64) -> View {
-        let count = ((w - AXIS_W) / 9.0).max(20.0).min(400.0);
+        // ~9 px per candle, but a young pool's few candles shouldn't hug the right edge.
+        let count = ((w - AXIS_W) / 9.0).min(n as f64 + 12.0).max(24.0).min(400.0);
         View { w, h, res, start: n as f64 + 2.0 - count, count, cursor: None, tz: 0.0 }
     }
 
@@ -153,7 +155,8 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
             let x = f.x(i0 + k);
             if x > 24.0 && x < pw - 24.0 {
                 out_v(&mut grid, x, base);
-                let lt = lt as i64;
+                // Label the boundary (16:45), not the first candle after a gap (16:46).
+                let lt = (bucket * tstep) as i64;
                 text(&mut labels, "", x, v.h - 7.0, "middle", |o| {
                     if tstep >= 86_400.0 || lt.rem_euclid(86_400) == 0 {
                         fmt::date(o, lt)

@@ -32,7 +32,7 @@ pub const PALETTE: [(&str, &str, &str); 11] = [
 
 /// Chart styles, with `{name}` standing for a palette color.
 const CHART_CSS: &str = ".ch .g{stroke:{grid};fill:none}.ch .u{fill:{up}}.ch .d{fill:{down}}\
-.ch .vu{fill:{up};opacity:.28}.ch .vd{fill:{down};opacity:.28}.ch text{font-size:11px;font-family:system-ui,Inter,sans-serif}\
+.ch .vu{fill:{up};opacity:.28}.ch .vd{fill:{down};opacity:.28}.ch text{font-size:12px;font-family:system-ui,Inter,sans-serif}\
 .ch .a{fill:{muted}}.ch .l{fill:none;stroke-dasharray:2 3}.ch .l.u{stroke:{up}}.ch .l.d{stroke:{down}}\
 .ch .x{fill:none;stroke:{muted};stroke-dasharray:3 3}.ch .t{fill:{fg}}.ch .tc{fill:{bg}}.ch .tt{fill:{white}}";
 
@@ -183,7 +183,29 @@ pub fn metrics(st: &State, p: u32) -> Metrics {
     Metrics { price, native: pool.price_native, liq: st.liq(p), fdv: base.supply * price, w }
 }
 
-fn change(m: &Metrics, i: usize) -> f64 {
+/// The price in USD, or in the quote token (number, symbol) before that has a USD price.
+pub fn price_parts<'a>(st: &'a State, p: u32, m: &Metrics) -> (String, Option<&'a str>) {
+    if m.price.is_finite() {
+        (s(|o| fmt::usd(o, m.price)), None)
+    } else {
+        (s(|o| fmt::price(o, m.native)), Some(sym(st, st.pools[p as usize].quote())))
+    }
+}
+
+pub fn price_label(st: &State, p: u32, m: &Metrics) -> String {
+    match price_parts(st, p, m) {
+        (n, Some(unit)) => format!("{n} {unit}"),
+        (n, None) => n,
+    }
+}
+
+/// The largest candle size up to `RES[max]` that still gives a young pool a few dozen candles.
+pub fn default_res(st: &State, p: u32, max: usize) -> usize {
+    let age = st.head_ts.saturating_sub(st.pools[p as usize].created_ts);
+    (0..=max).rev().find(|&ri| age / RES[ri] >= 48).unwrap_or(0)
+}
+
+pub fn change(m: &Metrics, i: usize) -> f64 {
     let open = m.w[i].open;
     if open > 0.0 && m.price.is_finite() { m.price / open - 1.0 } else { f64::NAN }
 }
@@ -232,7 +254,7 @@ fn field(fs: &[(String, String, &'static str)], id: &str) -> String {
 pub fn trade_row(st: &State, pool: &Pool, t: &Trade) -> String {
     let cls = if t.buy { "u" } else { "d" };
     format!(
-        r#"<tr><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><a class="mono" href="{EXPLORER}/address/{maker}" rel="nofollow">{maker_s}</a></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow" aria-label="Transaction">{tx_s}</a></td></tr>"#,
+        r#"<tr><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><a class="mono" href="{EXPLORER}/address/{maker}" rel="nofollow">{maker_s}</a></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
         time = s(|o| fmt::date_clock(o, t.ts as i64)),
         kind = if t.buy { "Buy" } else { "Sell" },
         price = s(|o| fmt::usd(o, t.price_usd as f64)),
@@ -454,18 +476,12 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let price_head = format!(r#"<span class="big">{}</span> {}"#, f("p"), f("c24h"));
     let url = format!("{}/base/{key}", app.cfg.public_url);
     let m = metrics(st, p);
-    let title = format!(
-        "{} {} {} | {}/{} on Base | {SITE}",
-        bs,
-        s(|o| fmt::usd(o, m.price)),
-        s(|o| fmt::pct(o, change(&m, 3))),
-        bs,
-        qs
-    );
+    let price_text = price_label(st, p, &m);
+    let title = format!("{bs} {price_text} {} | {bs}/{qs} on Base | {SITE}", s(|o| fmt::pct(o, change(&m, 3))));
     let desc = format!(
         "{bs} ({}) price {}, 24h volume {}, liquidity {} on {}. Live chart and trades for the {bs}/{qs} pool on Base.",
         if base.name.is_empty() { bs } else { &base.name },
-        s(|o| fmt::usd(o, m.price)),
+        price_text,
         s(|o| fmt::usd_compact(o, m.w[3].vol)),
         s(|o| fmt::usd_compact(o, m.liq)),
         pool.dex(),
@@ -474,7 +490,8 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let head = Head {
         title,
         desc,
-        path: if embed { format!("/embed/base/{key}") } else { format!("/base/{key}") },
+        // Embeds point search engines at the full pair page.
+        path: format!("/base/{key}"),
         image: Some(format!("{}/og/base/{key}.png?v={v}", app.cfg.public_url)),
         miniapp: Some((format!("{}/og/base/{key}.png?s=fc&v={v}", app.cfg.public_url), url.clone())),
         embed,

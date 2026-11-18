@@ -109,12 +109,15 @@ async fn main() -> Result<()> {
     tokio::spawn(http::search_index(app.clone()));
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     eprintln!("listening on {}", cfg.listen);
-    axum::serve(listener, http::router(app))
-        .with_graceful_shutdown(async {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM");
-            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-        })
-        .await?;
+    // No graceful drain: live streams never end on their own. Every indexed batch is
+    // already committed atomically, so syncing the journal is all a shutdown needs.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        r = axum::serve(listener, http::router(app)) => r?,
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+    let _state = sh.state.write(); // wait out a batch being applied
     sh.store.db.persist(fjall::PersistMode::SyncAll)?;
     Ok(())
 }

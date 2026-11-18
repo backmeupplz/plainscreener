@@ -185,7 +185,7 @@ fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Res
             None => return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response(),
         },
     };
-    let ri = q.res.as_deref().and_then(res_index).unwrap_or(2);
+    let ri = q.res.as_deref().and_then(res_index).unwrap_or_else(|| pages::default_res(&st, p, 2));
     html(pages::pair(&app, &st, &app.sh.store, p, ri, embed), 3)
 }
 
@@ -234,7 +234,7 @@ fn png_static(bytes: &'static [u8]) -> Response {
 }
 
 async fn robots(Ax(app): A) -> Response {
-    let body = format!("User-agent: *\nAllow: /\nDisallow: /api/\nDisallow: /embed/\nSitemap: {}/sitemap.xml\n", app.cfg.public_url);
+    let body = format!("User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: {}/sitemap.xml\n", app.cfg.public_url);
     cached("text/plain; charset=utf-8", 3600, body)
 }
 
