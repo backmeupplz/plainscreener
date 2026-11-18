@@ -2,8 +2,9 @@
 //! few seconds; live data goes over SSE.
 
 use crate::abi::{pad, unhex};
+use crate::lists::{self, Filter, Tab};
 use crate::model::{RES, res_index};
-use crate::pages::{self, Tab};
+use crate::pages;
 use crate::state::State;
 use crate::{App, og};
 use axum::Router;
@@ -28,6 +29,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/search", get(search))
         .route("/base/{id}", get(pair))
         .route("/embed/base/{id}", get(embed))
+        .route("/base/token/{addr}", get(token))
         .route("/og/base/{file}", get(og_pair))
         .route("/og.png", get(|| async { png_static(&SITE_PNG) }))
         .route("/icon.png", get(|| async { png_static(&ICON_PNG) }))
@@ -41,6 +43,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/live/{id}", get(live))
         .route("/api/trades/{id}", get(trades))
         .route("/api/list", get(list))
+        .nest("/api/v1", crate::api::router())
+        .route("/api", get(api_docs))
+        .route("/api/traders/{id}", get(traders))
         .route("/healthz", get(health))
         .fallback(|Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) })
         .layer(axum::middleware::from_fn(no_www))
@@ -56,7 +61,7 @@ async fn no_www(req: axum::extract::Request, next: axum::middleware::Next) -> Re
     next.run(req).await
 }
 
-fn cached(ctype: &'static str, secs: u32, body: impl IntoResponse) -> Response {
+pub(crate) fn cached(ctype: &'static str, secs: u32, body: impl IntoResponse) -> Response {
     let mut r = body.into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
@@ -82,7 +87,7 @@ fn html(body: String, edge: u32) -> Response {
     r
 }
 
-fn read(app: &App) -> std::sync::RwLockReadGuard<'_, State> {
+pub(crate) fn read(app: &App) -> std::sync::RwLockReadGuard<'_, State> {
     app.sh.state.read().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -106,41 +111,32 @@ fn resolve(st: &State, id: &str) -> Option<Found> {
     }
 }
 
-fn pool_of(st: &State, id: &str) -> Option<u32> {
+pub(crate) fn pool_of(st: &State, id: &str) -> Option<u32> {
     match resolve(st, id)? {
         Found::Pool(p) => Some(p),
         Found::Token(t) => pages::best_pool(st, t),
     }
 }
 
-#[derive(Deserialize)]
-struct HomeQ {
-    tab: Option<String>,
+async fn home(Ax(app): A, Query(f): Query<Filter>) -> Response {
+    let pools = if f.tab() == Tab::Watch { Vec::new() } else { app.list(&f) };
+    html(pages::home(&app, &read(&app), &f, &pools), 15)
 }
 
-fn tab_of(slug: Option<&str>) -> Tab {
-    pages::TABS.iter().find(|t| Some(t.1) == slug).map(|t| t.0).unwrap_or(Tab::Trending)
-}
-
-async fn home(Ax(app): A, Query(q): Query<HomeQ>) -> Response {
-    let tab = tab_of(q.tab.as_deref());
-    let pools = app.list(tab);
-    html(pages::home(&app, &read(&app), tab, &pools), 15)
-}
-
-#[derive(Deserialize)]
-struct ListQ {
-    tab: Option<String>,
-    q: Option<String>,
-}
-
-/// Fresh rows for a home tab or search results; pages poll this while open.
-async fn list(Ax(app): A, Query(q): Query<ListQ>) -> Response {
-    let pools = match q.q.as_deref().map(str::trim) {
-        Some(needle) if !needle.is_empty() => search_pools(&app, &read(&app), needle),
-        _ => app.list(tab_of(q.tab.as_deref())),
+/// Fresh rows for a home tab, search results or watchlist; pages poll this while open.
+async fn list(Ax(app): A, Query(f): Query<Filter>) -> Response {
+    let pools = match (f.q.as_deref().map(str::trim), f.pairs.as_deref()) {
+        (Some(needle), _) if !needle.is_empty() => search_pools(&app, &read(&app), needle),
+        (_, Some(keys)) => {
+            let st = read(&app);
+            let mut pools: Vec<u32> = keys.split(',').take(100).filter_map(|k| pool_of(&st, k)).collect();
+            lists::sort(&st, &f, &mut pools);
+            pools
+        }
+        _ if f.tab() == Tab::Watch => Vec::new(),
+        _ => app.list(&f),
     };
-    let mut r = cached("text/html; charset=utf-8", 0, pages::list_rows(&read(&app), &pools));
+    let mut r = cached("text/html; charset=utf-8", 0, lists::rows(&read(&app), &pools));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=0, s-maxage=2"));
     r
 }
@@ -166,7 +162,7 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
 
 /// Pools for tokens whose symbol starts with or name contains `q`: exact symbol matches
 /// first, then pools from known DEXes, then by liquidity.
-fn search_pools(app: &App, st: &State, q: &str) -> Vec<u32> {
+pub(crate) fn search_pools(app: &App, st: &State, q: &str) -> Vec<u32> {
     let needle = q.to_lowercase();
     let index = app.search.read().unwrap_or_else(|e| e.into_inner());
     // Exact symbol matches first, then pools from known DEXes, then by liquidity.
@@ -219,6 +215,19 @@ fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Res
     // Cached for a minute at the edge: the live stream brings a stale copy up to date
     // as soon as it connects.
     html(pages::pair(&app, &st, &app.sh.store, p, ri, embed), 60)
+}
+
+async fn api_docs(Ax(app): A) -> Response {
+    html(pages::api_docs(&app, &read(&app)), 3600)
+}
+
+async fn token(Ax(app): A, Path(addr): Path<String>) -> Response {
+    let st = read(&app);
+    let t = unhex(addr.trim()).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|a| st.token_ix.get(&a).copied());
+    match t {
+        Some(t) => html(pages::token(&app, &st, &app.sh.store, t), 30),
+        None => (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -333,7 +342,7 @@ async fn candles(Ax(app): A, Path(id): Path<String>, Query(q): Query<CandlesQ>) 
 }
 
 /// "b-i" (block, log index), as in trade cursors and live event ids.
-fn trade_cursor(s: &str) -> Option<(u32, u32)> {
+pub(crate) fn trade_cursor(s: &str) -> Option<(u32, u32)> {
     let (b, i) = s.split_once('-')?;
     Some((b.parse().ok()?, i.parse().ok()?))
 }
@@ -366,6 +375,19 @@ async fn trades(Ax(app): A, Path(id): Path<String>, Query(q): Query<TradesQ>) ->
     let cache =
         if q.before.is_some() { "public, max-age=3600, s-maxage=86400" } else { "public, max-age=0, s-maxage=5" };
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    r
+}
+
+/// A pool's top traders as a table (see `pages::top_traders`).
+async fn traders(Ax(app): A, Path(id): Path<String>) -> Response {
+    let st = read(&app);
+    let Some(p) = pool_of(&st, &id) else { return StatusCode::NOT_FOUND.into_response() };
+    let rows = pages::top_traders(&st, &app.sh.store, p);
+    let body = format!(
+        r#"<p class="sub tsub">Most profitable wallets in the last 100,000 trades. Profit counts what they still hold at today's price.</p><table class="trades"><thead><tr><th class="l">#</th><th class="l">Maker</th><th>Bought</th><th>Sold</th><th>Profit</th><th class="hide-s">Trades</th></tr></thead><tbody>{rows}</tbody></table>"#
+    );
+    let mut r = cached("text/html; charset=utf-8", 0, body);
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=0, s-maxage=60"));
     r
 }
 
@@ -420,20 +442,24 @@ async fn health(Ax(app): A) -> Response {
     r
 }
 
-/// Short-lived caches for things computed from the whole state.
+/// Short-lived caches for lists computed from the whole state, by what was asked.
 #[derive(Default)]
-pub struct Lists(pub std::sync::Mutex<HashMap<Tab, (Instant, Vec<u32>)>>);
+pub struct Lists(pub std::sync::Mutex<HashMap<Filter, (Instant, Vec<u32>)>>);
 
 impl App {
-    fn list(&self, tab: Tab) -> Vec<u32> {
+    pub(crate) fn list(&self, f: &Filter) -> Vec<u32> {
         let mut cache = self.lists.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, v)) = cache.get(&tab)
+        if let Some((at, v)) = cache.get(f)
             && at.elapsed() < Duration::from_secs(3)
         {
             return v.clone();
         }
-        let v = pages::list(&read(self), tab);
-        cache.insert(tab, (Instant::now(), v.clone()));
+        let v = lists::ranked(&read(self), f);
+        // Filters are free-form; don't let odd combinations pile up.
+        if cache.len() > 500 {
+            cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(3));
+        }
+        cache.insert(f.clone(), (Instant::now(), v.clone()));
         v
     }
 }

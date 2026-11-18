@@ -1,13 +1,16 @@
 //! plainscreener: one process that indexes Base DEX swaps and serves the site.
 
 mod abi;
+mod api;
 mod http;
 mod icons;
 mod index;
+mod lists;
 mod model;
 mod og;
 mod pages;
 mod rpc;
+mod safety;
 mod sqd;
 mod state;
 mod store;
@@ -109,6 +112,7 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(http::search_index(app.clone()));
     tokio::spawn(icons::run(app.clone()));
+    tokio::spawn(safety::run(app.clone()));
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     eprintln!("listening on {}", cfg.listen);
     // No graceful drain: live streams never end on their own. Every indexed batch is

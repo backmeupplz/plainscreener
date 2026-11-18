@@ -25,7 +25,7 @@ impl Rpc {
         Rpc { url: url.into(), http: reqwest::Client::new() }
     }
 
-    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let mut out = self.batch(vec![(method, params)]).await?;
         Ok(out.pop().unwrap_or(Value::Null))
     }

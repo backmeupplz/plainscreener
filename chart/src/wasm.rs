@@ -1,11 +1,12 @@
 //! Browser entry points. JS writes candles into the buffer from `data`, calls `draw`,
 //! and reads `len()` UTF-8 bytes of SVG at the returned pointer.
 
-use crate::{AXIS_W, Candle, View, render};
+use crate::{AXIS_W, Candle, Mark, View, render_marked};
 use std::cell::UnsafeCell;
 
 struct State {
     candles: Vec<Candle>,
+    marks: Vec<Mark>,
     svg: String,
     view: View,
 }
@@ -16,6 +17,7 @@ unsafe impl Sync for Global {}
 
 static S: Global = Global(UnsafeCell::new(State {
     candles: Vec::new(),
+    marks: Vec::new(),
     svg: String::new(),
     view: View { w: 0.0, h: 0.0, res: 60.0, start: 0.0, count: 1.0, cursor: None, tz: 0.0, opts: 0 },
 }));
@@ -33,8 +35,16 @@ pub extern "C" fn data(n: usize) -> *mut f64 {
     s.candles.as_mut_ptr().cast()
 }
 
+/// Resizes the trade-mark buffer to `n` marks: `[t, price, buy] * n` f64s.
+#[unsafe(no_mangle)]
+pub extern "C" fn marks(n: usize) -> *mut f64 {
+    let s = state();
+    s.marks.resize(n, Mark::default());
+    s.marks.as_mut_ptr().cast()
+}
+
 /// Renders the buffer. A NaN `start` picks the default (latest) view; negative `cx`
-/// hides the crosshair; `opts` are `LINE`/`MA`/`COMPACT` flags. Returns a pointer to the
+/// hides the crosshair; `opts` are the chart's flags (`LINE`, `MA`, `COMPACT`, `LOG`, …). Returns a pointer to the
 /// SVG; its length is `len()`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
@@ -59,7 +69,7 @@ pub extern "C" fn draw(
     v.tz = tz;
     v.opts = opts;
     s.svg.clear();
-    render(&s.candles, &v, &mut s.svg);
+    render_marked(&s.candles, &s.marks, &v, &mut s.svg);
     s.view = v;
     s.svg.as_ptr()
 }

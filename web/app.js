@@ -37,6 +37,28 @@ $('.theme')?.addEventListener('click', () => {
 // old rows out past `shown`.
 let shown = 50
 let maker = ''
+let remark = () => {} // the chart redraws the filtered wallet's trades
+
+// Trades and Top traders tabs (traders load when first shown).
+function tab(name) {
+  const card = tr?.closest('.card')
+  if (!card) return
+  card.querySelectorAll('[data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)))
+  const traders = $('#traders')
+  traders.hidden = name !== 'traders'
+  for (const el of [tr.closest('table'), $('#more'), $('#flt')]) if (el) el.hidden = name === 'traders'
+  if (name === 'traders' && !traders.dataset.loaded) {
+    traders.dataset.loaded = 1
+    traders.innerHTML = '<p class="empty">Adding up trades…</p>'
+    fetch(`/api/traders/${$('#chart').dataset.pool}`)
+      .then((r) => r.text())
+      .then((h) => (traders.innerHTML = h))
+  }
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-tab]')
+  if (b) tab(b.dataset.tab)
+})
 const tr = $('#tr')
 async function trades(before) {
   const q = new URLSearchParams()
@@ -48,6 +70,7 @@ async function trades(before) {
   shown = Math.max(50, tr.rows.length)
   $('#more')?.remove()
   if (r.more) tr.closest('table').insertAdjacentHTML('afterend', r.more)
+  remark()
 }
 document.addEventListener('click', (e) => {
   const more = e.target.closest('#more')
@@ -57,24 +80,126 @@ document.addEventListener('click', (e) => {
   if (!mk && !all) return
   maker = mk ? mk.dataset.maker : ''
   $('#flt')?.remove()
+  tab('trades')
   if (maker)
-    tr.closest('.card').querySelector('h2').insertAdjacentHTML(
+    tr.closest('.card').querySelector('.tt').insertAdjacentHTML(
       'afterend',
       `<p class="flt" id="flt">Trades by <span class="mono">${maker.slice(0, 6)}…${maker.slice(-4)}</span> <a class="mono" href="https://basescan.org/address/${maker}" rel="nofollow">Basescan ↗</a><button type="button">Show all</button></p>`
     )
   trades(maker ? '' : '4294967295-4294967295')
 })
 
-// Pair lists (home tabs, search) take fresh rows every few seconds while visible. The rows
-// are cached at the edge for 2 s, so every viewer shares one render.
+// Instant search: matching pairs as you type, from the public API (edge-cached per query).
+// Token names come from anyone's contract, so results are built as text, never HTML.
+const usd = (x, o) => (x == null ? '–' : new Intl.NumberFormat('en', { style: 'currency', currency: 'USD', ...o }).format(x))
+document.querySelectorAll('input[type=search]').forEach((input, n) => {
+  const box = document.createElement('ul')
+  box.className = 'sugg'
+  box.id = `sugg${n}`
+  box.setAttribute('role', 'listbox')
+  box.hidden = true
+  input.after(box)
+  input.form.classList.add('has-sugg')
+  input.setAttribute('role', 'combobox')
+  input.setAttribute('aria-autocomplete', 'list')
+  input.setAttribute('aria-controls', box.id)
+  input.setAttribute('aria-expanded', 'false')
+  let timer = 0, active = -1, asked = ''
+  const show = (on) => ((box.hidden = !on), input.setAttribute('aria-expanded', String(on)))
+  const mark = (i) => {
+    const items = box.querySelectorAll('[role=option]')
+    active = (i + items.length) % items.length
+    items.forEach((el, k) => el.setAttribute('aria-selected', String(k === active)))
+    if (items[active]) input.setAttribute('aria-activedescendant', items[active].id)
+  }
+  const el = (tag, cls, text) => {
+    const e = document.createElement(tag)
+    if (cls) e.className = cls
+    if (text != null) e.textContent = text
+    return e
+  }
+  const render = (pairs) => {
+    box.replaceChildren(
+      ...pairs.map((p, i) => {
+        const li = el('li')
+        li.id = `${box.id}-${i}`
+        li.setAttribute('role', 'option')
+        const a = el('a')
+        a.href = `/base/${p.pair}`
+        const icon = p.base.icon ? Object.assign(el('img', 'av'), { src: p.base.icon, alt: '', width: 26, height: 26 }) : el('span', 'av', (p.base.symbol[0] || '?').toUpperCase())
+        const name = el('span', 'nm')
+        name.append(el('b', '', p.base.symbol), el('span', 'm', `/${p.quote.symbol}`), el('small', '', p.dex))
+        a.append(icon, name, el('span', 'pr', usd(p.price_usd, { maximumSignificantDigits: 4 })), el('span', 'm lq2', usd(p.liquidity_usd, { notation: 'compact', maximumFractionDigits: 1 })))
+        li.append(a)
+        return li
+      })
+    )
+    active = -1
+    show(pairs.length > 0)
+  }
+  input.addEventListener('input', () => {
+    clearTimeout(timer)
+    const q = input.value.trim()
+    if (q.length < 2) return show(false)
+    timer = setTimeout(async () => {
+      asked = q
+      const r = await fetch(`/api/v1/search?q=${encodeURIComponent(q)}`).then((r) => (r.ok ? r.json() : { pairs: [] }), () => ({ pairs: [] }))
+      if (asked === q && input.value.trim() === q) render(r.pairs.slice(0, 8))
+    }, 150)
+  })
+  input.addEventListener('keydown', (e) => {
+    if (box.hidden) return
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') e.preventDefault(), mark(active + (e.key === 'ArrowDown' ? 1 : -1))
+    else if (e.key === 'Escape') show(false)
+    else if (e.key === 'Enter' && active >= 0) e.preventDefault(), box.querySelectorAll('a')[active].click()
+  })
+  input.addEventListener('blur', () => setTimeout(() => show(false), 150))
+  input.addEventListener('focus', () => box.children.length && input.value.trim().length > 1 && show(true))
+})
+
+// Watchlist: starred pair keys, kept in this browser only.
+const watched = () => {
+  try {
+    return JSON.parse(localStorage.getItem('watch')) || []
+  } catch {
+    return []
+  }
+}
+const stars = () => {
+  const w = new Set(watched())
+  document.querySelectorAll('[data-star]').forEach((b) => b.setAttribute('aria-pressed', String(w.has(b.dataset.star))))
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-star]')
+  if (!b) return
+  e.preventDefault()
+  const k = b.dataset.star
+  const w = watched()
+  try {
+    localStorage.setItem('watch', JSON.stringify(w.includes(k) ? w.filter((x) => x !== k) : [k, ...w].slice(0, 100)))
+  } catch {}
+  stars()
+})
+stars()
+
+// Filters apply as soon as they change.
+$('.filters')?.addEventListener('change', (e) => e.currentTarget.requestSubmit())
+
+// Pair lists (home tabs, search, watchlist) take fresh rows every few seconds while
+// visible. The rows are cached at the edge for 2 s, so every viewer shares one render.
 const list = $('[data-list]')
 if (list) {
+  const watch = list.dataset.list.includes('tab=watch')
+  const src = () => (watch ? (watched().length ? `/api/list?pairs=${watched().join(',')}` : '') : list.dataset.list)
   let last = ''
-  setInterval(async () => {
-    if (document.hidden) return
-    const rows = await fetch(list.dataset.list).then((r) => (r.ok ? r.text() : ''), () => '')
-    if (rows && rows !== last) list.querySelector('tbody').innerHTML = last = rows
-  }, 3000)
+  const refresh = async () => {
+    const u = src()
+    if (!u) return
+    const rows = await fetch(u).then((r) => (r.ok ? r.text() : ''), () => '')
+    if (rows && rows !== last) (list.querySelector('tbody').innerHTML = last = rows), stars()
+  }
+  if (watch) refresh()
+  setInterval(() => document.hidden || refresh(), 3000)
 }
 
 const el = $('#chart')
@@ -88,19 +213,31 @@ async function chart(el) {
   const tz = -new Date().getTimezoneOffset() * 60
   let start = NaN, count = 0, cur = null, drag = null, frame = 0, busy = false, done = cs.length < 300
   // Chart options, remembered per browser. Ones the page doesn't offer stay off.
-  const opt = { mcap: 0, native: 0, line: 0, ma: 0 }
+  const opt = { mcap: 0, native: 0, line: 0, log: 0, ma: 0, vwap: 0, rsi: 0 }
   try {
     Object.assign(opt, JSON.parse(localStorage.getItem('chart')))
   } catch {}
   for (const o in opt) if (!$(`[data-o="${o}"]`)) opt[o] = 0
   const supply = +el.dataset.supply
-  const flags = () => opt.line | (opt.ma << 1) | (opt.mcap << 2) // chart::LINE, MA, COMPACT
+  // chart::LINE, MA, COMPACT, LOG, RSI, VWAP
+  const flags = () => opt.line | (opt.ma << 1) | (opt.mcap << 2) | (opt.log << 3) | (opt.rsi << 4) | (opt.vwap << 5)
+  // The filtered wallet's buys and sells, at their price in the chart's unit.
+  const marks = () => {
+    const k = opt.mcap ? supply : 1
+    const ms = maker
+      ? [...document.querySelectorAll('#tr tr[data-s="b"], #tr tr[data-s="s"]')].map((r) => [+r.dataset.t, (opt.native ? +r.dataset.n : +r.dataset.u) * k, r.dataset.s === 'b' ? 1 : 0])
+      : []
+    const p = w.marks(ms.length) // may grow wasm memory, so take the buffer after
+    new Float64Array(w.memory.buffer, p, ms.length * 3).set(ms.flat())
+  }
+  remark = () => (marks(), redraw())
 
   // Market cap is the price times the supply; volume stays in USD.
   const load = () => {
     const k = opt.mcap ? supply : 1
     const p = w.data(cs.length)
     new Float64Array(w.memory.buffer, p, cs.length * 6).set(cs.flatMap((c) => [c[0], c[1] * k, c[2] * k, c[3] * k, c[4] * k, c[5]]))
+    marks()
   }
   const draw = () => {
     frame = 0
@@ -275,6 +412,7 @@ async function chart(el) {
       const t = document.createElement('tbody')
       t.innerHTML = u.t
       rows.prepend(...[...t.rows].filter((r) => !maker || r.querySelector('.mk')?.dataset.maker === maker))
+      if (maker) marks()
       while (rows.rows.length > shown) rows.deleteRow(-1)
       const m = $('#more')
       if (m) m.dataset.before = rows.rows[rows.rows.length - 1].dataset.k

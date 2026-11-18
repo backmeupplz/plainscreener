@@ -48,6 +48,25 @@ pub const LINE: u32 = 1;
 pub const MA: u32 = 2;
 /// Label prices as 1.2M (for market cap).
 pub const COMPACT: u32 = 4;
+/// Logarithmic price scale.
+pub const LOG: u32 = 8;
+/// A 14-candle RSI pane under the price.
+pub const RSI: u32 = 16;
+/// Volume-weighted average price, restarting each day (below daily candles).
+pub const VWAP: u32 = 32;
+/// Share of the plot height the RSI pane takes.
+const RSI_PANE: f64 = 0.22;
+const RSI_LEN: usize = 14;
+
+/// A trade drawn on the chart: time, price, and 1 for a buy (0 for a sell). `repr(C)`
+/// like `Candle`, so the browser can hand over a `Float64Array`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Mark {
+    pub t: f64,
+    pub p: f64,
+    pub buy: f64,
+}
 /// Moving average periods, drawn with classes `m1` and `m2`.
 const MAS: [usize; 2] = [20, 50];
 
@@ -92,6 +111,7 @@ impl View {
 struct Frame {
     lo: f64,
     hi: f64,
+    log: bool,
     top: f64,
     bottom: f64,
     vmax: f64,
@@ -102,7 +122,17 @@ struct Frame {
 
 impl Frame {
     fn y(&self, p: f64) -> f64 {
-        self.top + (self.hi - p) / (self.hi - self.lo) * (self.bottom - self.top)
+        let s = |x: f64| if self.log { x.ln() } else { x };
+        self.top + (s(self.hi) - s(p)) / (s(self.hi) - s(self.lo)) * (self.bottom - self.top)
+    }
+    /// The price at height `y`.
+    fn p(&self, y: f64) -> f64 {
+        let k = (y - self.top) / (self.bottom - self.top);
+        if self.log {
+            (self.hi.ln() - k * (self.hi.ln() - self.lo.ln())).exp()
+        } else {
+            self.hi - k * (self.hi - self.lo)
+        }
     }
     fn x(&self, i: usize) -> f64 {
         (i as f64 - self.start + 0.5) * self.step
@@ -114,10 +144,18 @@ impl Frame {
 
 /// Renders `cs` (oldest first) into `out` as a complete `<svg>` element.
 pub fn render(cs: &[Candle], v: &View, out: &mut String) {
+    render_marked(cs, &[], v, out)
+}
+
+/// `render` with trades marked on the chart (`marks` in any order).
+pub fn render_marked(cs: &[Candle], marks: &[Mark], v: &View, out: &mut String) {
     let (line, compact) = (v.opts & LINE != 0, v.opts & COMPACT != 0);
     let num = |o: &mut String, x: f64, sig: i32| if compact { fmt::compact(o, x) } else { fmt::price_sig(o, x, sig) };
     let pw = v.plot_w();
-    let base = v.h - AXIS_H;
+    // Above the time axis: price and volume, then the RSI pane when shown.
+    let axis = v.h - AXIS_H;
+    let rsi_top = if v.opts & RSI != 0 { axis - (axis - LEGEND_H) * RSI_PANE } else { axis };
+    let base = if v.opts & RSI != 0 { rsi_top - 8.0 } else { axis };
     out.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg" class="ch" viewBox="0 0 "#);
     fmt::coord(out, v.w);
     out.push(' ');
@@ -144,11 +182,19 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
         lo -= m;
         hi += m;
     }
-    let pad = (hi - lo) * 0.08;
+    let log = v.opts & LOG != 0 && lo > 0.0;
+    let (lo, hi) = if log {
+        let pad = (hi / lo).ln() * 0.08;
+        (lo * (-pad).exp(), hi * pad.exp())
+    } else {
+        let pad = (hi - lo) * 0.08;
+        (lo - pad, hi + pad)
+    };
     let bottom = base - (base - LEGEND_H) * VOLUME;
     let f = Frame {
-        lo: lo - pad,
-        hi: hi + pad,
+        lo,
+        hi,
+        log,
         top: LEGEND_H,
         bottom,
         vmax: if vmax > 0.0 { vmax } else { 1.0 },
@@ -164,16 +210,16 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     let mut labels = String::new();
     // The last-price tag covers axis labels within its height.
     let tag_y = cs.last().map(|c| f.y(c.c)).filter(|y| *y > LEGEND_H && *y < bottom);
-    let mut p = (f.lo / tick).ceil() * tick;
-    while p <= f.hi {
+    let wide_log = f.log && f.hi / f.lo >= 3.0;
+    for p in ticks(&f, tick) {
         let y = f.y(p);
         if y > LEGEND_H + 6.0 && y < bottom - 4.0 {
             path_h(&mut grid, y, pw);
             if tag_y.is_none_or(|t| (t - y).abs() > 14.0) {
-                text(&mut labels, "", pw + 8.0, y + 4.0, "start", |o| num(o, p, sig));
+                // Wide log scales tick at 1, 2 and 5 of each power of ten: one digit says it.
+                text(&mut labels, "", pw + 8.0, y + 4.0, "start", |o| num(o, p, if wide_log { 1 } else { sig }));
             }
         }
-        p += tick;
     }
     let tstep = STEPS.iter().copied().find(|s| s / v.res * f.step >= 84.0).unwrap_or(STEPS[STEPS.len() - 1]);
     let mut prev = f64::NAN;
@@ -186,7 +232,7 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
             // Candles are spaced by index, so gaps in trading bunch boundaries together.
             if x > 24.0 && x < pw - 24.0 && x - last_x >= 76.0 {
                 last_x = x;
-                out_v(&mut grid, x, base);
+                out_v(&mut grid, x, axis);
                 // Label the boundary (16:45), not the first candle after a gap (16:46).
                 let lt = (bucket * tstep) as i64;
                 text(&mut labels, "", x, v.h - 7.0, "middle", |o| {
@@ -223,6 +269,23 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     path(out, "u", &up);
     path(out, "d", &down);
     path(out, "ln", &close);
+    // Daily VWAP: typical price weighted by volume since the day's first candle.
+    if v.opts & VWAP != 0 && v.res < 86_400.0 {
+        let (mut day, mut pv, mut vol, mut d) = (f64::NAN, 0.0, 0.0, String::new());
+        for (i, c) in cs.iter().enumerate().take(i0 + vis.len()) {
+            let today = ((c.t + v.tz) / 86_400.0).floor();
+            if today != day {
+                (day, pv, vol) = (today, 0.0, 0.0);
+            }
+            pv += (c.h + c.l + c.c) / 3.0 * c.v;
+            vol += c.v;
+            if i >= i0 && vol > 0.0 {
+                let first = d.is_empty();
+                point(&mut d, first, f.x(i), f.y(pv / vol));
+            }
+        }
+        path(out, "vw", &d);
+    }
     if v.opts & MA != 0 {
         for (cls, n) in ["m1", "m2"].into_iter().zip(MAS) {
             let mut d = String::new();
@@ -258,19 +321,42 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
         }
     }
 
+    // Trades, as small triangles at their price: buys point up from below, sells down.
+    let mut mu = String::new();
+    let mut md = String::new();
+    for m in marks {
+        // The candle the trade falls in: the last one starting at or before it.
+        let Some(i) = cs.partition_point(|c| c.t <= m.t).checked_sub(1) else { continue };
+        if i < i0 || i >= i0 + vis.len() || !m.p.is_finite() {
+            continue;
+        }
+        let (x, y) = (f.x(i), f.y(m.p));
+        let (d, dir) = if m.buy > 0.0 { (&mut mu, 1.0) } else { (&mut md, -1.0) };
+        point(d, true, x, y + 2.0 * dir);
+        point(d, false, x - 5.0, y + 11.0 * dir);
+        point(d, false, x + 5.0, y + 11.0 * dir);
+        d.push('z');
+    }
+    path(out, "mku", &mu);
+    path(out, "mkd", &md);
+
+    if v.opts & RSI != 0 {
+        rsi_pane(out, cs, &f, i0, vis.len(), rsi_top, axis, pw);
+    }
+
     // Crosshair, or the latest candle when the pointer is away.
     let mut shown = cs.len() - 1;
-    if let Some((cx, cy)) = v.cursor.filter(|&(cx, cy)| cx >= 0.0 && cx < pw && cy >= 0.0 && cy < base) {
+    if let Some((cx, cy)) = v.cursor.filter(|&(cx, cy)| cx >= 0.0 && cx < pw && cy >= 0.0 && cy < axis) {
         let i = (cx / f.step + v.start).floor();
         if i >= 0.0 && (i as usize) < cs.len() {
             shown = i as usize;
         }
         let mut d = String::new();
-        out_v(&mut d, f.x(shown), base);
+        out_v(&mut d, f.x(shown), axis);
         path_h(&mut d, cy, pw);
         path(out, "x", &d);
         if cy < bottom {
-            let p = f.hi - (cy - f.top) / (f.bottom - f.top) * (f.hi - f.lo);
+            let p = f.p(cy);
             tag(out, "t", pw, cy, |o| num(o, p, sig.max(4)));
         }
         let t = (cs[shown].t + v.tz) as i64;
@@ -399,6 +485,70 @@ fn rect(d: &mut String, x: f64, y: f64, w: f64, h: f64) {
     d.push('z');
 }
 
+/// Price axis values: steps of `tick`, or on a log scale spanning more than 3×, the
+/// 1, 2 and 5 of each power of ten (at least 40 px apart).
+fn ticks(f: &Frame, tick: f64) -> Vec<f64> {
+    if !f.log || f.hi / f.lo < 3.0 {
+        let first = (f.lo / tick).ceil() as i64;
+        let last = (f.hi / tick).floor() as i64;
+        return (first..=last.min(first + 200)).map(|k| k as f64 * tick).collect();
+    }
+    // Powers of ten first, then 2s and 5s where they fit.
+    let mut out: Vec<f64> = Vec::new();
+    for m in [1.0, 2.0, 5.0] {
+        for e in f.lo.log10().floor() as i32..=f.hi.log10().ceil() as i32 {
+            let p = m * 10f64.powi(e);
+            if p >= f.lo && p <= f.hi && out.iter().all(|&q| (f.y(q) - f.y(p)).abs() >= 40.0) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// The RSI pane between `top` and `axis`: Wilder's 14-candle RSI of the close, with
+/// 30 and 70 guides.
+#[allow(clippy::too_many_arguments)]
+fn rsi_pane(out: &mut String, cs: &[Candle], f: &Frame, i0: usize, n: usize, top: f64, axis: f64, pw: f64) {
+    let y = |r: f64| top + (100.0 - r) / 100.0 * (axis - top - 4.0) + 2.0;
+    let mut guides = String::new();
+    path_h(&mut guides, top - 4.0, pw);
+    path(out, "g", &guides);
+    guides.clear();
+    for r in [30.0, 70.0] {
+        path_h(&mut guides, y(r), pw);
+        text(out, "a", pw + 8.0, y(r) + 4.0, "start", |o| fmt::uint(o, r as u64));
+    }
+    path(out, "rg", &guides);
+    let (mut gain, mut loss, mut d, mut last) = (0.0, 0.0, String::new(), f64::NAN);
+    for i in 1..(i0 + n).min(cs.len()) {
+        let ch = cs[i].c - cs[i - 1].c;
+        let (up, down) = (ch.max(0.0), (-ch).max(0.0));
+        if i <= RSI_LEN {
+            gain += up / RSI_LEN as f64;
+            loss += down / RSI_LEN as f64;
+        } else {
+            gain = (gain * (RSI_LEN - 1) as f64 + up) / RSI_LEN as f64;
+            loss = (loss * (RSI_LEN - 1) as f64 + down) / RSI_LEN as f64;
+        }
+        if i >= RSI_LEN {
+            let r = if loss == 0.0 { 100.0 } else { 100.0 - 100.0 / (1.0 + gain / loss) };
+            last = r;
+            if i >= i0 {
+                let first = d.is_empty();
+                point(&mut d, first, f.x(i), y(r));
+            }
+        }
+    }
+    path(out, "rsi", &d);
+    text(out, "a", 6.0, top + 10.0, "start", |o| {
+        o.push_str("RSI 14 ");
+        if last.is_finite() {
+            fmt::fixed(o, last, 1);
+        }
+    });
+}
+
 /// 1, 2 or 5 times a power of ten, at least `raw`.
 fn nice(raw: f64) -> f64 {
     let p = 10f64.powf(raw.log10().floor());
@@ -440,6 +590,31 @@ mod tests {
         render(&cs, &v, &mut out);
         assert!(out.contains(r#"class="ln""#) && out.contains(r#"class="m1""#) && out.contains(r#"class="m2""#));
         assert!(!out.contains(r#"<path class="u""#), "no candle bodies in line mode");
+    }
+
+    #[test]
+    fn log_rsi_vwap_and_marks() {
+        // Prices from 1 to ~1000: log ticks are 1-2-5 steps, evenly spread per decade.
+        let cs: Vec<Candle> = (0..300)
+            .map(|i| {
+                let p = 10f64.powf(i as f64 / 100.0);
+                Candle { t: 1_794_992_700.0 + i as f64 * 60.0, o: p, h: p * 1.01, l: p * 0.99, c: p, v: 10.0 }
+            })
+            .collect();
+        let mut v = View::latest(cs.len(), 960.0, 600.0, 60.0);
+        v.start = 0.0;
+        v.count = 300.0;
+        v.opts = LOG | RSI | VWAP;
+        let marks =
+            [Mark { t: cs[150].t + 30.0, p: cs[150].c, buy: 1.0 }, Mark { t: cs[200].t, p: cs[200].c, buy: 0.0 }];
+        let mut out = String::new();
+        render_marked(&cs, &marks, &v, &mut out);
+        for label in [">1<", ">10<", ">100<"] {
+            assert!(out.contains(label), "log tick {label} in {}", &out[..300]);
+        }
+        assert!(out.contains(r#"class="rsi""#) && out.contains("RSI 14 100.0"), "rising closes: RSI 100");
+        assert!(out.contains(r#"class="vw""#) && out.contains(r#"class="mku""#) && out.contains(r#"class="mkd""#));
+        assert!(!out.contains("NaN") && !out.contains("inf"));
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct Store {
     pub icons: Keyspace,
     /// [token addr] → JSON `{"t": looked up at, "d": description, "l": [[kind, url], …]}`
     pub profiles: Keyspace,
+    /// [token addr] → JSON safety checks (see `safety`)
+    pub safety: Keyspace,
 }
 
 pub fn candle_key(pool: u32, res: usize, t: u32) -> [u8; 9] {
@@ -55,6 +57,7 @@ impl Store {
             trades: ks("trades")?,
             icons: ks("icons")?,
             profiles: ks("profiles")?,
+            safety: ks("safety")?,
             db,
         })
     }

@@ -3,6 +3,7 @@
 
 use crate::App;
 use crate::abi::hex;
+use crate::lists::{self, Filter, Tab};
 use crate::model::{Pool, RES, RES_NAMES, Trade, TradeKind, Window};
 use crate::state::{NONE, State};
 use crate::store::Store;
@@ -17,7 +18,7 @@ pub const CHART_CANDLES: usize = 300;
 
 /// Colors: (name, light, dark). The page gets them as CSS variables, OG images inline.
 /// Near-black surfaces, hairline borders, one blue accent.
-pub const PALETTE: [(&str, &str, &str); 27] = [
+pub const PALETTE: [(&str, &str, &str); 29] = [
     // Avatar background and letter lightness (hue comes from the token address).
     ("avbg", "90%", "22%"),
     ("avfg", "30%", "82%"),
@@ -45,6 +46,8 @@ pub const PALETTE: [(&str, &str, &str); 27] = [
     // Moving averages on the chart.
     ("ma1", "#c2410c", "#f5a524"),
     ("ma2", "#7c3aed", "#a78bfa"),
+    ("vwap", "#0e7490", "#22d3ee"),
+    ("rsi", "#be185d", "#f472b6"),
     // Which icon the theme button shows.
     ("sun", "none", "block"),
     ("moon", "block", "none"),
@@ -55,7 +58,10 @@ const CHART_CSS: &str = ".ch .g{stroke:{grid};fill:none}.ch .u{fill:{up}}.ch .d{
 .ch .vu{fill:{up};opacity:.28}.ch .vd{fill:{down};opacity:.28}.ch text{font-size:12px;font-family:system-ui,Inter,sans-serif}\
 .ch .a{fill:{muted}}.ch .l{fill:none;stroke-dasharray:2 3}.ch .l.u{stroke:{up}}.ch .l.d{stroke:{down}}\
 .ch .x{fill:none;stroke:{muted};stroke-dasharray:3 3}.ch .ln{fill:none;stroke:{accent};stroke-width:1.6;stroke-linejoin:round}\
-.ch .m1,.ch .m2{fill:none;stroke-width:1.3}.ch .m1{stroke:{ma1}}.ch .m2{stroke:{ma2}}.ch .t{fill:{fg}}.ch .tc{fill:{bg}}.ch .tt{fill:{white}}";
+.ch .m1,.ch .m2{fill:none;stroke-width:1.3}.ch .m1{stroke:{ma1}}.ch .m2{stroke:{ma2}}\
+.ch .vw{fill:none;stroke:{vwap};stroke-width:1.3}.ch .rsi{fill:none;stroke:{rsi};stroke-width:1.3}\
+.ch .rg{fill:none;stroke:{muted};stroke-dasharray:2 4;opacity:.6}\
+.ch .mku{fill:{up};stroke:{bg}}.ch .mkd{fill:{down};stroke:{bg}}.ch .t{fill:{fg}}.ch .tc{fill:{bg}}.ch .tt{fill:{white}}";
 
 /// Chart CSS with colors from `value(name)`.
 pub fn chart_css(value: impl Fn(&str) -> String) -> String {
@@ -119,7 +125,7 @@ impl Display for Esc<'_> {
     }
 }
 
-fn s(f: impl FnOnce(&mut String)) -> String {
+pub(crate) fn s(f: impl FnOnce(&mut String)) -> String {
     fmt::s(f)
 }
 
@@ -208,7 +214,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         String::new()
     } else {
         format!(
-            r#"<footer><div class="wrap">Every Base DEX pool, indexed straight from the chain. <a href="{REPO}">Open source</a>. Not financial advice.</div></footer>"#
+            r#"<footer><div class="wrap">Every Base DEX pool, indexed straight from the chain. <a href="{REPO}">Open source</a> · <a href="/api">Free API</a>. Not financial advice.</div></footer>"#
         )
     };
     format!(
@@ -275,7 +281,7 @@ pub fn change(m: &Metrics, i: usize) -> f64 {
     if open > 0.0 && m.price.is_finite() { m.price / open - 1.0 } else { f64::NAN }
 }
 
-fn dir(x: f64) -> &'static str {
+pub(crate) fn dir(x: f64) -> &'static str {
     if x > 0.0 {
         "u"
     } else if x < 0.0 {
@@ -283,6 +289,123 @@ fn dir(x: f64) -> &'static str {
     } else {
         "m"
     }
+}
+
+/// Trades looked at for makers and top traders (newest first).
+const TRADER_SCAN: usize = 100_000;
+
+/// Unique wallets that traded in each window (`WINDOWS`): (makers, buyers, sellers), from
+/// the pool's stored trades. Cached for 15 s per pool: a busy pool has many thousands.
+pub fn makers(store: &Store, p: u32, now: u32) -> [(u32, u32, u32); 4] {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{LazyLock, Mutex};
+    type Cache = HashMap<u32, (std::time::Instant, [(u32, u32, u32); 4])>;
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+    if let Some((at, m)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&p)
+        && at.elapsed().as_secs() < 15
+    {
+        return *m;
+    }
+    let mut sets: [[HashSet<[u8; 20]>; 3]; 4] = Default::default();
+    let from = now.saturating_sub(WINDOWS[3].1);
+    for (_, t) in store.trades(p, (u32::MAX, u32::MAX), TRADER_SCAN) {
+        if t.ts < from {
+            break;
+        }
+        if t.kind != TradeKind::Swap {
+            continue;
+        }
+        for (w, (_, secs)) in WINDOWS.iter().enumerate() {
+            if t.ts + secs >= now {
+                sets[w][0].insert(t.maker);
+                sets[w][if t.buy { 1 } else { 2 }].insert(t.maker);
+            }
+        }
+    }
+    let m = sets.map(|[a, b, s]| (a.len() as u32, b.len() as u32, s.len() as u32));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 10_000 {
+        cache.clear();
+    }
+    cache.insert(p, (std::time::Instant::now(), m));
+    m
+}
+
+/// Live fields plus makers per window (`k5m` …), which need the store.
+pub fn fields_full(st: &State, store: &Store, p: u32) -> Vec<(String, String, &'static str)> {
+    let mut fs = fields(st, p);
+    for ((name, _), (makers, _, _)) in WINDOWS.iter().zip(makers(store, p, st.head_ts)) {
+        fs.push((format!("k{name}"), s(|o| fmt::uint(o, makers as u64)), ""));
+    }
+    fs
+}
+
+/// The most profitable wallets among a pool's last `TRADER_SCAN` trades, as table rows:
+/// what they bought and sold, and profit counting what they still hold at today's price.
+pub fn top_traders(st: &State, store: &Store, p: u32) -> String {
+    #[derive(Default)]
+    struct W {
+        bought: f64,
+        sold: f64,
+        got: f64,
+        gave: f64,
+        n: u32,
+    }
+    let pool = &st.pools[p as usize];
+    let mut by: std::collections::HashMap<[u8; 20], W> = Default::default();
+    for (_, t) in store.trades(p, (u32::MAX, u32::MAX), TRADER_SCAN) {
+        if t.kind != TradeKind::Swap || !t.usd.is_finite() {
+            continue;
+        }
+        let w = by.entry(t.maker).or_default();
+        w.n += 1;
+        if t.buy {
+            (w.bought, w.got) = (w.bought + t.usd as f64, w.got + t.base);
+        } else {
+            (w.sold, w.gave) = (w.sold + t.usd as f64, w.gave + t.base);
+        }
+    }
+    let price = pool.price_usd;
+    let mut ws: Vec<([u8; 20], W, f64)> = by
+        .into_iter()
+        .map(|(a, w)| {
+            let held = (w.got - w.gave).max(0.0) * if price.is_finite() { price } else { 0.0 };
+            let pnl = w.sold + held - w.bought;
+            (a, w, pnl)
+        })
+        .collect();
+    ws.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+    let bs = Esc(sym(st, pool.base())).to_string();
+    ws.iter()
+        .take(50)
+        .enumerate()
+        .map(|(i, (a, w, pnl))| {
+            let amount = |usd: f64, base: f64| {
+                s(|o| {
+                    fmt::usd_compact(o, usd);
+                    o.push_str(r#"<small class="m">"#);
+                    fmt::compact(o, base);
+                    let _ = write!(o, " {bs}</small>");
+                })
+            };
+            format!(
+                r#"<tr><td class="l m">{n}</td><td class="l"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{short}</button></td><td class="u">{bought}</td><td class="d">{sold}</td><td class="{cls}">{pnl}</td><td class="hide-s">{trades}</td></tr>"#,
+                n = i + 1,
+                maker = hex(a),
+                short = short(a),
+                bought = amount(w.bought, w.got),
+                sold = amount(w.sold, w.gave),
+                cls = if *pnl >= 0.0 { "u" } else { "d" },
+                pnl = s(|o| {
+                    if *pnl >= 0.0 {
+                        o.push('+');
+                    }
+                    fmt::usd_compact(o, *pnl);
+                }),
+                trades = w.n,
+            )
+        })
+        .collect()
 }
 
 /// Live fields of a pair page: (id, text, class). Used for the first render and for updates.
@@ -394,8 +517,16 @@ pub fn trade_row(st: &State, pool: &Pool, (block, index): (u32, u32), t: &Trade)
     });
     let price = if t.kind == TradeKind::Swap { s(|o| fmt::usd(o, t.price_usd as f64)) } else { "–".into() };
     format!(
-        r#"<tr data-k="{block}-{index}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{maker_s}</button></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
+        r#"<tr data-k="{block}-{index}" data-t="{ts}" data-u="{pu}" data-n="{pn}" data-s="{side}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{maker_s}</button></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
         time = s(|o| fmt::date_clock(o, t.ts as i64)),
+        ts = t.ts,
+        pu = t.price_usd,
+        pn = t.price_native,
+        side = match t.kind {
+            TradeKind::Swap if t.buy => "b",
+            TradeKind::Swap => "s",
+            _ => "l",
+        },
         total = s(|o| fmt::usd_compact(o, t.usd as f64)),
         maker = hex(&t.maker),
         maker_s = short(&t.maker),
@@ -431,7 +562,7 @@ fn avatar(st: &State, token: u32, large: bool) -> String {
     )
 }
 
-fn pair_name(st: &State, pool: &Pool, dex: bool) -> String {
+pub(crate) fn pair_name(st: &State, pool: &Pool, dex: bool) -> String {
     let mut out = format!(
         r#"<span class="pairname">{}<span><b>{}</b><span class="q">/{}</span></span>"#,
         avatar(st, pool.base(), false),
@@ -445,107 +576,23 @@ fn pair_name(st: &State, pool: &Pool, dex: bool) -> String {
     out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Tab {
-    Trending,
-    Top,
-    Gainers,
-    New,
-}
-
-pub const TABS: [(Tab, &str, &str); 4] = [
-    (Tab::Trending, "trending", "Trending"),
-    (Tab::Top, "top", "Top volume"),
-    (Tab::Gainers, "gainers", "Gainers"),
-    (Tab::New, "new", "New pairs"),
-];
-
-/// Ranked pools for a home tab.
-pub fn list(st: &State, tab: Tab) -> Vec<u32> {
-    let head = st.head_ts;
-    let mut rows: Vec<(u32, f64)> = st
-        .stats
-        .keys()
-        .filter(|&&p| st.pools[p as usize].trusted())
-        .filter_map(|&p| {
-            let m = metrics(st, p);
-            let pool = &st.pools[p as usize];
-            let score = match tab {
-                Tab::Trending if m.liq >= 10_000.0 => m.w[1].vol,
-                Tab::Top if m.liq >= 10_000.0 => m.w[3].vol,
-                Tab::Gainers if m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0 => change(&m, 3),
-                Tab::New if m.liq >= 5_000.0 && pool.created_ts + 3 * 86_400 > head => pool.created_ts as f64,
-                _ => return None,
-            };
-            (score.is_finite() && score > 0.0).then_some((p, score))
-        })
-        .collect();
-    rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    rows.truncate(100);
-    rows.into_iter().map(|(p, _)| p).collect()
-}
-
-/// A list of pairs; `src` serves fresh rows (see `list_rows`) that app.js swaps in.
-fn table(st: &State, pools: &[u32], src: &str) -> String {
-    if pools.is_empty() {
-        return r#"<p class="empty">Nothing here yet. The indexer may still be catching up.</p>"#.into();
-    }
-    format!(
-        r#"<div class="card scroll" data-list="{src}"><table class="list"><thead><tr><th>#</th><th class="l">Pair</th><th>Price</th><th class="hide-s">5m</th><th class="hide-s">1h</th><th class="hide-s">6h</th><th>24h</th><th>Volume</th><th>Liquidity</th><th class="hide-s">FDV</th><th class="hide-s">Txns</th><th class="hide-s">Age</th></tr></thead><tbody>{}</tbody></table></div>"#,
-        list_rows(st, pools)
-    )
-}
-
-/// The rows of a pair list.
-pub fn list_rows(st: &State, pools: &[u32]) -> String {
-    let mut rows = String::new();
-    for (i, &p) in pools.iter().enumerate() {
-        let pool = &st.pools[p as usize];
-        let m = metrics(st, p);
-        let txns = m.w[3].buys + m.w[3].sells;
-        let _ = write!(
-            rows,
-            r#"<tr><td class="n">{n}</td><td class="l"><a href="/base/{key}">{name}</a></td><td>{price}</td>"#,
-            n = i + 1,
-            key = pool.key(),
-            name = pair_name(st, pool, true),
-            price = s(|o| fmt::usd(o, m.price)),
-        );
-        for w in 0..4 {
-            let c = change(&m, w);
-            let hide = if w < 3 { " hide-s" } else { "" };
-            let _ = write!(rows, r#"<td class="{}{hide}">{}</td>"#, dir(c), s(|o| fmt::pct(o, c)));
-        }
-        let _ = write!(
-            rows,
-            r#"<td>{vol}</td><td>{liq}</td><td class="hide-s">{fdv}</td><td class="hide-s">{txns}</td><td class="hide-s m">{age}</td></tr>"#,
-            vol = s(|o| fmt::usd_compact(o, m.w[3].vol)),
-            liq = s(|o| fmt::usd_compact(o, m.liq)),
-            fdv = s(|o| fmt::usd_compact(o, m.fdv)),
-            txns = s(|o| fmt::compact(o, txns as f64)),
-            age = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
-        );
-    }
-    rows
-}
-
-pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
-    let tabs: String = TABS
-        .iter()
-        .map(|(t, slug, label)| {
-            let href = if *t == Tab::Trending { "/".to_string() } else { format!("/?tab={slug}") };
-            let cur = if *t == tab { r#" aria-current="page""# } else { "" };
-            format!(r#"<a href="{href}"{cur}>{label}</a>"#)
-        })
-        .collect();
-    let body = format!(
-        r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain. Free, fast and open source.</p>{SEARCH_FORM}<div class="links">Embed any chart · <a href="{REPO}">Read the code ↗</a></div></div></section><main class="wrap"><nav class="tabs" aria-label="Lists">{tabs}</nav>{}</main>"#,
-        table(st, pools, &format!("/api/list?tab={}", TABS.iter().find(|x| x.0 == tab).map(|x| x.1).unwrap_or("")))
-    );
-    let path = match tab {
-        Tab::Trending => "/".to_string(),
-        t => format!("/?tab={}", TABS.iter().find(|x| x.0 == t).map(|x| x.1).unwrap_or("")),
+pub fn home(app: &App, st: &State, f: &Filter, pools: &[u32]) -> String {
+    let empty = if f.tab() == Tab::Watch {
+        "Star pairs (★) to keep them here. The list lives in this browser."
+    } else {
+        "Nothing matches. Try other filters, or wait: the indexer may still be catching up."
     };
+    let src = match f.tab() {
+        Tab::Watch => "/api/list?tab=watch".to_string(),
+        _ => format!("/api/list?{}", f.query(&[])),
+    };
+    let body = format!(
+        r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain. Free, fast and open source.</p>{SEARCH_FORM}<div class="links">Embed any chart · <a href="/api">Free API</a> · <a href="{REPO}">Read the code ↗</a></div></div></section><main class="wrap">{}{}</main>"#,
+        lists::controls(f),
+        lists::table(st, pools, Some(f), &src, empty),
+    );
+    let q = f.query(&[]);
+    let path = if q.is_empty() { "/".to_string() } else { format!("/?{q}") };
     let head = Head {
         title: format!("{SITE}: live prices and charts for every token on Base"),
         desc: "Fast, free and open-source DEX screener for Base. Live charts, trades, liquidity and volume for every Uniswap, Aerodrome and PancakeSwap pool.".into(),
@@ -563,13 +610,105 @@ pub fn search(app: &App, st: &State, q: &str, pools: &[u32]) -> String {
         r#"<main class="wrap"><h1>Results for “{}”</h1><p class="sub">{} pairs, most liquid first.</p>{}</main>"#,
         Esc(q),
         pools.len(),
-        table(st, pools, &format!("/api/list?q={}", urlencode(q)))
+        lists::table(st, pools, None, &format!("/api/list?q={}", urlencode(q)), "No matches.")
     );
     let head = Head {
         title: format!("{} on Base | {SITE}", q),
         desc: format!("Base pairs matching {q}: live price, chart, liquidity and volume."),
         path: format!("/search?q={}", urlencode(q)),
         image: None,
+        miniapp: None,
+        player: None,
+        embed: false,
+    };
+    layout(app, &head, &body)
+}
+
+/// /api: how to use the public JSON API (see `api`).
+pub fn api_docs(app: &App, st: &State) -> String {
+    let base = &app.cfg.public_url;
+    // Live examples with a real pair and token.
+    let weth = st.token_ix.get(&crate::abi::WETH).map(|&t| &st.tokens[t as usize]);
+    let pair =
+        weth.filter(|t| t.best_pool != NONE).map(|t| st.pools[t.best_pool as usize].key()).unwrap_or("0x…".into());
+    let token = hex(&crate::abi::WETH);
+    let endpoint = |path: &str, what: &str, params: &[(&str, &str)], example: &str| {
+        let params: String = params
+            .iter()
+            .map(|(n, d)| format!("<tr><td class=\"l mono\">{n}</td><td class=\"l\">{d}</td></tr>"))
+            .collect();
+        let params = if params.is_empty() {
+            params
+        } else {
+            format!(r#"<table class="params"><tbody>{params}</tbody></table>"#)
+        };
+        format!(
+            r#"<section class="card ep"><h2><span class="get">GET</span> <code>{path}</code></h2><p>{what}</p>{params}<p class="ex">Try it: <a class="mono" href="{example}" rel="nofollow">{example}</a></p></section>"#
+        )
+    };
+    let body = format!(
+        r#"<main class="wrap docs"><h1>Free API</h1><p class="sub">Everything on {SITE} as JSON: pairs, tokens, candles, trades and lists for every pool on Base. No key, no sign-up, and any website may call it (CORS is open).</p>
+<div class="card note-card"><p><b>Limits.</b> {limit} requests a minute per IP. Responses are cached at the edge for a few seconds (older candles and trades for a day), and cached answers don't count. Past the limit you get <code>429</code> with <code>Retry-After</code>; <code>X-RateLimit-Remaining</code> says how many are left. Need more? The code is open source: run your own.</p><p><b>Conventions.</b> Pairs are pool addresses (v4 pools: their 32-byte id). Times are Unix seconds. Prices in USD use on-chain stablecoin pools; a pair whose quote token has no USD price yet has <code>price_usd: null</code>. <code>trusted</code> is true for pools from known DEX factories (and v4); only those set token prices.</p></div>
+{}{}{}{}{}{}
+<p class="sub">Questions or ideas: <a href="{REPO}">open an issue</a>.</p></main>"#,
+        endpoint(
+            "/api/v1/search?q=",
+            "Pairs for a symbol, name or address, best match first (up to 20).",
+            &[("q", "symbol (degen), name, or a pair or token address")],
+            &format!("{base}/api/v1/search?q=degen")
+        ),
+        endpoint(
+            "/api/v1/pairs/{pair}",
+            "One pair: tokens, price, liquidity, FDV, pooled amounts, and change, volume and buys/sells over 5m, 1h, 6h and 24h. A token address gives its deepest pair.",
+            &[],
+            &format!("{base}/api/v1/pairs/{pair}")
+        ),
+        endpoint(
+            "/api/v1/pairs/{pair}/candles",
+            "OHLCV candles, oldest first: <code>[time, open, high, low, close, volume_usd]</code>.",
+            &[
+                ("res", "1m, 5m, 15m (default), 1h, 4h or 1d"),
+                ("unit", "usd (default) or native (in the quote token)"),
+                ("before", "only candles before this time (paging back)"),
+                ("limit", "1–1000, default 300")
+            ],
+            &format!("{base}/api/v1/pairs/{pair}/candles?res=1h")
+        ),
+        endpoint(
+            "/api/v1/pairs/{pair}/trades",
+            "Trades, newest first, including liquidity adds and removals (<code>type</code>: buy, sell, add, remove). Pass <code>next</code> back as <code>before</code> for older ones.",
+            &[
+                ("before", "a trade id (block-index) to page from"),
+                ("maker", "only this wallet's trades"),
+                ("limit", "1–500, default 100")
+            ],
+            &format!("{base}/api/v1/pairs/{pair}/trades?limit=20")
+        ),
+        endpoint(
+            "/api/v1/tokens/{token}",
+            "A token: price, supply, FDV, description and links, safety checks, and its pairs on known DEXes (deepest first, up to 50).",
+            &[],
+            &format!("{base}/api/v1/tokens/{token}")
+        ),
+        endpoint(
+            "/api/v1/lists/{tab}",
+            "The home lists: trending, top, gainers, losers or new (up to 100 pairs), with the same filters as the site.",
+            &[
+                ("w", "window for trending, gainers and losers: 5m, 1h, 6h, 24h"),
+                ("liq, vol, txns", "minimum liquidity, 24h volume (USD) and 24h transactions"),
+                ("age", "created at most this many hours ago"),
+                ("sort, dir", "price, c5m, c1h, c6h, c24h, vol, liq, fdv, txns or age; dir=asc for ascending")
+            ],
+            &format!("{base}/api/v1/lists/gainers?w=1h&liq=50000")
+        ),
+        limit = crate::api::LIMIT,
+    );
+    let head = Head {
+        title: format!("Free API for Base DEX data | {SITE}"),
+        desc: "Free JSON API for every Base DEX pool: pairs, tokens, candles, trades and lists. No key, CORS open."
+            .into(),
+        path: "/api".into(),
+        image: Some(format!("{}/og.png", app.cfg.public_url)),
         miniapp: None,
         player: None,
         embed: false,
@@ -616,12 +755,23 @@ pub fn chart_data(
         .collect()
 }
 
-/// The base token: what it says about itself (see `icons`), its supply, and what this
-/// pool holds.
-fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'static str)]) -> String {
-    let base = &st.tokens[pool.base() as usize];
+/// Uniswap's swap page on Base, buying the base token with the quote token (ETH for WETH).
+pub fn buy_url(st: &State, pool: &Pool) -> String {
+    let token = |t: u32| {
+        let a = st.tokens[t as usize].addr;
+        if a == crate::abi::WETH { "ETH".to_string() } else { hex(&a) }
+    };
+    format!(
+        "https://app.uniswap.org/swap?chain=base&inputCurrency={}&outputCurrency={}",
+        token(pool.quote()),
+        token(pool.base())
+    )
+}
+
+/// A token's description and links (see `icons`) as HTML, each empty when unknown.
+fn profile(store: &Store, token: crate::abi::Addr) -> (String, String) {
     let profile: serde_json::Value =
-        store.profiles.get(base.addr).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
+        store.profiles.get(token).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
     let desc = match profile["d"].as_str() {
         Some(d) if !d.is_empty() => format!(r#"<p class="desc">{}</p>"#, Esc(d)),
         _ => String::new(),
@@ -640,14 +790,163 @@ fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'s
         })
         .collect();
     let links = if links.is_empty() { links } else { format!(r#"<div class="links">{links}</div>"#) };
+    (desc, links)
+}
+
+/// A token's page: price, totals across its pools, what it says about itself, safety
+/// checks and every pair it trades in.
+pub fn token(app: &App, st: &State, store: &Store, t: u32) -> String {
+    let tok = &st.tokens[t as usize];
+    let best = tok.best_pool;
+    let mut pools: Vec<u32> = st.base_pools.get(&t).cloned().unwrap_or_default();
+    pools.sort_unstable_by(|a, b| st.liq(*b).total_cmp(&st.liq(*a)));
+    let (liq, vol) = pools.iter().fold((0.0, 0.0), |(l, v), &p| {
+        let m = metrics(st, p);
+        (l + if m.liq.is_finite() { m.liq } else { 0.0 }, v + if m.w[3].vol.is_finite() { m.w[3].vol } else { 0.0 })
+    });
+    let symbol = sym(st, t);
+    let name = if tok.name.is_empty() { symbol } else { &tok.name };
+    let (desc, links) = profile(store, tok.addr);
+    let (ch, buy, safety) = if best == NONE {
+        (f64::NAN, String::new(), String::new())
+    } else {
+        let pool = &st.pools[best as usize];
+        let buy = format!(
+            r#"<a class="btn btn-primary buy" href="{}" target="_blank" rel="noopener nofollow">Buy on Uniswap ↗</a>"#,
+            buy_url(st, pool)
+        );
+        (change(&metrics(st, best), 3), buy, safety_card(st, store, best))
+    };
+    let keys: Vec<String> = pools.iter().map(|&p| st.pools[p as usize].key()).collect();
+    let table =
+        lists::table(st, &pools, None, &format!("/api/list?pairs={}", keys.join(",")), "No pairs on known DEXes yet.");
+    let stat = |label: &str, v: String| format!("<div><dt>{label}</dt><dd>{v}</dd></div>");
+    let body = format!(
+        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><h1>{name_e}</h1><span class="name">{sym_e} · <a class="mono m" href="{EXPLORER}/token/{addr}" rel="nofollow">{short}</a></span></div></div><div class="px"><div><div class="big">{price}</div></div><span class="chg"><span class="{cls}">{ch}</span></span>{buy}</div></div><div class="pair"><section><dl class="card kv kv4">{stats}</dl><h2 class="sect">Pairs</h2>{table}</section><aside><div class="card tok"><h2>About {name_e}</h2>{desc}{links}</div>{safety}</aside></div></main>"#,
+        av = avatar(st, t, true),
+        name_e = Esc(name),
+        sym_e = Esc(symbol),
+        addr = hex(&tok.addr),
+        short = short(&tok.addr),
+        price = s(|o| fmt::usd(o, tok.usd)),
+        cls = dir(ch),
+        ch = s(|o| fmt::pct(o, ch)),
+        stats = [
+            stat("Liquidity", s(|o| fmt::usd_compact(o, liq))),
+            stat("Volume 24h", s(|o| fmt::usd_compact(o, vol))),
+            stat("FDV", s(|o| fmt::usd_compact(o, tok.supply * tok.usd))),
+            stat("Supply", s(|o| fmt::compact(o, tok.supply))),
+        ]
+        .concat(),
+    );
+    let head = Head {
+        title: format!("{symbol} price {} | {name} on Base | {SITE}", s(|o| fmt::usd(o, tok.usd))),
+        desc: format!(
+            "{name} ({symbol}) on Base: price, liquidity and volume across {} pairs, links and safety checks.",
+            pools.len()
+        ),
+        path: format!("/base/token/{}", hex(&tok.addr)),
+        image: (best != NONE).then(|| {
+            format!("{}/og/base/{}.png?v={}", app.cfg.public_url, st.pools[best as usize].key(), st.head_ts / 300)
+        }),
+        miniapp: None,
+        player: None,
+        embed: false,
+    };
+    layout(app, &head, &body)
+}
+
+/// The base token: what it says about itself (see `icons`), its supply, and what this
+/// pool holds.
+fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'static str)]) -> String {
+    let base = &st.tokens[pool.base() as usize];
+    let (desc, links) = profile(store, base.addr);
     format!(
-        r#"<div class="card tok"><h2>About {name}</h2>{desc}{links}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
+        r#"<div class="card tok"><h2>About {name} <a class="m" href="/base/token/{addr}">· token page</a></h2>{desc}{links}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
         name = Esc(if base.name.is_empty() { sym(st, pool.base()) } else { &base.name }),
+        addr = hex(&base.addr),
         supply = field(fs, "sup"),
         bs = Esc(sym(st, pool.base())),
         qs = Esc(sym(st, pool.quote())),
         bb = field(fs, "pb"),
         qb = field(fs, "pq"),
+    )
+}
+
+/// What the chain says about the base token's risks (see `safety`), and whether anyone
+/// has managed to sell it lately.
+fn safety_card(st: &State, store: &Store, p: u32) -> String {
+    let pool = &st.pools[p as usize];
+    let base = &st.tokens[pool.base() as usize];
+    let v: serde_json::Value =
+        store.safety.get(base.addr).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
+    // (label, value, Some(true) fine / Some(false) a warning / None neutral)
+    let mut rows: Vec<(&str, String, Option<bool>)> = Vec::new();
+    if v["t"].is_null() {
+        rows.push(("Contract checks", "Not run yet".into(), None));
+    } else {
+        rows.push(match v["owner"].as_str().unwrap_or("none") {
+            "renounced" => ("Ownership", "Renounced".into(), Some(true)),
+            "none" => ("Ownership", "No owner".into(), Some(true)),
+            a => (
+                "Ownership",
+                format!(
+                    r#"<a class="mono" href="{EXPLORER}/address/{0}" rel="nofollow">{1}</a>"#,
+                    Esc(a),
+                    Esc(&a
+                        .chars()
+                        .take(6)
+                        .chain("…".chars())
+                        .chain(a.chars().skip(a.len().saturating_sub(4)))
+                        .collect::<String>())
+                ),
+                Some(false),
+            ),
+        });
+        let flag = |key: &str, yes: &str, no: &str| {
+            let on = v[key].as_bool().unwrap_or(false);
+            ((if on { yes } else { no }).to_string(), Some(!on))
+        };
+        let (t, ok) = flag("upgradeable", "Yes, by its admin", "No");
+        rows.push(("Upgradeable", t, ok));
+        let (t, ok) = flag("mint", "Has a mint function", "None found");
+        rows.push(("Minting", t, ok));
+        let on = v["pause"].as_bool().unwrap_or(false) || v["blacklist"].as_bool().unwrap_or(false);
+        rows.push(("Pause or blacklist", (if on { "Found" } else { "None found" }).into(), Some(!on)));
+        match &v["lp"] {
+            lp if lp["pool"].as_str() == Some(pool.key().as_str()) => {
+                let burned = lp["burned"].as_f64().unwrap_or(0.0);
+                rows.push((
+                    "Liquidity burned",
+                    s(|o| fmt::pct(o, burned)).trim_start_matches('+').to_string(),
+                    Some(burned >= 0.95),
+                ));
+            }
+            _ if pool.is_address() && matches!(pool.kind, crate::abi::Kind::V2 | crate::abi::Kind::Solidly) => {}
+            _ => rows.push(("Liquidity burned", "n/a (positions, not LP tokens)".into(), None)),
+        }
+    }
+    let (_, buyers, sellers) = makers(store, p, st.head_ts)[3];
+    rows.push((
+        "Sellers in 24h",
+        format!("{sellers} wallet{}", if sellers == 1 { "" } else { "s" }),
+        if buyers > 0 { Some(sellers > 0) } else { None },
+    ));
+    let rows: String = rows
+        .iter()
+        .map(|(label, value, ok)| {
+            let (cls, mark) = match ok {
+                Some(true) => ("ok", "✓"),
+                Some(false) => ("warn", "!"),
+                None => ("", "·"),
+            };
+            format!(
+                r#"<p><span>{label}</span><span>{value} <i class="sv {cls}" aria-hidden="true">{mark}</i></span></p>"#
+            )
+        })
+        .collect();
+    format!(
+        r#"<div class="card info safety"><h2>Safety checks</h2>{rows}<p class="fine">Read from the contract and recent trades. A heuristic, not an audit.</p></div>"#
     )
 }
 
@@ -682,7 +981,10 @@ fn other_pairs(st: &State, p: u32) -> String {
             )
         })
         .collect();
-    format!(r#"<div class="card pairs"><h2>Other pairs <span class="m">· liquidity</span></h2>{rows}</div>"#)
+    format!(
+        r#"<div class="card pairs"><h2>Other pairs <a class="m" href="/base/token/{}">· all</a></h2>{rows}</div>"#,
+        hex(&st.tokens[pool.base() as usize].addr)
+    )
 }
 
 /// Chart options (applied by app.js): price or market cap, USD or quote token, line, moving
@@ -701,8 +1003,8 @@ fn chart_tools(st: &State, pool: &Pool) -> String {
         out.push_str(&seg("native", "USD", &Esc(sym(st, pool.quote())).to_string()));
     }
     out.push_str(concat!(
-        r#"<button type="button" data-o="line" aria-pressed="false">Line</button>"#,
-        r#"<button type="button" data-o="ma" aria-pressed="false" title="Moving averages, 20 and 50 candles">MA</button>"#,
+        r#"<span class="seg"><button type="button" data-o="line" aria-pressed="false">Line</button><button type="button" data-o="log" aria-pressed="false" title="Logarithmic price scale">Log</button></span>"#,
+        r#"<span class="seg"><button type="button" data-o="ma" aria-pressed="false" title="Moving averages, 20 and 50 candles">MA</button><button type="button" data-o="vwap" aria-pressed="false" title="Volume-weighted average price, from each day's start">VWAP</button><button type="button" data-o="rsi" aria-pressed="false" title="Relative strength index, 14 candles">RSI</button></span>"#,
         r#"<button type="button" class="ic" data-o="reset" aria-label="Reset chart view" title="Reset view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/></svg></button>"#,
         r#"<button type="button" class="ic" data-o="full" aria-label="Fullscreen chart" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>"#,
         "</div>"
@@ -729,7 +1031,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let (base, quote) = (&st.tokens[pool.base() as usize], &st.tokens[pool.quote() as usize]);
     let (bs, qs) = (sym(st, pool.base()), sym(st, pool.quote()));
     let key = pool.key();
-    let fs = fields(st, p);
+    let fs = fields_full(st, store, p);
     let f = |id: &str| field(&fs, id);
     let candles = chart_data(st, store, p, ri, u32::MAX, CHART_CANDLES, false);
     let svg = s(|o| chart::render(&candles, &chart::View::latest(candles.len(), 960.0, 440.0, RES[ri] as f64), o));
@@ -789,11 +1091,12 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         .iter()
         .map(|(n, _)| {
             format!(
-                r#"<tr><td class="l">{n}</td><td>{}</td><td>{}</td><td class="u">{}</td><td class="d">{}</td></tr>"#,
+                r#"<tr><td class="l">{n}</td><td>{}</td><td>{}</td><td><span class="u">{}</span> <span class="m">/</span> <span class="d">{}</span></td><td>{}</td></tr>"#,
                 f(&format!("c{n}")),
                 f(&format!("v{n}")),
                 f(&format!("b{n}")),
-                f(&format!("s{n}"))
+                f(&format!("s{n}")),
+                f(&format!("k{n}"))
             )
         })
         .collect();
@@ -819,10 +1122,12 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         urlencode(&format!("{url}?s={}", st.head_ts / 3600))
     );
     let body = format!(
-        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span></div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table>{more}</div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div>{token}{others}<div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
+        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div><button type="button" class="star" data-star="{key}" aria-pressed="false" aria-label="Watch this pair">★</button></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span><a class="btn btn-primary buy" href="{buy}" target="_blank" rel="noopener nofollow">Buy on Uniswap ↗</a></div></div>{chart}<div class="card scroll"><div class="tt" role="tablist" aria-label="Trades"><button type="button" role="tab" aria-selected="true" data-tab="trades">Trades</button><button type="button" role="tab" aria-selected="false" data-tab="traders">Top traders</button></div><div id="traders" hidden></div><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table>{more}</div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l"><span class="sr">Window</span></th><th>Change</th><th>Volume</th><th>Buys / Sells</th><th title="Unique wallets that traded">Makers</th></tr></thead><tbody>{windows}</tbody></table></div>{token}{safety}{others}<div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
         av = avatar(st, pool.base(), true),
+        buy = buy_url(st, pool),
         more = more_button(&trades),
         token = token_card(st, store, pool, &fs),
+        safety = safety_card(st, store, p),
         others = other_pairs(st, p),
         bs_e = Esc(bs),
         c24 = f("c24h"),
@@ -847,7 +1152,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
 pub fn live(st: &State, store: &Store, p: u32, after: (u32, u32)) -> (String, (u32, u32)) {
     let pool = &st.pools[p as usize];
     let fs: serde_json::Map<String, serde_json::Value> =
-        fields(st, p).into_iter().map(|(id, text, cls)| (id, serde_json::json!([text, cls]))).collect();
+        fields_full(st, store, p).into_iter().map(|(id, text, cls)| (id, serde_json::json!([text, cls]))).collect();
     // The latest candle of every resolution, in USD ("c") and in the quote token ("n").
     let latest = |native: bool| -> serde_json::Map<String, serde_json::Value> {
         RES.iter()
