@@ -39,6 +39,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/i/{file}", get(icon))
         .route("/api/candles/{id}", get(candles))
         .route("/api/live/{id}", get(live))
+        .route("/api/trades/{id}", get(trades))
         .route("/healthz", get(health))
         .fallback(|Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) })
         .layer(axum::middleware::from_fn(no_www))
@@ -275,6 +276,8 @@ async fn icon(Ax(app): A, Path(file): Path<String>) -> Response {
 struct CandlesQ {
     res: Option<u32>,
     before: Option<u32>,
+    /// "n": in the quote token instead of USD.
+    unit: Option<String>,
 }
 
 async fn candles(Ax(app): A, Path(id): Path<String>, Query(q): Query<CandlesQ>) -> Response {
@@ -283,12 +286,43 @@ async fn candles(Ax(app): A, Path(id): Path<String>, Query(q): Query<CandlesQ>) 
         return StatusCode::NOT_FOUND.into_response();
     };
     let ri = RES.iter().position(|&r| Some(r) == q.res).unwrap_or(2);
-    let data = pages::chart_data(&st, &app.sh.store, p, ri, q.before.unwrap_or(u32::MAX), pages::CHART_CANDLES);
+    let data = pages::chart_data(
+        &st,
+        &app.sh.store,
+        p,
+        ri,
+        q.before.unwrap_or(u32::MAX),
+        pages::CHART_CANDLES,
+        q.unit.as_deref() == Some("n"),
+    );
     let edge = if q.before.is_some() { 3600 } else { 3 };
     let mut r = cached("application/json", 0, pages::candles_json(&data));
     if let Ok(v) = HeaderValue::from_str(&format!("public, max-age=0, s-maxage={edge}")) {
         r.headers_mut().insert(header::CACHE_CONTROL, v);
     }
+    r
+}
+
+/// "b-i" (block, log index), as in trade cursors and live event ids.
+fn trade_cursor(s: &str) -> Option<(u32, u32)> {
+    let (b, i) = s.split_once('-')?;
+    Some((b.parse().ok()?, i.parse().ok()?))
+}
+
+#[derive(Deserialize)]
+struct TradesQ {
+    before: Option<String>,
+}
+
+async fn trades(Ax(app): A, Path(id): Path<String>, Query(q): Query<TradesQ>) -> Response {
+    let st = read(&app);
+    let Some(p) = pool_of(&st, &id) else { return StatusCode::NOT_FOUND.into_response() };
+    let Some(before) = q.before.as_deref().and_then(trade_cursor) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    // Older trades never change.
+    let mut r = cached("application/json", 0, pages::trades_page(&st, &app.sh.store, p, before));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600, s-maxage=86400"));
     r
 }
 
@@ -303,11 +337,7 @@ async fn live(Ax(app): A, Path(id): Path<String>, Query(q): Query<LiveQ>, header
     };
     // A reconnecting EventSource reports the last trade it got as the last event id.
     let last_id = headers.get("last-event-id").and_then(|v| v.to_str().ok());
-    let mut after = last_id
-        .or(q.after.as_deref())
-        .and_then(|a| a.split_once('-'))
-        .and_then(|(b, i)| Some((b.parse().ok()?, i.parse().ok()?)))
-        .unwrap_or((0, 0));
+    let mut after = last_id.or(q.after.as_deref()).and_then(trade_cursor).unwrap_or((0, 0));
     // Subscribe before the catch-up snapshot so nothing falls between them.
     let rx = app.sh.live.subscribe();
     let (first, newest) = pages::live(&read(&app), &app.sh.store, p, after);

@@ -38,7 +38,18 @@ pub struct View {
     pub cursor: Option<(f64, f64)>,
     /// Seconds added to timestamps for labels (the viewer's UTC offset).
     pub tz: f64,
+    /// `LINE`, `MA` and `COMPACT` flags.
+    pub opts: u32,
 }
+
+/// Draw a close-price line instead of candles.
+pub const LINE: u32 = 1;
+/// Overlay 20- and 50-candle moving averages of the close.
+pub const MA: u32 = 2;
+/// Label prices as 1.2M (for market cap).
+pub const COMPACT: u32 = 4;
+/// Moving average periods, drawn with classes `m1` and `m2`.
+const MAS: [usize; 2] = [20, 50];
 
 /// Width of the price axis on the right.
 pub const AXIS_W: f64 = 72.0;
@@ -70,7 +81,7 @@ impl View {
     pub fn latest(n: usize, w: f64, h: f64, res: f64) -> View {
         // ~9 px per candle, but a young pool's few candles shouldn't hug the right edge.
         let count = ((w - AXIS_W) / 9.0).min(n as f64 + 12.0).max(24.0).min(400.0);
-        View { w, h, res, start: n as f64 + 2.0 - count, count, cursor: None, tz: 0.0 }
+        View { w, h, res, start: n as f64 + 2.0 - count, count, cursor: None, tz: 0.0, opts: 0 }
     }
 
     fn plot_w(&self) -> f64 {
@@ -103,6 +114,8 @@ impl Frame {
 
 /// Renders `cs` (oldest first) into `out` as a complete `<svg>` element.
 pub fn render(cs: &[Candle], v: &View, out: &mut String) {
+    let (line, compact) = (v.opts & LINE != 0, v.opts & COMPACT != 0);
+    let num = |o: &mut String, x: f64, sig: i32| if compact { fmt::compact(o, x) } else { fmt::price_sig(o, x, sig) };
     let pw = v.plot_w();
     let base = v.h - AXIS_H;
     out.push_str(r#"<svg xmlns="http://www.w3.org/2000/svg" class="ch" viewBox="0 0 "#);
@@ -122,8 +135,8 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
 
     let (mut lo, mut hi, mut vmax) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
     for c in vis {
-        lo = lo.min(c.l);
-        hi = hi.max(c.h);
+        lo = lo.min(if line { c.c } else { c.l });
+        hi = hi.max(if line { c.c } else { c.h });
         vmax = vmax.max(c.v);
     }
     if hi <= lo {
@@ -149,12 +162,16 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     let sig = sig_digits(f.hi, tick);
     let mut grid = String::new();
     let mut labels = String::new();
+    // The last-price tag covers axis labels within its height.
+    let tag_y = cs.last().map(|c| f.y(c.c)).filter(|y| *y > LEGEND_H && *y < bottom);
     let mut p = (f.lo / tick).ceil() * tick;
     while p <= f.hi {
         let y = f.y(p);
         if y > LEGEND_H + 6.0 && y < bottom - 4.0 {
             path_h(&mut grid, y, pw);
-            text(&mut labels, "", pw + 8.0, y + 4.0, "start", |o| fmt::price_sig(o, p, sig));
+            if tag_y.is_none_or(|t| (t - y).abs() > 14.0) {
+                text(&mut labels, "", pw + 8.0, y + 4.0, "start", |o| num(o, p, sig));
+            }
         }
         p += tick;
     }
@@ -184,12 +201,17 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     // Volume, wicks and bodies: one path per color keeps the DOM tiny.
     let bw = (f.step * 0.72).max(1.0);
     let (mut up, mut down, mut vup, mut vdown) = (String::new(), String::new(), String::new(), String::new());
+    let mut close = String::new();
     for (k, c) in vis.iter().enumerate() {
         let x = f.x(i0 + k);
         let rising = c.c >= c.o;
         let (body, vol) = if rising { (&mut up, &mut vup) } else { (&mut down, &mut vdown) };
         if c.v > 0.0 {
             rect(vol, x - bw / 2.0, f.vy(c.v, base), bw, base - f.vy(c.v, base));
+        }
+        if line {
+            point(&mut close, k == 0, x, f.y(c.c));
+            continue;
         }
         let (yh, yl) = (f.y(c.h), f.y(c.l));
         rect(body, x - 0.5, yh, 1.0, (yl - yh).max(1.0));
@@ -200,6 +222,24 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     path(out, "vd", &vdown);
     path(out, "u", &up);
     path(out, "d", &down);
+    path(out, "ln", &close);
+    if v.opts & MA != 0 {
+        for (cls, n) in ["m1", "m2"].into_iter().zip(MAS) {
+            let mut d = String::new();
+            let mut sum: f64 = cs[i0.saturating_sub(n - 1)..i0].iter().map(|c| c.c).sum();
+            for i in i0..i0 + vis.len() {
+                sum += cs[i].c;
+                if i >= n {
+                    sum -= cs[i - n].c;
+                }
+                if i + 1 >= n {
+                    let first = d.is_empty();
+                    point(&mut d, first, f.x(i), f.y(sum / n as f64));
+                }
+            }
+            path(out, cls, &d);
+        }
+    }
     out.push_str(r#"<g class="a">"#);
     out.push_str(&labels);
     out.push_str("</g>");
@@ -214,7 +254,7 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
             out.push_str(r#"" d=""#);
             path_h(out, y, pw);
             out.push_str(r#""/>"#);
-            tag(out, cls, pw, y, |o| fmt::price_sig(o, last.c, sig.max(4)));
+            tag(out, cls, pw, y, |o| num(o, last.c, sig.max(4)));
         }
     }
 
@@ -231,7 +271,7 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
         path(out, "x", &d);
         if cy < bottom {
             let p = f.hi - (cy - f.top) / (f.bottom - f.top) * (f.hi - f.lo);
-            tag(out, "t", pw, cy, |o| fmt::price_sig(o, p, sig.max(4)));
+            tag(out, "t", pw, cy, |o| num(o, p, sig.max(4)));
         }
         let t = (cs[shown].t + v.tz) as i64;
         let w = 12.0 * CHAR_W;
@@ -247,11 +287,11 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
         out.push_str(r#""/>"#);
         text(out, "tc", x + w / 2.0, v.h - 7.0, "middle", |o| fmt::date_clock(o, t));
     }
-    legend(out, &cs[shown]);
+    legend(out, &cs[shown], compact);
     out.push_str("</svg>");
 }
 
-fn legend(out: &mut String, c: &Candle) {
+fn legend(out: &mut String, c: &Candle, compact: bool) {
     let change = if c.o != 0.0 { c.c / c.o - 1.0 } else { 0.0 };
     let cls = if c.c >= c.o { "u" } else { "d" };
     out.push_str(r#"<text class="a" x="6" y="17">"#);
@@ -260,7 +300,11 @@ fn legend(out: &mut String, c: &Candle) {
         out.push_str(r#" <tspan class=""#);
         out.push_str(cls);
         out.push_str(r#"">"#);
-        fmt::price(out, val);
+        if compact {
+            fmt::compact(out, val)
+        } else {
+            fmt::price(out, val)
+        }
         out.push_str("</tspan>  ");
     }
     out.push_str(r#"<tspan class=""#);
@@ -317,6 +361,14 @@ fn path(out: &mut String, cls: &str, d: &str) {
     out.push_str(r#"" d=""#);
     out.push_str(d);
     out.push_str(r#""/>"#);
+}
+
+/// Extends a polyline (`first` starts it).
+fn point(d: &mut String, first: bool, x: f64, y: f64) {
+    d.push(if first { 'M' } else { 'L' });
+    fmt::coord(d, x);
+    d.push(' ');
+    fmt::coord(d, y);
 }
 
 fn path_h(d: &mut String, y: f64, w: f64) {
@@ -383,6 +435,44 @@ mod tests {
         assert!(out.contains(r#"class="x""#), "crosshair drawn");
         assert!(out.contains("Vol $100"));
         assert!(out.len() < 40_000, "svg stays small: {}", out.len());
+        v.opts = LINE | MA | COMPACT;
+        out.clear();
+        render(&cs, &v, &mut out);
+        assert!(out.contains(r#"class="ln""#) && out.contains(r#"class="m1""#) && out.contains(r#"class="m2""#));
+        assert!(!out.contains(r#"<path class="u""#), "no candle bodies in line mode");
+    }
+
+    #[test]
+    fn moving_average_values() {
+        // Closes 1..=60: MA20 at the last candle is mean(41..=60) = 50.5.
+        let cs: Vec<Candle> = (1..=60)
+            .map(|i| Candle { t: i as f64 * 60.0, o: i as f64, h: i as f64, l: i as f64, c: i as f64, v: 1.0 })
+            .collect();
+        let mut v = View::latest(cs.len(), 600.0, 300.0, 60.0);
+        v.opts = MA;
+        let mut out = String::new();
+        render(&cs, &v, &mut out);
+        let ma20 = out.split(r#"class="m1" d=""#).nth(1).unwrap().split('"').next().unwrap();
+        let last_y: f64 = ma20.rsplit(' ').next().unwrap().parse().unwrap();
+        let close_y: f64 = {
+            let mut o = String::new();
+            v.opts = LINE;
+            render(&cs, &v, &mut o);
+            // Line through closes: find the point for close 50.5 by interpolating 50 and 51.
+            let pts: Vec<f64> = o
+                .split(r#"class="ln" d=""#)
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .split(['M', 'L'])
+                .filter(|s| !s.is_empty())
+                .map(|p| p.split(' ').nth(1).unwrap().parse().unwrap())
+                .collect();
+            (pts[pts.len() - 11] + pts[pts.len() - 10]) / 2.0
+        };
+        assert!((last_y - close_y).abs() < 0.6, "MA20 {last_y} vs close 50.5 at {close_y}");
     }
 
     #[test]

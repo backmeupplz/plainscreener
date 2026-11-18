@@ -1,5 +1,8 @@
-//! Token icons. Established tokens get theirs from CoinGecko's Base token list; launchpad
-//! tokens declare one on chain (Clanker's `imageUrl()`, Zora's `tokenURI()` metadata, …).
+//! Token icons and profiles (description and links).
+//!
+//! Sources, all free to store: CoinGecko's Base token list (logos), Trust Wallet's assets
+//! repo (MIT: logos, descriptions, links for established tokens), and what launchpad
+//! tokens declare on chain (Clanker's `imageUrl()`/`metadata()`, Zora's `tokenURI()`, …).
 //! Every image is redrawn to a small PNG here, so we never serve fetched bytes as-is.
 
 use crate::abi::{Addr, unhex};
@@ -9,6 +12,7 @@ use crate::{App, og};
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -19,51 +23,75 @@ const SIZE: u32 = 64;
 const MAX_BYTES: usize = 2 << 20;
 /// Seconds before looking again for a token that had no usable icon.
 const RETRY: u32 = 86_400;
-/// Only tokens with a pool at least this deep get an icon (the rest never reach a list).
+/// Seconds a profile is kept before it's looked up again.
+const PROFILE_TTL: u32 = 7 * 86_400;
+/// Only tokens with a pool at least this deep get looked up (the rest never reach a list).
 const MIN_LIQ: f64 = 1_000.0;
 const LIST: &str = "https://tokens.coingecko.com/base/all.json";
+const TW_DIR: &str = "https://api.github.com/repos/trustwallet/assets/contents/blockchains/base/assets";
+const TW_RAW: &str = "https://raw.githubusercontent.com/trustwallet/assets/master/blockchains/base/assets/";
 const IPFS: [&str; 2] = ["https://magic.decentralized-content.com/ipfs/", "https://gateway.pinata.cloud/ipfs/"];
-/// imageUrl(), image(), tokenURI(), contractURI()
-const GETTERS: [[u8; 4]; 4] =
-    [[0xab, 0xa8, 0x31, 0x50], [0xf3, 0xcc, 0xaa, 0xc0], [0x3c, 0x13, 0x0d, 0x90], [0xe8, 0xa3, 0xd4, 0x85]];
+/// imageUrl(), image(), tokenURI(), contractURI(), metadata()
+const GETTERS: [[u8; 4]; 5] = [
+    [0xab, 0xa8, 0x31, 0x50],
+    [0xf3, 0xcc, 0xaa, 0xc0],
+    [0x3c, 0x13, 0x0d, 0x90],
+    [0xe8, 0xa3, 0xd4, 0x85],
+    [0x39, 0x2f, 0x37, 0xe9],
+];
+
+/// Token lists, refreshed daily: CoinGecko logo URLs, and Trust Wallet's folder names
+/// (checksummed addresses) for the tokens it has.
+#[derive(Default)]
+struct Lists {
+    logos: HashMap<Addr, String>,
+    trust: HashMap<Addr, String>,
+}
 
 pub async fn run(app: Arc<App>) {
     let http = client();
     let rpc = Rpc::new(&app.cfg.rpc_url);
-    let mut list = Arc::new(HashMap::new());
-    let mut list_at: Option<Instant> = None;
+    let mut lists = Arc::new(Lists::default());
+    let mut lists_at: Option<Instant> = None;
     // Tokens whose lookup failed for a passing reason (rate limit, timeout), and when.
     let mut backoff: HashMap<Addr, Instant> = HashMap::new();
     loop {
-        if list_at.is_none_or(|t| t.elapsed() > Duration::from_secs(86_400)) {
-            match coingecko(&http).await {
-                Ok(l) => (list, list_at) = (Arc::new(l), Some(Instant::now())),
-                Err(e) => eprintln!("icons: token list: {e:#}"),
+        if lists_at.is_none_or(|t| t.elapsed() > Duration::from_secs(86_400)) {
+            match tokio::try_join!(coingecko(&http), trust(&http)) {
+                Ok((logos, trust)) => (lists, lists_at) = (Arc::new(Lists { logos, trust }), Some(Instant::now())),
+                Err(e) => eprintln!("icons: token lists: {e:#}"),
             }
         }
-        // Without the list, established tokens would be marked icon-less.
-        if list_at.is_some() {
+        // Without the lists, established tokens would be stored as having nothing.
+        if lists_at.is_some() {
             backoff.retain(|_, at| at.elapsed() < Duration::from_secs(3600));
             let mut todo = todo(&app, &backoff).into_iter();
             let mut set = tokio::task::JoinSet::new();
             loop {
                 while set.len() < 4
-                    && let Some((t, addr)) = todo.next()
+                    && let Some((t, addr, icon)) = todo.next()
                 {
-                    let (http, rpc, list) = (http.clone(), rpc.clone(), list.clone());
-                    set.spawn(async move { (t, addr, find(&http, &rpc, &list, addr).await) });
+                    let (http, rpc, lists) = (http.clone(), rpc.clone(), lists.clone());
+                    set.spawn(async move { (t, addr, find(&http, &rpc, &lists, addr, icon).await) });
                 }
                 let Some(done) = set.join_next().await else { break };
                 let Ok((t, addr, found)) = done else { continue };
+                let store = &app.sh.store;
                 match found {
-                    Ok(Some(png)) => {
-                        if app.sh.store.icons.insert(addr, png).is_ok()
-                            && let Ok(mut s) = app.sh.state.write()
-                        {
-                            s.tokens[t as usize].icon = true;
+                    Ok(f) => {
+                        let _ = store.profiles.insert(addr, f.profile.to_string());
+                        match f.icon {
+                            Some(png) => {
+                                if store.icons.insert(addr, png).is_ok()
+                                    && let Ok(mut s) = app.sh.state.write()
+                                {
+                                    s.tokens[t as usize].icon = true;
+                                }
+                            }
+                            None if f.looked_for_icon => drop(store.icons.insert(addr, now().to_be_bytes())),
+                            None => {}
                         }
                     }
-                    Ok(None) => drop(app.sh.store.icons.insert(addr, now().to_be_bytes())),
                     Err(_) => drop(backoff.insert(addr, Instant::now())),
                 }
             }
@@ -76,52 +104,166 @@ fn now() -> u32 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
 }
 
-/// Up to 100 tokens worth an icon: never tried first, then ones whose last miss is a day
-/// old; deepest pools first within each.
-fn todo(app: &App, backoff: &HashMap<Addr, Instant>) -> Vec<(u32, Addr)> {
-    let tokens: Vec<(f64, u32, Addr)> = {
+/// Up to 100 tokens to look up, with whether they still need an icon: never looked up
+/// first, then due retries; deepest pools first within each.
+fn todo(app: &App, backoff: &HashMap<Addr, Instant>) -> Vec<(u32, Addr, bool)> {
+    let tokens: Vec<(f64, u32, Addr, bool)> = {
         let Ok(st) = app.sh.state.read() else { return Vec::new() };
         st.tokens
             .iter()
             .enumerate()
-            .filter(|(_, t)| !t.icon && t.best_pool != NONE && !backoff.contains_key(&t.addr))
-            .map(|(i, t)| (st.liq(t.best_pool), i as u32, t.addr))
+            .filter(|(_, t)| t.best_pool != NONE && !backoff.contains_key(&t.addr))
+            .map(|(i, t)| (st.liq(t.best_pool), i as u32, t.addr, t.icon))
             .filter(|(liq, ..)| *liq >= MIN_LIQ)
             .collect()
     };
-    let cutoff = now().saturating_sub(RETRY);
-    let mut out: Vec<(bool, f64, u32, Addr)> = tokens
+    let now = now();
+    let store = &app.sh.store;
+    let mut out: Vec<(bool, f64, u32, Addr, bool)> = tokens
         .into_iter()
-        .filter_map(|(liq, t, a)| match app.sh.store.icons.get(a) {
-            Ok(None) => Some((false, liq, t, a)),
-            Ok(Some(v)) if v.len() == 4 && u32::from_be_bytes(v[..4].try_into().unwrap_or_default()) < cutoff => {
-                Some((true, liq, t, a))
-            }
-            _ => None,
+        .filter_map(|(liq, t, a, has_icon)| {
+            // Icon: none stored, or a miss (4-byte timestamp) a day old.
+            let icon = !has_icon
+                && match store.icons.get(a) {
+                    Ok(None) => true,
+                    Ok(Some(v)) => v.len() == 4 && be32(&v) + RETRY < now,
+                    Err(_) => false,
+                };
+            let profile_at = store.profiles.get(a).ok().flatten().map(|v| profile_time(&v));
+            let new = profile_at.is_none();
+            let due = profile_at.is_none_or(|at| at + PROFILE_TTL < now);
+            (icon || due).then_some((!new, liq, t, a, icon))
         })
         .collect();
     out.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
-    out.into_iter().take(100).map(|(.., t, a)| (t, a)).collect()
+    out.into_iter().take(100).map(|(_, _, t, a, icon)| (t, a, icon)).collect()
 }
 
-/// The first usable icon from the token list or the token's own getters. `Ok(None)`: the
-/// token has none. `Err`: something failed that may work later (node, rate limit, timeout).
-async fn find(http: &reqwest::Client, rpc: &Rpc, list: &HashMap<Addr, String>, addr: Addr) -> Result<Option<Vec<u8>>> {
-    let mut urls: Vec<String> = list.get(&addr).cloned().into_iter().collect();
-    urls.extend(rpc.strings(addr, &GETTERS).await?.into_iter().flatten());
-    for url in urls {
-        let Some(mut bytes) = get(http, &url).await? else { continue };
-        // Metadata JSON (tokenURI and friends) points at the image.
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let Some(img) = v["image"].as_str() else { continue };
-            let Some(b) = get(http, img).await? else { continue };
-            bytes = b;
-        }
-        if let Ok(Some(png)) = tokio::task::spawn_blocking(move || og::icon_png(&bytes, SIZE)).await {
-            return Ok(Some(png));
+fn be32(b: &[u8]) -> u32 {
+    u32::from_be_bytes(b.get(..4).and_then(|b| b.try_into().ok()).unwrap_or_default())
+}
+
+fn profile_time(stored: &[u8]) -> u32 {
+    serde_json::from_slice::<Value>(stored).ok().and_then(|v| v["t"].as_u64()).unwrap_or(0) as u32
+}
+
+struct Found {
+    icon: Option<Vec<u8>>,
+    /// Whether we tried to find an icon (a miss is then remembered).
+    looked_for_icon: bool,
+    /// `{"t": looked up at, "d": description, "l": [[kind, url], …]}`
+    profile: Value,
+}
+
+/// Looks a token up in every source. `Err` when something failed that may work later
+/// (node, rate limit, timeout), so nothing is stored.
+async fn find(http: &reqwest::Client, rpc: &Rpc, lists: &Lists, addr: Addr, want_icon: bool) -> Result<Found> {
+    let mut images: Vec<String> = lists.logos.get(&addr).cloned().into_iter().collect();
+    let mut docs: Vec<Value> = Vec::new();
+    if let Some(dir) = lists.trust.get(&addr) {
+        images.push(format!("{TW_RAW}{dir}/logo.png"));
+        if let Some(b) = get(http, &format!("{TW_RAW}{dir}/info.json")).await?
+            && let Ok(v) = serde_json::from_slice(&b)
+        {
+            docs.push(v);
         }
     }
-    Ok(None)
+    let got = rpc.strings(addr, &GETTERS).await?;
+    images.extend(got[..2].iter().flatten().cloned()); // imageUrl(), image()
+    for uri in got[2..4].iter().flatten() {
+        // tokenURI(), contractURI(): metadata JSON, or sometimes the image itself.
+        if let Some(b) = get(http, uri).await? {
+            match serde_json::from_slice::<Value>(&b) {
+                Ok(v) => {
+                    images.extend(v["image"].as_str().map(String::from));
+                    docs.push(v);
+                }
+                Err(_) => images.push(uri.clone()),
+            }
+        }
+    }
+    if let Some(v) = got[4].as_deref().and_then(|m| serde_json::from_str(m).ok()) {
+        docs.push(v); // metadata(): Clanker's JSON with description and social links
+    }
+
+    let mut icon = None;
+    if want_icon {
+        for url in images {
+            let Some(bytes) = get(http, &url).await? else { continue };
+            if let Ok(Some(png)) = tokio::task::spawn_blocking(move || og::icon_png(&bytes, SIZE)).await {
+                icon = Some(png);
+                break;
+            }
+        }
+    }
+    Ok(Found { icon, looked_for_icon: want_icon, profile: profile(&docs) })
+}
+
+/// Description and links from metadata documents, earlier documents first.
+fn profile(docs: &[Value]) -> Value {
+    let desc = docs
+        .iter()
+        .filter_map(|d| d["description"].as_str())
+        .map(str::trim)
+        .find(|d| !d.is_empty())
+        .map(|d| d.chars().take(600).collect::<String>())
+        .unwrap_or_default();
+    let mut links: Vec<(&'static str, String)> = Vec::new();
+    for d in docs {
+        // A declared website before whatever URLs the document happens to list.
+        let mut urls: Vec<&str> =
+            ["website", "external_url", "websiteUrl"].iter().filter_map(|k| d[*k].as_str()).collect();
+        strings(d, &mut urls);
+        for url in urls {
+            if let Some(kind) = link_kind(url)
+                && !links.iter().any(|(k, _)| *k == kind)
+            {
+                links.push((kind, url.to_string()));
+            }
+        }
+    }
+    links.truncate(6);
+    json!({"t": now(), "d": desc, "l": links})
+}
+
+/// Every string in a JSON document.
+fn strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+    match v {
+        Value::String(s) => out.push(s),
+        Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+        Value::Object(o) => o.values().for_each(|x| strings(x, out)),
+        _ => {}
+    }
+}
+
+/// What a link in token metadata points at, or `None` for ones not worth showing
+/// (images, explorers, price sites, anything not plain HTTPS).
+pub fn link_kind(url: &str) -> Option<&'static str> {
+    if url.len() > 200 {
+        return None;
+    }
+    let u = reqwest::Url::parse(url).ok().filter(|u| u.scheme() == "https" && u.username().is_empty())?;
+    let host = u.host_str()?.trim_start_matches("www.");
+    let path = u.path().to_ascii_lowercase();
+    if [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].iter().any(|e| path.ends_with(e)) {
+        return None;
+    }
+    Some(match host {
+        "x.com" | "twitter.com" => "X",
+        "t.me" | "telegram.me" => "Telegram",
+        "warpcast.com" | "farcaster.xyz" => "Farcaster",
+        "discord.gg" | "discord.com" => "Discord",
+        "github.com" => "GitHub",
+        h if h.contains("scan.")
+            || h.contains("ipfs")
+            || ["coingecko.com", "coinmarketcap.com", "dexscreener.com", "geckoterminal.com"]
+                .iter()
+                .any(|s| h == *s || h.ends_with(&format!(".{s}"))) =>
+        {
+            return None;
+        }
+        _ => "Website",
+    })
 }
 
 /// Contents of a `data:`, `ipfs://` or `https://` URL, up to `MAX_BYTES`; errors as `fetch`.
@@ -237,9 +379,22 @@ fn client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Trust Wallet's Base tokens: address → folder name (the checksummed address).
+async fn trust(http: &reqwest::Client) -> Result<HashMap<Addr, String>> {
+    let v: Value = http.get(TW_DIR).send().await?.error_for_status()?.json().await?;
+    Ok(v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let name = e["name"].as_str()?;
+            Some((unhex(name)?.try_into().ok()?, name.to_string()))
+        })
+        .collect())
+}
+
 /// CoinGecko's Base list: token → 250 px logo URL.
 async fn coingecko(http: &reqwest::Client) -> Result<HashMap<Addr, String>> {
-    let v: serde_json::Value = http.get(LIST).send().await?.error_for_status()?.json().await?;
+    let v: Value = http.get(LIST).send().await?.error_for_status()?.json().await?;
     Ok(v["tokens"]
         .as_array()
         .into_iter()

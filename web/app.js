@@ -24,6 +24,18 @@ $('.theme')?.addEventListener('click', () => {
   } catch {}
 })
 
+// Older trades, a page at a time. Live trades push old rows out past `shown`.
+let shown = 50
+$('#more')?.addEventListener('click', async function more(e) {
+  const b = e.currentTarget
+  b.disabled = true
+  const r = await fetch(`/api/trades/${$('#chart').dataset.pool}?before=${b.dataset.before}`).then((r) => r.json())
+  $('#tr').insertAdjacentHTML('beforeend', r.rows)
+  shown = $('#tr').rows.length
+  if (r.more) (b.outerHTML = r.more), $('#more').addEventListener('click', more)
+  else b.remove()
+})
+
 const el = $('#chart')
 if (el) chart(el)
 
@@ -34,22 +46,40 @@ async function chart(el) {
   const w = (await WebAssembly.instantiateStreaming(fetch(el.dataset.wasm))).instance.exports
   const tz = -new Date().getTimezoneOffset() * 60
   let start = NaN, count = 0, cur = null, drag = null, frame = 0, busy = false, done = cs.length < 300
+  // Chart options, remembered per browser. Ones the page doesn't offer stay off.
+  const opt = { mcap: 0, native: 0, line: 0, ma: 0 }
+  try {
+    Object.assign(opt, JSON.parse(localStorage.getItem('chart')))
+  } catch {}
+  for (const o in opt) if (!$(`[data-o="${o}"]`)) opt[o] = 0
+  const supply = +el.dataset.supply
+  const flags = () => opt.line | (opt.ma << 1) | (opt.mcap << 2) // chart::LINE, MA, COMPACT
 
+  // Market cap is the price times the supply; volume stays in USD.
   const load = () => {
+    const k = opt.mcap ? supply : 1
     const p = w.data(cs.length)
-    new Float64Array(w.memory.buffer, p, cs.length * 6).set(cs.flat())
+    new Float64Array(w.memory.buffer, p, cs.length * 6).set(cs.flatMap((c) => [c[0], c[1] * k, c[2] * k, c[3] * k, c[4] * k, c[5]]))
   }
   const draw = () => {
     frame = 0
     const r = el.getBoundingClientRect()
-    const p = w.draw(r.width, r.height, res, start, count, cur ? cur[0] : -1, cur ? cur[1] : -1, tz)
+    const p = w.draw(r.width, r.height, res, start, count, cur ? cur[0] : -1, cur ? cur[1] : -1, tz, flags())
     el.innerHTML = new TextDecoder().decode(new Uint8Array(w.memory.buffer, p, w.len()))
     start = w.start()
     count = w.count()
     if (start < 10 && !done && !busy) older()
   }
   const redraw = () => frame || (frame = requestAnimationFrame(draw))
-  const get = (q) => fetch(`/api/candles/${pool}?res=${res}${q}`).then((r) => r.json())
+  const get = (q) => fetch(`/api/candles/${pool}?res=${res}&unit=${opt.native ? 'n' : 'u'}${q}`).then((r) => r.json())
+  // Latest candles again (new size or unit), back at the default view.
+  async function reload() {
+    cs = await get('')
+    done = cs.length < 300
+    start = NaN
+    load()
+    draw()
+  }
 
   // Candles that closed while the page sat in a cache: take the latest from the API,
   // then the live candle `c` (the API copy may be a few seconds older).
@@ -120,13 +150,37 @@ async function chart(el) {
       document.querySelectorAll('.res a').forEach((x) => x.removeAttribute('aria-current'))
       a.setAttribute('aria-current', 'true')
       history.replaceState(null, '', a.href)
-      cs = await get('')
-      done = cs.length < 300
-      start = NaN
-      load()
-      draw()
+      reload()
     })
   )
+
+  const card = el.closest('.chartcard')
+  const press = () =>
+    card.querySelectorAll('[data-o]').forEach((b) => {
+      const o = b.dataset.o
+      if (o in opt) b.setAttribute('aria-pressed', b.dataset.v ? String(opt[o] === +b.dataset.v) : String(!!opt[o]))
+    })
+  card.querySelector('.tools')?.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-o]')
+    if (!b) return
+    const o = b.dataset.o
+    if (o === 'reset') return (start = NaN), draw()
+    if (o === 'full') return document.fullscreenElement ? document.exitFullscreen() : card.requestFullscreen()
+    const prev = opt[o]
+    opt[o] = b.dataset.v ? +b.dataset.v : 1 - opt[o]
+    if (opt[o] === prev) return
+    try {
+      localStorage.setItem('chart', JSON.stringify(opt))
+    } catch {}
+    press()
+    if (o === 'native') return reload()
+    load()
+    draw()
+  })
+  el.addEventListener('dblclick', () => ((start = NaN), draw()))
+  press()
+  if (opt.native) reload()
+  else if (flags()) load(), draw()
 
   const rows = $('#tr')
   const live = new EventSource(`/api/live/${pool}?after=${rows ? rows.dataset.last : '0-0'}`)
@@ -137,7 +191,7 @@ async function chart(el) {
         n.textContent = text
         n.className = cls
       })
-    const c = u.c[res]
+    const c = u[opt.native ? 'n' : 'c'][res]
     if (c) {
       const last = cs[cs.length - 1]
       if (last && c[0] > last[0] + res) fill(c)
@@ -148,7 +202,9 @@ async function chart(el) {
     }
     if (rows && u.t) {
       rows.insertAdjacentHTML('afterbegin', u.t)
-      while (rows.rows.length > 50) rows.deleteRow(-1)
+      while (rows.rows.length > shown) rows.deleteRow(-1)
+      const m = $('#more')
+      if (m) m.dataset.before = rows.rows[rows.rows.length - 1].dataset.k
     }
   }
 }

@@ -33,6 +33,8 @@ pub struct State {
     pub token_ix: HashMap<Addr, u32>,
     pub pools: Vec<Pool>,
     pub pool_ix: HashMap<Id, u32>,
+    /// Pools from known DEXes by their base token, for a token's other pairs.
+    pub base_pools: HashMap<u32, Vec<u32>>,
     pub stats: HashMap<u32, Box<Stats>>,
     /// Timestamp of the last applied block.
     pub head_ts: u32,
@@ -63,6 +65,9 @@ impl State {
             }
         }
         s.pool_ix = s.pools.iter().enumerate().map(|(i, p)| (p.id, i as u32)).collect();
+        for (i, p) in s.pools.iter().enumerate().filter(|(_, p)| p.trusted()) {
+            s.base_pools.entry(p.base()).or_default().push(i as u32);
+        }
         s.head_ts = store.cursor()?.map(|(_, ts)| ts).unwrap_or(0);
         // Rebuild 24 h stats from stored 1 m and 1 h candles.
         let now = s.head_ts;
@@ -240,6 +245,9 @@ impl State {
             pool.price_native = if quote0 { 1.0 / p1per0 } else { p1per0 };
         }
         let p = self.pools.len() as u32;
+        if pool.trusted() {
+            self.base_pools.entry(pool.base()).or_default().push(p);
+        }
         self.pools.push(pool);
         self.pool_ix.insert(id, p);
         self.dirty_pools.insert(p);

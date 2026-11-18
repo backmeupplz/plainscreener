@@ -45,8 +45,29 @@ main{padding:28px 0 56px}
 .tabs a,.res a{display:inline-flex;align-items:center;min-height:32px;padding:0 14px;border-radius:9px;color:var(--muted);font-size:14px;font-weight:500;transition:background .15s,color .15s}
 .tabs a:hover,.res a:hover{color:var(--fg)}
 .tabs a[aria-current],.res a[aria-current]{background:var(--raise);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
-.res{margin:0 0 6px}
 .res a{min-height:28px;padding:0 11px;font-size:13px}
+/* chart toolbar: candle sizes on the left, options on the right */
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 6px}
+.bar .res{margin:0}
+.tools{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-left:auto}
+.tools>button{min-height:36px;padding:0 12px;border-radius:12px;background:var(--card);color:var(--muted);font-weight:500}
+.tools>button[aria-pressed=true]{background:var(--raise);color:var(--fg);border-color:var(--line3)}
+.seg{display:inline-flex;gap:2px;padding:3px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+.seg button{min-height:28px;padding:0 10px;border:0;border-radius:9px;background:transparent;color:var(--muted);font-weight:500}
+.seg button[aria-pressed=true]{background:var(--raise);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
+.tools .ic{width:36px;padding:0}
+.ic svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.chartcard:fullscreen{display:flex;flex-direction:column;padding:16px;border-radius:0;background:var(--card)}
+.chartcard:fullscreen #chart{flex:1;height:auto}
+.more{display:flex;margin:6px auto 14px}
+/* token card and other pairs */
+.card h2 .m{font-weight:400}
+.tok .desc{margin:0;padding:2px 16px 12px;color:var(--muted);font-size:14px;line-height:1.55;white-space:pre-line;overflow-wrap:anywhere}
+.tok .links{display:flex;flex-wrap:wrap;gap:8px;padding:0 16px 12px}
+.tok .info{padding:0 0 6px;border-top:1px solid var(--line2)}
+.pairs{padding-bottom:6px}
+.pairs a{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 16px;font-size:14px;transition:background .12s}
+.pairs a:hover{background:var(--hover);color:inherit}
 
 /* tables */
 .scroll{overflow-x:auto}
@@ -59,10 +80,10 @@ th:first-child,td:first-child,th.l,td.l{text-align:left}
 .list td.n{color:var(--muted);width:1%;font-size:13px}
 .list tbody tr{transition:background .12s}
 .list tbody tr:hover{background:var(--hover)}
-.pairname{display:inline-flex;align-items:center;gap:10px}
+.pairname{display:flex;align-items:center;gap:10px}
 .pairname b{font-weight:600}
 .pairname .q{color:var(--muted)}
-.pairname small{color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:4px}
+.pairname small,.pairs small{color:var(--muted);font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin-left:4px}
 .av{display:inline-flex;align-items:center;justify-content:center;flex:none;width:26px;height:26px;border-radius:50%;background:hsl(var(--h) 55% var(--avbg));color:hsl(var(--h) 70% var(--avfg));font-size:12px;font-weight:650;box-shadow:inset 0 0 0 1px var(--line)}
 .av.lg{width:40px;height:40px;font-size:17px}
 img.av{background:var(--raise);object-fit:cover}
@@ -86,7 +107,6 @@ img.av{background:var(--raise);object-fit:cover}
 .big{font-size:34px;font-weight:600;letter-spacing:-.035em;line-height:1.1}
 .chartcard{padding:12px}
 #chart{height:460px;touch-action:pan-y;user-select:none;cursor:crosshair}
-.embed #chart{height:calc(100vh - 60px)}
 .ch{display:block;width:100%;height:100%}
 .card h2{padding:16px 16px 6px}
 .trades td,.trades th{padding:9px 14px;font-size:13px}
@@ -98,7 +118,8 @@ dl{margin:0}
 .win{font-size:13px}
 .win th,.win td{padding:9px 14px}
 .info{padding:6px 0}
-.info p{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:0;padding:8px 16px}
+.info p{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:40px;margin:0;padding:4px 16px}
+.info button{min-height:28px;padding:0 10px;font-size:12px}
 .info p span:first-child{color:var(--muted)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 .m a.mono,td a.mono{color:var(--muted)}
@@ -119,7 +140,11 @@ footer{border-top:1px solid var(--line);color:var(--muted);padding:24px 0 36px;f
 .embed body,.embed{background:var(--card)}
 .embed .eh{display:flex;align-items:center;gap:12px;height:56px;padding:0 14px;border-bottom:1px solid var(--line)}
 .embed .eh .big{font-size:20px}
-.embed .eh .brand{margin-left:auto;color:var(--muted);font-size:12px}
-.embed .chartcard{padding:8px}
+.embed .eh .brand{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
+.embed .eh .pairname{min-width:0;white-space:nowrap}
+.embed body{display:flex;flex-direction:column;height:100vh}
+.embed .chartcard{flex:1;display:flex;flex-direction:column;min-height:0;padding:8px;border:0;border-radius:0;box-shadow:none}
+.embed #chart{flex:1;height:auto;min-height:0}
 @media (max-width:980px){.pair{grid-template-columns:minmax(0,1fr)}#chart{height:380px}.px{margin-left:0;text-align:left}}
-@media (max-width:640px){.tabs{flex-wrap:nowrap;max-width:100%;overflow-x:auto;scrollbar-width:none}.tabs a{padding:0 11px;white-space:nowrap}.top .wrap{gap:12px}.logo span,.gh{display:none}.big{font-size:28px}.hide-s{display:none}#chart{height:320px}.hero{padding:44px 0 32px}.hero p{font-size:16px}}
+@media (max-width:640px){.tabs,.tools{flex-wrap:nowrap;max-width:100%;overflow-x:auto;scrollbar-width:none}.tools{margin-left:0}.tabs a{padding:0 11px;white-space:nowrap}.top .wrap{gap:12px}.logo span,.gh{display:none}.big{font-size:28px}.hide-s{display:none}#chart{height:320px}.hero{padding:44px 0 32px}.hero p{font-size:16px}}
+@media (max-width:440px){.embed .eh .chg{display:none}}

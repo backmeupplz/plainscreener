@@ -142,7 +142,7 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let (cw, chh) = (w - 48, h - cy - 24);
     let scale = 1.6;
     let ri = default_res(st, p, 3);
-    let candles = chart_data(st, store, p, ri, u32::MAX, 300);
+    let candles = chart_data(st, store, p, ri, u32::MAX, 300, false);
     let (vw, vh) = (cw as f64 / scale, chh as f64 / scale);
     let mut view = chart::View::latest(candles.len(), vw, vh, RES[ri] as f64);
     view.count = view.count.min(candles.len().max(30) as f64 + 2.0);

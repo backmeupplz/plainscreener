@@ -17,7 +17,7 @@ pub const CHART_CANDLES: usize = 300;
 
 /// Colors: (name, light, dark). The page gets them as CSS variables, OG images inline.
 /// Near-black surfaces, hairline borders, one blue accent.
-pub const PALETTE: [(&str, &str, &str); 25] = [
+pub const PALETTE: [(&str, &str, &str); 27] = [
     // Avatar background and letter lightness (hue comes from the token address).
     ("avbg", "90%", "22%"),
     ("avfg", "30%", "82%"),
@@ -42,6 +42,9 @@ pub const PALETTE: [(&str, &str, &str); 25] = [
     ("ring", "rgba(45,99,234,0.2)", "rgba(45,99,234,0.35)"),
     ("shadow", "0 1px 2px rgba(0,0,0,0.04)", "0 12px 32px -16px rgba(0,0,0,0.65)"),
     ("white", "#ffffff", "#ffffff"),
+    // Moving averages on the chart.
+    ("ma1", "#c2410c", "#f5a524"),
+    ("ma2", "#7c3aed", "#a78bfa"),
     // Which icon the theme button shows.
     ("sun", "none", "block"),
     ("moon", "block", "none"),
@@ -51,7 +54,8 @@ pub const PALETTE: [(&str, &str, &str); 25] = [
 const CHART_CSS: &str = ".ch .g{stroke:{grid};fill:none}.ch .u{fill:{up}}.ch .d{fill:{down}}\
 .ch .vu{fill:{up};opacity:.28}.ch .vd{fill:{down};opacity:.28}.ch text{font-size:12px;font-family:system-ui,Inter,sans-serif}\
 .ch .a{fill:{muted}}.ch .l{fill:none;stroke-dasharray:2 3}.ch .l.u{stroke:{up}}.ch .l.d{stroke:{down}}\
-.ch .x{fill:none;stroke:{muted};stroke-dasharray:3 3}.ch .t{fill:{fg}}.ch .tc{fill:{bg}}.ch .tt{fill:{white}}";
+.ch .x{fill:none;stroke:{muted};stroke-dasharray:3 3}.ch .ln{fill:none;stroke:{accent};stroke-width:1.6;stroke-linejoin:round}\
+.ch .m1,.ch .m2{fill:none;stroke-width:1.3}.ch .m1{stroke:{ma1}}.ch .m2{stroke:{ma2}}.ch .t{fill:{fg}}.ch .tc{fill:{bg}}.ch .tt{fill:{white}}";
 
 /// Chart CSS with colors from `value(name)`.
 pub fn chart_css(value: impl Fn(&str) -> String) -> String {
@@ -195,7 +199,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         )
     };
     format!(
-        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script>{meta}<style>{css}</style></head><body>{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
+        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">{meta}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script><style>{css}</style></head><body>{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
         cls = if h.embed { r#" class="embed""# } else { "" },
         css = app.css,
         js = app.js_url,
@@ -297,10 +301,32 @@ fn field(fs: &[(String, String, &'static str)], id: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn trade_row(st: &State, pool: &Pool, t: &Trade) -> String {
+/// Trades per page (the first page and each "Load more").
+pub const TRADES: usize = 50;
+
+/// "Load more" under the trades table, pointing at the oldest trade shown.
+fn more_button(page: &[((u32, u32), Trade)]) -> String {
+    match page.last() {
+        Some(((b, i), _)) if page.len() == TRADES => {
+            format!(r#"<button type="button" class="more" id="more" data-before="{b}-{i}">Load more trades</button>"#)
+        }
+        _ => String::new(),
+    }
+}
+
+/// An older page of trade rows for "Load more": `{"rows": html, "more": html}`.
+pub fn trades_page(st: &State, store: &Store, p: u32, before: (u32, u32)) -> String {
+    let pool = &st.pools[p as usize];
+    let page = store.trades(p, before, TRADES);
+    let rows: String = page.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
+    serde_json::json!({"rows": rows, "more": more_button(&page)}).to_string()
+}
+
+/// A trades table row; `data-k` is its cursor (block-index) for paging.
+pub fn trade_row(st: &State, pool: &Pool, (block, index): (u32, u32), t: &Trade) -> String {
     let cls = if t.buy { "u" } else { "d" };
     format!(
-        r#"<tr><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><a class="mono" href="{EXPLORER}/address/{maker}" rel="nofollow">{maker_s}</a></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
+        r#"<tr data-k="{block}-{index}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><a class="mono" href="{EXPLORER}/address/{maker}" rel="nofollow">{maker_s}</a></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
         time = s(|o| fmt::date_clock(o, t.ts as i64)),
         kind = if t.buy { "Buy" } else { "Sell" },
         price = s(|o| fmt::usd(o, t.price_usd as f64)),
@@ -497,10 +523,19 @@ pub fn not_found(app: &App) -> String {
     )
 }
 
-/// Candles of a pool for the chart, in USD when the quote token has a price, else native.
-pub fn chart_data(st: &State, store: &Store, p: u32, ri: usize, before: u32, limit: usize) -> Vec<chart::Candle> {
+/// Candles of a pool for the chart: in USD when the quote token has a price (unless
+/// `native`), else in the quote token.
+pub fn chart_data(
+    st: &State,
+    store: &Store,
+    p: u32,
+    ri: usize,
+    before: u32,
+    limit: usize,
+    native: bool,
+) -> Vec<chart::Candle> {
     let raw = store.candles(p, ri, 0, before, limit);
-    let usd = raw.last().is_some_and(|(_, c)| c.c.is_finite()) && st.pools[p as usize].price_usd.is_finite();
+    let usd = !native && raw.last().is_some_and(|(_, c)| c.c.is_finite()) && st.pools[p as usize].price_usd.is_finite();
     raw.iter()
         .map(|(t, c)| {
             let (o, h, l, cl) = if usd { (c.o, c.h, c.l, c.c) } else { (c.no, c.nh, c.nl, c.nc) };
@@ -508,6 +543,107 @@ pub fn chart_data(st: &State, store: &Store, p: u32, ri: usize, before: u32, lim
         })
         .filter(|c| c.o.is_finite() && c.c.is_finite())
         .collect()
+}
+
+/// The base token: what it says about itself (see `icons`), its supply, and what this
+/// pool holds.
+fn token_card(st: &State, store: &Store, pool: &Pool) -> String {
+    let base = &st.tokens[pool.base() as usize];
+    let profile: serde_json::Value =
+        store.profiles.get(base.addr).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
+    let desc = match profile["d"].as_str() {
+        Some(d) if !d.is_empty() => format!(r#"<p class="desc">{}</p>"#, Esc(d)),
+        _ => String::new(),
+    };
+    let links: String = profile["l"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| {
+            let url = l[1].as_str()?;
+            let kind = crate::icons::link_kind(url)?;
+            Some(format!(
+                r#"<a class="btn" href="{}" target="_blank" rel="nofollow ugc noopener noreferrer">{kind} ↗</a>"#,
+                Esc(url)
+            ))
+        })
+        .collect();
+    let links = if links.is_empty() { links } else { format!(r#"<div class="links">{links}</div>"#) };
+    let (bb, qb) = if pool.quote0 { (pool.bal1, pool.bal0) } else { (pool.bal0, pool.bal1) };
+    let amount = |x: f64, t: u32| {
+        s(|o| {
+            fmt::compact(o, x);
+            let _ = write!(o, " {}", Esc(sym(st, t)));
+        })
+    };
+    format!(
+        r#"<div class="card tok"><h2>About {name}</h2>{desc}{links}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
+        name = Esc(if base.name.is_empty() { sym(st, pool.base()) } else { &base.name }),
+        supply = amount(base.supply, pool.base()),
+        bs = Esc(sym(st, pool.base())),
+        qs = Esc(sym(st, pool.quote())),
+        bb = amount(bb, pool.base()),
+        qb = amount(qb, pool.quote()),
+    )
+}
+
+/// The base token's other pools on known DEXes, deepest first.
+fn other_pairs(st: &State, p: u32) -> String {
+    let pool = &st.pools[p as usize];
+    let mut others: Vec<(f64, u32)> = st
+        .base_pools
+        .get(&pool.base())
+        .into_iter()
+        .flatten()
+        .filter(|&&q| q != p)
+        .map(|&q| (st.liq(q), q))
+        .filter(|(liq, _)| *liq >= 1.0)
+        .collect();
+    if others.is_empty() {
+        return String::new();
+    }
+    others.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    let rows: String = others
+        .iter()
+        .take(6)
+        .map(|&(liq, q)| {
+            let o = &st.pools[q as usize];
+            format!(
+                r#"<a href="/base/{key}"><span><b>{bs}</b><span class="m">/{qs}</span> <small>{dex}</small></span><span>{liq}</span></a>"#,
+                key = o.key(),
+                bs = Esc(sym(st, o.base())),
+                qs = Esc(sym(st, o.quote())),
+                dex = o.dex(),
+                liq = s(|x| fmt::usd_compact(x, liq)),
+            )
+        })
+        .collect();
+    format!(r#"<div class="card pairs"><h2>Other pairs <span class="m">· liquidity</span></h2>{rows}</div>"#)
+}
+
+/// Chart options (applied by app.js): price or market cap, USD or quote token, line, moving
+/// averages, reset and fullscreen. Choices without data (no supply, no USD price) are left out.
+fn chart_tools(st: &State, pool: &Pool) -> String {
+    let seg = |opt: &str, a: &str, b: &str| {
+        format!(
+            r#"<span class="seg"><button type="button" data-o="{opt}" data-v="0" aria-pressed="true">{a}</button><button type="button" data-o="{opt}" data-v="1" aria-pressed="false">{b}</button></span>"#
+        )
+    };
+    let mut out = String::from(r#"<div class="tools" role="toolbar" aria-label="Chart options">"#);
+    if st.tokens[pool.base() as usize].supply > 0.0 {
+        out.push_str(&seg("mcap", "Price", "MCap"));
+    }
+    if pool.price_usd.is_finite() {
+        out.push_str(&seg("native", "USD", &Esc(sym(st, pool.quote())).to_string()));
+    }
+    out.push_str(concat!(
+        r#"<button type="button" data-o="line" aria-pressed="false">Line</button>"#,
+        r#"<button type="button" data-o="ma" aria-pressed="false" title="Moving averages, 20 and 50 candles">MA</button>"#,
+        r#"<button type="button" class="ic" data-o="reset" aria-label="Reset chart view" title="Reset view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/></svg></button>"#,
+        r#"<button type="button" class="ic" data-o="full" aria-label="Fullscreen chart" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>"#,
+        "</div>"
+    ));
+    out
 }
 
 /// Candles as compact JSON: [[t,o,h,l,c,v],…]
@@ -531,7 +667,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let key = pool.key();
     let fs = fields(st, p);
     let f = |id: &str| field(&fs, id);
-    let candles = chart_data(st, store, p, ri, u32::MAX, CHART_CANDLES);
+    let candles = chart_data(st, store, p, ri, u32::MAX, CHART_CANDLES, false);
     let svg = s(|o| chart::render(&candles, &chart::View::latest(candles.len(), 960.0, 440.0, RES[ri] as f64), o));
     let res_nav: String = RES_NAMES
         .iter()
@@ -542,7 +678,9 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         })
         .collect();
     let chart = format!(
-        r#"<div class="card chartcard"><nav class="res" aria-label="Candle size">{res_nav}</nav><div id="chart" data-pool="{key}" data-res="{res}" data-wasm="{wasm}">{svg}</div></div><script id="cd" type="application/json">{json}</script>"#,
+        r#"<div class="card chartcard"><div class="bar"><nav class="res" aria-label="Candle size">{res_nav}</nav>{tools}</div><div id="chart" data-pool="{key}" data-res="{res}" data-wasm="{wasm}" data-supply="{supply}">{svg}</div></div><script id="cd" type="application/json">{json}</script>"#,
+        tools = chart_tools(st, pool),
+        supply = base.supply,
         res = RES[ri],
         wasm = app.wasm_url,
         json = candles_json(&candles),
@@ -579,8 +717,8 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         return layout(app, &head, &body);
     }
 
-    let trades = store.trades(p, (u32::MAX, u32::MAX), 50);
-    let rows: String = trades.iter().map(|(_, t)| trade_row(st, pool, t)).collect();
+    let trades = store.trades(p, (u32::MAX, u32::MAX), TRADES);
+    let rows: String = trades.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
     let last = trades.first().map(|(k, _)| format!("{}-{}", k.0, k.1)).unwrap_or_else(|| "0-0".into());
     let windows: String = WINDOWS
         .iter()
@@ -616,8 +754,11 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         urlencode(&format!("{url}?s={}", st.head_ts / 3600))
     );
     let body = format!(
-        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span></div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table></div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div><div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
+        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span></div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table>{more}</div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div>{token}{others}<div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
         av = avatar(st, pool.base(), true),
+        more = more_button(&trades),
+        token = token_card(st, store, pool),
+        others = other_pairs(st, p),
         bs_e = Esc(bs),
         c24 = f("c24h"),
         dex = pool.dex(),
@@ -642,21 +783,26 @@ pub fn live(st: &State, store: &Store, p: u32, after: (u32, u32)) -> (String, (u
     let pool = &st.pools[p as usize];
     let fs: serde_json::Map<String, serde_json::Value> =
         fields(st, p).into_iter().map(|(id, text, cls)| (id, serde_json::json!([text, cls]))).collect();
-    let mut candles = serde_json::Map::new();
-    for (ri, res) in RES.iter().enumerate() {
-        if let Some(c) = chart_data(st, store, p, ri, u32::MAX, 1).last() {
-            candles.insert(res.to_string(), serde_json::json!([c.t, c.o, c.h, c.l, c.c, c.v]));
-        }
-    }
+    // The latest candle of every resolution, in USD ("c") and in the quote token ("n").
+    let latest = |native: bool| -> serde_json::Map<String, serde_json::Value> {
+        RES.iter()
+            .enumerate()
+            .filter_map(|(ri, res)| {
+                let c = *chart_data(st, store, p, ri, u32::MAX, 1, native).last()?;
+                Some((res.to_string(), serde_json::json!([c.t, c.o, c.h, c.l, c.c, c.v])))
+            })
+            .collect()
+    };
+    let (candles, native) = (latest(false), latest(true));
     // The newest 50 trades after `after` (a page shows 50), newest first.
     let trades: Vec<_> = if after == (0, 0) {
         Vec::new()
     } else {
-        store.trades(p, (u32::MAX, u32::MAX), 50).into_iter().take_while(|(k, _)| *k > after).collect()
+        store.trades(p, (u32::MAX, u32::MAX), TRADES).into_iter().take_while(|(k, _)| *k > after).collect()
     };
     let newest = trades.first().map(|(k, _)| *k).unwrap_or(after);
-    let rows: String = trades.iter().map(|(_, t)| trade_row(st, pool, t)).collect();
-    (serde_json::json!({"f": fs, "c": candles, "t": rows}).to_string(), newest)
+    let rows: String = trades.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
+    (serde_json::json!({"f": fs, "c": candles, "n": native, "t": rows}).to_string(), newest)
 }
 
 pub fn sitemap(app: &App, st: &State) -> String {

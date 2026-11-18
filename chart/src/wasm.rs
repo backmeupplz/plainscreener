@@ -17,7 +17,7 @@ unsafe impl Sync for Global {}
 static S: Global = Global(UnsafeCell::new(State {
     candles: Vec::new(),
     svg: String::new(),
-    view: View { w: 0.0, h: 0.0, res: 60.0, start: 0.0, count: 1.0, cursor: None, tz: 0.0 },
+    view: View { w: 0.0, h: 0.0, res: 60.0, start: 0.0, count: 1.0, cursor: None, tz: 0.0, opts: 0 },
 }));
 
 fn state() -> &'static mut State {
@@ -34,10 +34,21 @@ pub extern "C" fn data(n: usize) -> *mut f64 {
 }
 
 /// Renders the buffer. A NaN `start` picks the default (latest) view; negative `cx`
-/// hides the crosshair. Returns a pointer to the SVG; its length is `len()`.
+/// hides the crosshair; `opts` are `LINE`/`MA`/`COMPACT` flags. Returns a pointer to the
+/// SVG; its length is `len()`.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub extern "C" fn draw(w: f64, h: f64, res: f64, start: f64, count: f64, cx: f64, cy: f64, tz: f64) -> *const u8 {
+pub extern "C" fn draw(
+    w: f64,
+    h: f64,
+    res: f64,
+    start: f64,
+    count: f64,
+    cx: f64,
+    cy: f64,
+    tz: f64,
+    opts: u32,
+) -> *const u8 {
     let s = state();
     let mut v = View::latest(s.candles.len(), w, h, res);
     if !start.is_nan() {
@@ -46,6 +57,7 @@ pub extern "C" fn draw(w: f64, h: f64, res: f64, start: f64, count: f64, cx: f64
     }
     v.cursor = (cx >= 0.0).then_some((cx, cy));
     v.tz = tz;
+    v.opts = opts;
     s.svg.clear();
     render(&s.candles, &v, &mut s.svg);
     s.view = v;

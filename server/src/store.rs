@@ -16,6 +16,8 @@ pub struct Store {
     pub trades: Keyspace,
     /// [token addr] → 64 px PNG, or the 4-byte Unix time of a failed lookup
     pub icons: Keyspace,
+    /// [token addr] → JSON `{"t": looked up at, "d": description, "l": [[kind, url], …]}`
+    pub profiles: Keyspace,
 }
 
 pub fn candle_key(pool: u32, res: usize, t: u32) -> [u8; 9] {
@@ -49,6 +51,7 @@ impl Store {
             candles: ks("candles")?,
             trades: ks("trades")?,
             icons: ks("icons")?,
+            profiles: ks("profiles")?,
             db,
         })
     }
