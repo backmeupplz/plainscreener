@@ -157,8 +157,12 @@ img.av{background:var(--raise);object-fit:cover}
 .pv .pn{color:var(--muted);font-size:12px}
 .big{font-size:28px;font-weight:600;letter-spacing:-.03em;line-height:1.1}
 .buy{min-height:38px;padding:0 16px;font-size:14px}
-.pair{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:16px;align-items:start}
+/* The HTML goes chart, sidebar, trades: the phone order, so nothing jumps while a page
+   streams in. On wider screens trades sit under the chart, the sidebar spans both rows. */
+.pair{display:grid;grid-template-columns:minmax(0,1fr) 340px;grid-template-rows:auto 1fr;gap:16px;align-items:start}
 .pair>section,.pair>aside{display:flex;flex-direction:column;gap:14px;min-width:0}
+.pair>aside{grid-column:2;grid-row:1/3}
+.pair>.top-l,.pair>.bot-l{grid-column:1}
 
 /* chart */
 .chartcard{padding:10px}
