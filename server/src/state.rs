@@ -44,6 +44,8 @@ pub struct State {
     trades: Vec<([u8; 12], Vec<u8>)>,
     /// Pools that traded since the last flush (for live updates).
     touched: HashSet<u32>,
+    /// Hour of the last pruning of idle pools' stats.
+    pruned_hour: u32,
 }
 
 impl State {
@@ -271,8 +273,10 @@ impl State {
         pool.price_usd = usd;
         pool.last_ts = ts;
         let qliq = pool.bal_quote() * qusd;
+        let trusted = pool.trusted();
         let tok = &mut self.tokens[base as usize];
-        if !STABLES.contains(&tok.addr)
+        if trusted
+            && !STABLES.contains(&tok.addr)
             && usd.is_finite()
             && qliq >= MIN_REF_LIQ
             && (tok.ref_pool == p || qliq > tok.ref_liq || !tok.usd.is_finite())
@@ -282,9 +286,11 @@ impl State {
             tok.ref_liq = qliq;
             self.dirty_tokens.insert(base);
         }
+        // A token links to its most liquid trusted pool, or any pool if it has no trusted one.
+        let rank = |s: &State, q: u32| (s.pools[q as usize].trusted(), s.liq(q));
         for t in [base, quote] {
             let best = self.tokens[t as usize].best_pool;
-            if best != p && (best == NONE || self.liq(p) > self.liq(best)) {
+            if best != p && (best == NONE || rank(self, p) > rank(self, best)) {
                 self.tokens[t as usize].best_pool = p;
                 self.dirty_tokens.insert(t);
             }
@@ -315,13 +321,11 @@ impl State {
         // Candles whose period has ended can't change any more.
         let head = self.head_ts;
         self.candles.retain(|&(_, ri), (t, _)| *t + RES[ri] > head);
+        if head / 3600 != self.pruned_hour {
+            self.pruned_hour = head / 3600;
+            self.stats.retain(|_, s| s.last_active() + 86_400 > head);
+        }
         Ok(self.touched.drain().collect())
-    }
-
-    /// Drops stats of pools idle for a day.
-    pub fn prune_stats(&mut self) {
-        let head = self.head_ts;
-        self.stats.retain(|_, s| s.last_active() + 86_400 > head);
     }
 
     pub fn pending(&self) -> usize {
@@ -375,13 +379,14 @@ mod tests {
         s.add_token(WETH, meta("WETH", 18), 1);
         s.add_token(usdc, meta("USDC", 6), 1);
         s.add_token(meme, meta("MEME", 18), 1);
-        let factory = [1u8; 20];
-        let (pool_a, pool_b) = ([2u8; 20], [3u8; 20]);
-        let created = |pool: Addr, t0: Addr, t1: Addr| {
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let (pool_a, pool_b, fake) = ([2u8; 20], [3u8; 20], [4u8; 20]);
+        let created_by = |factory: Addr, pool: Addr, t0: Addr, t1: Addr| {
             let mut data = pad(&pool).to_vec();
             data.extend(word(1.0));
             log(10, factory, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
         };
+        let created = |pool: Addr, t0: Addr, t1: Addr| created_by(uniswap, pool, t0, t1);
         // WETH/USDC with $3M on each side: 1000 WETH @ $3000.
         s.apply(&created(pool_a, WETH, usdc), &store);
         let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
@@ -395,18 +400,25 @@ mod tests {
         assert!((weth.usd - 3000.0).abs() < 1e-6, "WETH priced from USDC: {}", weth.usd);
         assert!(!s.pools[0].quote0, "USDC (token1) is the quote");
 
+        // A contract posing as a bigger WETH/USDC pool can't move WETH's price.
+        s.apply(&created_by([1; 20], fake, WETH, usdc), &store);
+        s.apply(&sync(fake, 1e6 * 1e18, 1e12 * 1e6), &store);
+        s.apply(&swap(fake, 0.0, 1e6, 1e15, 0.0), &store); // "WETH at $1000"
+        assert!((s.tokens[0].usd - 3000.0).abs() < 1e-6, "untrusted pool ignored: {}", s.tokens[0].usd);
+        assert_eq!(s.tokens[0].best_pool, 0, "WETH still links to the real pool");
+
         // MEME/WETH: 1M MEME vs 10 WETH ($30k). Sell 1000 MEME for 0.01 WETH.
         s.apply(&created(pool_b, meme, WETH), &store);
         s.apply(&sync(pool_b, 1_000_000e18, 10e18), &store);
         s.apply(&swap(pool_b, 1000e18, 0.0, 0.0, 0.01e18), &store);
         let m = &s.tokens[2];
         assert!((m.usd - 0.03).abs() < 1e-9, "MEME = 0.00001 WETH = $0.03, got {}", m.usd);
-        assert!((s.liq(1) - 60_000.0).abs() < 1.0);
-        assert_eq!(s.flush(&store, 12).unwrap().len(), 2);
-        let candles = store.candles(1, 0, 0, u32::MAX, 10);
+        assert!((s.liq(2) - 60_000.0).abs() < 1.0);
+        assert_eq!(s.flush(&store, 12).unwrap().len(), 3);
+        let candles = store.candles(2, 0, 0, u32::MAX, 10);
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].1.sells, 1);
-        assert_eq!(store.trades(1, (u32::MAX, 0), 10).len(), 1);
+        assert_eq!(store.trades(2, (u32::MAX, 0), 10).len(), 1);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

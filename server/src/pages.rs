@@ -283,6 +283,7 @@ pub fn list(st: &State, tab: Tab) -> Vec<u32> {
     let mut rows: Vec<(u32, f64)> = st
         .stats
         .keys()
+        .filter(|&&p| st.pools[p as usize].trusted())
         .filter_map(|&p| {
             let m = metrics(st, p);
             let pool = &st.pools[p as usize];
@@ -557,7 +558,13 @@ pub fn live(st: &State, store: &Store, p: u32, after: (u32, u32)) -> (String, (u
 }
 
 pub fn sitemap(app: &App, st: &State) -> String {
-    let mut pools: Vec<(u32, f64)> = st.stats.keys().map(|&p| (p, st.liq(p))).filter(|(_, l)| *l >= 10_000.0).collect();
+    let mut pools: Vec<(u32, f64)> = st
+        .stats
+        .keys()
+        .filter(|&&p| st.pools[p as usize].trusted())
+        .map(|&p| (p, st.liq(p)))
+        .filter(|(_, l)| *l >= 10_000.0)
+        .collect();
     pools.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let mut out = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">"#);
     let _ = write!(out, "<url><loc>{}/</loc></url>", app.cfg.public_url);

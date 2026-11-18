@@ -120,8 +120,7 @@ impl Progress {
         if secs < 30.0 {
             return;
         }
-        if let Ok(mut s) = sh.state.write() {
-            s.prune_stats();
+        if let Ok(s) = sh.state.read() {
             eprintln!(
                 "block {block}: {:.0} blocks/s, {:.0} logs/s, {} pools, {} tokens",
                 (block - self.block) as f64 / secs,

@@ -141,10 +141,14 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
     }
     let needle = q.to_lowercase();
     let index = app.search.read().unwrap_or_else(|e| e.into_inner());
-    let mut hits: Vec<(bool, f64, u32)> = index
+    // Exact symbol matches first, then pools from known DEXes, then by liquidity.
+    let mut hits: Vec<((bool, bool), f64, u32)> = index
         .iter()
         .filter(|(sym, name, _)| sym.starts_with(&needle) || name.contains(&needle))
-        .filter_map(|(sym, _, t)| pages::best_pool(&st, *t).map(|p| (*sym == needle, st.liq(p), p)))
+        .filter_map(|(sym, _, t)| {
+            let p = pages::best_pool(&st, *t)?;
+            Some(((*sym == needle, st.pools[p as usize].trusted()), st.liq(p), p))
+        })
         .collect();
     hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
     let mut pools: Vec<u32> = hits.into_iter().map(|h| h.2).collect();

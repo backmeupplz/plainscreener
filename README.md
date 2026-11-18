@@ -11,10 +11,10 @@ A fast, open-source DEX screener for Base: [plainscreener.com](https://plainscre
 
 One Rust binary does everything:
 
-1. **Indexer** (`server/src/index.rs`). It backfills history from [HyperSync](https://envio.dev), then follows a Base node block by block. Both sources produce the same logs, which go through the same code path:
+1. **Indexer** (`server/src/index.rs`). It replays history from the free [SQD portal](https://docs.sqd.dev), takes the last ~1M blocks from a Base node (pruned nodes keep about that much), then follows the node block by block. Every source produces the same logs, which go through the same code path:
    - Pools are discovered from factory events emitted by any contract.
    - Swaps update prices, balances, candles (1m to 1d) and 24 h stats.
-   - USD prices come from on-chain stablecoin pairs. A pool needs at least $1k of quote-side liquidity before it can set a token's price, which keeps dust pools from inventing prices.
+   - USD prices come from on-chain stablecoin pairs. Only pools from known factories (or Uniswap v4) can set a token's price, and only once they hold $1k of quote-side liquidity. A contract that emits fake pool events can't move prices or reach the lists.
 2. **Store** (`server/src/store.rs`). An embedded [fjall](https://github.com/fjall-rs/fjall) LSM database holding tokens, pools, candles and trades. No separate database server.
 3. **Web** (`server/src/http.rs`, `pages.rs`, `og.rs`). Pages are rendered per request in microseconds and cached by Cloudflare for a few seconds. Live prices, candles and trades stream over server-sent events.
 
@@ -22,7 +22,7 @@ One Rust binary does everything:
 
 ```sh
 make wasm            # builds chart/ to web/chart.wasm (needs the wasm32-unknown-unknown target)
-HYPERSYNC_TOKEN=… RPC_URL=http://your-base-node:8545 cargo run --release -p plainscreener
+RPC_URL=http://your-base-node:8545 cargo run --release -p plainscreener
 ```
 
 Settings (environment variables):
@@ -30,7 +30,7 @@ Settings (environment variables):
 | Variable | Default | Meaning |
 |---|---|---|
 | `RPC_URL` | `http://127.0.0.1:8545` | Base node JSON-RPC, used for live blocks and token metadata |
-| `HYPERSYNC_TOKEN` | — | Envio HyperSync token, used to backfill anything older than a few thousand blocks |
+| `SQD_URL` | `https://portal.sqd.dev/datasets/base-mainnet` | Where history older than the node's ~1M blocks comes from |
 | `DATA_DIR` | `data` | Where the database lives |
 | `START_BLOCK` | `0` | First block to index on an empty database |
 | `LISTEN` | `0.0.0.0:8080` | HTTP address |

@@ -1,6 +1,6 @@
 # Production: runs next to the Base node (docker compose project base-node-v2), whose
 # network gives us its RPC at http://execution:8545 without opening any port.
-# Secrets live in deploy/.env (HYPERSYNC_TOKEN, TUNNEL_TOKEN), never in git.
+# The tunnel token lives in deploy/.env (TUNNEL_TOKEN), never in git.
 name: plainscreener
 
 services:

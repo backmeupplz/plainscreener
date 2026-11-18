@@ -70,6 +70,13 @@ impl Pool {
     pub fn key(&self) -> String {
         crate::abi::hex(if self.is_address() { &self.id[12..] } else { &self.id })
     }
+    /// Pools from known factories, or v4 (whose PoolManager does the accounting).
+    /// Anyone can deploy a contract that emits pool events with made-up reserves, so only
+    /// these may set token prices or appear in lists.
+    pub fn trusted(&self) -> bool {
+        self.kind == Kind::V4 || DEXES.iter().any(|(a, _)| *a == self.origin)
+    }
+
     pub fn dex(&self) -> &'static str {
         DEXES.iter().find(|(a, _)| *a == self.origin).map(|(_, n)| *n).unwrap_or(match self.kind {
             Kind::V2 => "v2 fork",
@@ -80,15 +87,20 @@ impl Pool {
     }
 }
 
-/// Known factories and v4 hooks on Base. Anything else is labelled by its pool type.
-const DEXES: [(Addr, &str); 7] = [
+/// Known factories on Base (each checked on-chain). Anything else is labelled by pool type.
+const DEXES: [(Addr, &str); 12] = [
     (hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6"), "Uniswap v2"),
     (hex20("33128a8fc17869897dce68ed026d694621f6fdfd"), "Uniswap v3"),
     (hex20("420dd381b31aef6683db6b902084cb0ffece40da"), "Aerodrome"),
     (hex20("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"), "Aerodrome CL"),
+    (hex20("ade65c38cd4849adba595a4323a8c7ddfe89716a"), "Aerodrome CL"),
     (hex20("0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"), "PancakeSwap v3"),
+    (hex20("02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e"), "PancakeSwap v2"),
     (hex20("71524b4f93c58fcbf659783284e38825f0622859"), "SushiSwap v2"),
     (hex20("c35dadb65012ec5796536bd9864ed8773abc74c4"), "SushiSwap v3"),
+    (hex20("fda619b6d20975be80a10332cd39b9a4b0faa8bb"), "BaseSwap"),
+    (hex20("04c9f118d21e8b767d2e50c946f0cc9f6c367300"), "SwapBased"),
+    (hex20("3e84d913803b02a4a7f027165e8ca42c14c0fde7"), "AlienBase"),
 ];
 
 /// A stored candle: USD and native (quote) OHLC, USD volume, buy and sell counts.

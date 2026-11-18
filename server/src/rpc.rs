@@ -5,6 +5,8 @@ use crate::state::Meta;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 const MULTICALL3: &str = "0xca11bde05977b3631167028862be2a173976ca11";
 const DECIMALS: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
@@ -40,7 +42,7 @@ impl Rpc {
         for r in resp {
             let id = r["id"].as_u64().unwrap_or(0) as usize;
             if let Some(e) = r.get("error") {
-                bail!("rpc error: {e}");
+                return Err(RpcError(e.clone()).into());
             }
             if id < out.len() {
                 out[id] = r["result"].clone();
@@ -101,35 +103,65 @@ impl Rpc {
     pub async fn meta(&self, tokens: &[Addr]) -> Result<Vec<Meta>> {
         let mut out = Vec::with_capacity(tokens.len());
         for chunk in tokens.chunks(150) {
-            let calls: Vec<(Addr, [u8; 4])> =
-                chunk.iter().flat_map(|t| [DECIMALS, SYMBOL, NAME, TOTAL_SUPPLY].map(|sel| (*t, sel))).collect();
-            let data = hex(&encode_aggregate3(&calls));
-            // A whole-batch failure (a token burning all the gas) leaves that chunk unnamed.
-            let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
-                Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
-                Err(e) => {
-                    eprintln!("token metadata multicall failed: {e:#}");
-                    Vec::new()
-                }
-            };
-            for i in 0..chunk.len() {
-                let get = |k: usize| ret.get(i * 4 + k).and_then(|x| x.as_ref());
-                let decimals = get(0).filter(|d| d.len() == 32).map(|d| d[31].min(36)).unwrap_or(18);
-                let scale = 10f64.powi(decimals as i32);
-                out.push(Meta {
-                    decimals,
-                    symbol: get(1).map(|d| text(d, 24)).unwrap_or_default(),
-                    name: get(2).map(|d| text(d, 64)).unwrap_or_default(),
-                    supply: get(3)
-                        .and_then(|d| d.get(..32)?.try_into().ok())
-                        .map(|w| abi::u256_f64(w) / scale)
-                        .unwrap_or(0.0),
-                });
-            }
+            out.extend(self.meta_batch(chunk).await?);
         }
         Ok(out)
     }
+
+    /// One multicall. When the node rejects the whole call (a token burning all the gas),
+    /// split it until the culprit is alone. Network errors propagate so the batch retries:
+    /// guessing decimals would corrupt every price of that token for good.
+    fn meta_batch<'a>(&'a self, tokens: &'a [Addr]) -> Pin<Box<dyn Future<Output = Result<Vec<Meta>>> + Send + 'a>> {
+        Box::pin(async move {
+            let calls: Vec<(Addr, [u8; 4])> =
+                tokens.iter().flat_map(|t| [DECIMALS, SYMBOL, NAME, TOTAL_SUPPLY].map(|sel| (*t, sel))).collect();
+            let data = hex(&encode_aggregate3(&calls));
+            let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
+                Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
+                Err(e) if e.is::<RpcError>() && tokens.len() > 1 => {
+                    let (a, b) = tokens.split_at(tokens.len() / 2);
+                    let mut out = self.meta_batch(a).await?;
+                    out.extend(self.meta_batch(b).await?);
+                    return Ok(out);
+                }
+                Err(e) if e.is::<RpcError>() => vec![None; 4], // a lone broken token: unnamed, 18 decimals
+                Err(e) => return Err(e),
+            };
+            if ret.len() != calls.len() {
+                bail!("multicall returned {} results for {} calls", ret.len(), calls.len());
+            }
+            Ok((0..tokens.len())
+                .map(|i| {
+                    let get = |k: usize| ret[i * 4 + k].as_deref();
+                    // Tokens without decimals() are treated as 18, like most wallets do.
+                    let decimals = get(0).filter(|d| d.len() == 32).map(|d| d[31].min(36)).unwrap_or(18);
+                    let scale = 10f64.powi(decimals as i32);
+                    Meta {
+                        decimals,
+                        symbol: get(1).map(|d| text(d, 24)).unwrap_or_default(),
+                        name: get(2).map(|d| text(d, 64)).unwrap_or_default(),
+                        supply: get(3)
+                            .and_then(|d| d.get(..32)?.try_into().ok())
+                            .map(|w| abi::u256_f64(w) / scale)
+                            .unwrap_or(0.0),
+                    }
+                })
+                .collect())
+        })
+    }
 }
+
+/// An error the node returned for a call (as opposed to not reaching the node).
+#[derive(Debug)]
+pub struct RpcError(Value);
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rpc error: {}", self.0)
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 fn num(v: &Value) -> Option<u32> {
     u32::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok()

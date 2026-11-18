@@ -112,10 +112,9 @@ impl Sqd {
                 }
                 last = Some(b.header.number);
             }
-            match last {
-                Some(n) => next = n + 1,
-                None => break, // nothing left in the range
-            }
+            // The portal always ends a range with its last block's header, so an empty
+            // answer means something went wrong, not that the range is done.
+            next = last.context("empty sqd response")? + 1;
         }
         Ok(out)
     }
