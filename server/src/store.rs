@@ -4,6 +4,9 @@ use crate::model::{Candle, Pool, Token, Trade};
 use anyhow::Result;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 
+/// A trade with its key: (block, log index).
+pub type Keyed = ((u32, u32), Trade);
+
 #[derive(Clone)]
 pub struct Store {
     pub db: Database,
@@ -97,7 +100,7 @@ impl Store {
         before: (u32, u32),
         limit: usize,
         scan: usize,
-    ) -> (Vec<((u32, u32), Trade)>, Option<(u32, u32)>) {
+    ) -> (Vec<Keyed>, Option<(u32, u32)>) {
         let mut out = Vec::new();
         let mut last = None;
         for g in self.trades.range(trade_key(pool, 0, 0)..trade_key(pool, before.0, before.1)).rev().take(scan) {
