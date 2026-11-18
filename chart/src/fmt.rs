@@ -129,6 +129,7 @@ pub fn compact(out: &mut String, x: f64) {
     }
     let x = x.abs();
     let (v, unit) = match x {
+        x if x >= 1e15 => return out.push_str(">999T"),
         x if x >= 1e12 => (x / 1e12, "T"),
         x if x >= 1e9 => (x / 1e9, "B"),
         x if x >= 1e6 => (x / 1e6, "M"),
@@ -267,6 +268,7 @@ mod tests {
         assert_eq!(c(1234.0), "1.23K");
         assert_eq!(c(45_600_000.0), "45.6M");
         assert_eq!(c(789e9), "789B");
+        assert_eq!(c(1.8e31), ">999T");
         assert_eq!(c(0.0), "0");
         assert_eq!(s(|o| pct(o, 0.1234)), "+12.3%");
         assert_eq!(s(|o| pct(o, 0.01234)), "+1.23%");

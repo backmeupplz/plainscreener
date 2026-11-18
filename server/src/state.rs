@@ -132,15 +132,10 @@ impl State {
         if v.is_finite() { v } else { 0.0 }
     }
 
-    /// Pool liquidity in USD (both sides; the quote side doubled when the base has no price).
+    /// Pool liquidity in USD: twice the quote side. Valuing the base side at the pool's own
+    /// price would let one trade at an absurd price inflate it without limit.
     pub fn liq(&self, p: u32) -> f64 {
-        let Some(pool) = self.pools.get(p as usize) else { return 0.0 };
-        let qusd = self.tokens[pool.quote() as usize].usd;
-        let busd = self.tokens[pool.base() as usize].usd;
-        let q = pool.bal_quote() * qusd;
-        let b = if busd.is_finite() { pool.bal_base() * busd } else { q };
-        let total = q + b;
-        if total.is_finite() { total } else { 0.0 }
+        2.0 * self.quote_liq(p)
     }
 
     pub fn apply(&mut self, log: &RawLog, store: &Store) {
@@ -161,7 +156,7 @@ impl State {
                 pool.bal0 = r0 / s0;
                 pool.bal1 = r1 / s1;
             }
-            Event::SwapV2 { d0, d1 } => self.trade(p, log, ts, d0 / s0, d1 / s1, None, store),
+            Event::SwapV2 { d0, d1 } => self.trade(p, log, ts, d0 / s0, d1 / s1, store),
             Event::SwapCl { d0, d1, sqrt_price, fee } => {
                 let (d0, d1) = (d0 / s0, d1 / s1);
                 // LP fees stay in the pool until withdrawn; v4 withdrawals don't report
@@ -170,9 +165,7 @@ impl State {
                 pool.bal0 += if d0 > 0.0 { d0 * keep } else { d0 };
                 pool.bal1 += if d1 > 0.0 { d1 * keep } else { d1 };
                 pool.sqrt_price = sqrt_price;
-                let p1per0 = (sqrt_price / Q96).powi(2) * s0 / s1;
-                let native = if pool.quote0 { 1.0 / p1per0 } else { p1per0 };
-                self.trade(p, log, ts, d0, d1, Some(native), store)
+                self.trade(p, log, ts, d0, d1, store)
             }
             Event::Flow { d0, d1 } => {
                 pool.bal0 += d0 / s0;
@@ -222,16 +215,17 @@ impl State {
         self.dirty_pools.insert(p);
     }
 
-    /// Records a swap given the pool's balance deltas in whole tokens.
-    #[allow(clippy::too_many_arguments)]
-    fn trade(&mut self, p: u32, log: &RawLog, ts: u32, d0: f64, d1: f64, spot: Option<f64>, store: &Store) {
+    /// Records a swap given the pool's balance deltas in whole tokens. The price is what
+    /// was actually exchanged: a concentrated-liquidity pool's spot price after a swap
+    /// through an empty range sits at the protocol limit, which nobody traded at.
+    fn trade(&mut self, p: u32, log: &RawLog, ts: u32, d0: f64, d1: f64, store: &Store) {
         let pool = &self.pools[p as usize];
         let (db, dq) = if pool.quote0 { (d1, d0) } else { (d0, d1) };
         if db == 0.0 || dq == 0.0 {
             return;
         }
         let (base, quote) = (pool.base(), pool.quote());
-        let native = spot.unwrap_or(dq.abs() / db.abs());
+        let native = dq.abs() / db.abs();
         if !native.is_finite() || native <= 0.0 {
             return;
         }
