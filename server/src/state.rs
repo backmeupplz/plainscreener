@@ -95,7 +95,6 @@ impl State {
             supply: meta.supply,
             usd: if stable { 1.0 } else { f64::NAN },
             ref_pool: NONE,
-            ref_liq: 0.0,
             best_pool: NONE,
             first_block: block,
         });
@@ -124,6 +123,13 @@ impl State {
         };
         // Among the rest, the token we saw first is the more established one.
         (class, token)
+    }
+
+    /// USD value of a pool's quote-side balance (0 when unknown).
+    fn quote_liq(&self, p: u32) -> f64 {
+        let Some(pool) = self.pools.get(p as usize) else { return 0.0 };
+        let v = pool.bal_quote() * self.tokens[pool.quote() as usize].usd;
+        if v.is_finite() { v } else { 0.0 }
     }
 
     /// Pool liquidity in USD (both sides; the quote side doubled when the base has no price).
@@ -272,18 +278,20 @@ impl State {
         pool.price_native = native;
         pool.price_usd = usd;
         pool.last_ts = ts;
-        let qliq = pool.bal_quote() * qusd;
         let trusted = pool.trusted();
-        let tok = &mut self.tokens[base as usize];
+        // The deepest pool sets the price, judged by liquidity now (a drained or rugged
+        // reference pool loses its claim at once).
+        let qliq = self.quote_liq(p);
+        let tok = &self.tokens[base as usize];
         if trusted
             && !STABLES.contains(&tok.addr)
             && usd.is_finite()
             && qliq >= MIN_REF_LIQ
-            && (tok.ref_pool == p || qliq > tok.ref_liq || !tok.usd.is_finite())
+            && (tok.ref_pool == p || !tok.usd.is_finite() || qliq > self.quote_liq(tok.ref_pool))
         {
+            let tok = &mut self.tokens[base as usize];
             tok.usd = usd;
             tok.ref_pool = p;
-            tok.ref_liq = qliq;
             self.dirty_tokens.insert(base);
         }
         // A token links to its most liquid trusted pool, or any pool if it has no trusted one.
@@ -419,6 +427,17 @@ mod tests {
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].1.sells, 1);
         assert_eq!(store.trades(2, (u32::MAX, 0), 10).len(), 1);
+
+        // A smaller pool can't move the price while the deep one holds liquidity…
+        let pool_c = [5u8; 20];
+        s.apply(&created(pool_c, meme, WETH), &store);
+        s.apply(&sync(pool_c, 50_000e18, 1e18), &store); // 1 WETH ($3k) of quote liquidity
+        s.apply(&swap(pool_c, 10e18, 0.0, 0.0, 0.0002e18), &store); // 0.00002 WETH = $0.06
+        assert!((s.tokens[2].usd - 0.03).abs() < 1e-9, "{}", s.tokens[2].usd);
+        // …but takes over as soon as the deep pool is drained.
+        s.apply(&sync(pool_b, 0.0, 0.0), &store);
+        s.apply(&swap(pool_c, 10e18, 0.0, 0.0, 0.0002e18), &store);
+        assert!((s.tokens[2].usd - 0.06).abs() < 1e-9, "{}", s.tokens[2].usd);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

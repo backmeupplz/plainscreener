@@ -23,6 +23,9 @@ pub async fn run(cfg: Arc<Config>, sh: Shared) {
     loop {
         if let Err(e) = step(&cfg, &sh, &rpc, &sqd, &mut cursor).await {
             eprintln!("indexer: {e:#}");
+            // A failed catch-up may have committed chunks past the cursor we hold;
+            // resume from what's stored so nothing is applied twice.
+            cursor = None;
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }

@@ -2,3 +2,4 @@ target/
 /web/chart.wasm
 /data/
 /deploy/.env
+/.deployed

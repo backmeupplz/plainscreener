@@ -19,9 +19,8 @@ pub struct Token {
     pub supply: f64,
     /// Trusted USD price (NaN until a pool with enough quote liquidity has traded).
     pub usd: f64,
-    /// Pool that set `usd`, and its quote-side liquidity in USD at the time.
+    /// Pool that set `usd`.
     pub ref_pool: u32,
-    pub ref_liq: f64,
     /// Most liquid pool, where token links go.
     pub best_pool: u32,
     pub first_block: u32,
@@ -309,7 +308,6 @@ impl Token {
             .f64(self.supply)
             .f64(self.usd)
             .u32(self.ref_pool)
-            .f64(self.ref_liq)
             .u32(self.best_pool)
             .u32(self.first_block)
             .0
@@ -324,7 +322,6 @@ impl Token {
             supply: r.f64(),
             usd: r.f64(),
             ref_pool: r.u32(),
-            ref_liq: r.f64(),
             best_pool: r.u32(),
             first_block: r.u32(),
         }
@@ -444,7 +441,6 @@ mod tests {
             supply: 1e9,
             usd: 1.0,
             ref_pool: 3,
-            ref_liq: 5.0,
             best_pool: 7,
             first_block: 9,
         };

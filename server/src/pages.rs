@@ -244,10 +244,12 @@ pub fn fields(st: &State, p: u32) -> Vec<(String, String, &'static str)> {
     out
 }
 
+/// A live field as HTML. `fields` holds plain text (live updates set `textContent`),
+/// so it's escaped here: the quote symbol in `pn` is anyone's to choose.
 fn field(fs: &[(String, String, &'static str)], id: &str) -> String {
     fs.iter()
         .find(|(i, ..)| i == id)
-        .map(|(i, text, cls)| format!(r#"<span data-f="{i}" class="{cls}">{text}</span>"#))
+        .map(|(i, text, cls)| format!(r#"<span data-f="{i}" class="{cls}">{}</span>"#, Esc(text)))
         .unwrap_or_default()
 }
 
