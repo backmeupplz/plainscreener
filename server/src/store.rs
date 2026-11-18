@@ -88,6 +88,33 @@ impl Store {
     }
 
     /// Up to `limit` trades older than `before` = (block, index), newest first.
+    /// Like `trades`, but only `maker`'s, looking at no more than `scan` trades. Also
+    /// returns the oldest key looked at, where a further page would continue.
+    pub fn trades_by(
+        &self,
+        pool: u32,
+        maker: [u8; 20],
+        before: (u32, u32),
+        limit: usize,
+        scan: usize,
+    ) -> (Vec<((u32, u32), Trade)>, Option<(u32, u32)>) {
+        let mut out = Vec::new();
+        let mut last = None;
+        for g in self.trades.range(trade_key(pool, 0, 0)..trade_key(pool, before.0, before.1)).rev().take(scan) {
+            let Ok((k, v)) = g.into_inner() else { continue };
+            let key = (be32(&k[4..8]), be32(&k[8..12]));
+            last = Some(key);
+            let t = Trade::decode(&v);
+            if t.maker == maker {
+                out.push((key, t));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        (out, last)
+    }
+
     pub fn trades(&self, pool: u32, before: (u32, u32), limit: usize) -> Vec<((u32, u32), Trade)> {
         self.trades
             .range(trade_key(pool, 0, 0)..trade_key(pool, before.0, before.1))

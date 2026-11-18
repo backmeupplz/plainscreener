@@ -24,16 +24,36 @@ $('.theme')?.addEventListener('click', () => {
   } catch {}
 })
 
-// Older trades, a page at a time. Live trades push old rows out past `shown`.
+// Trades: older pages, and a filter to one wallet (click its address). Live trades push
+// old rows out past `shown`.
 let shown = 50
-$('#more')?.addEventListener('click', async function more(e) {
-  const b = e.currentTarget
-  b.disabled = true
-  const r = await fetch(`/api/trades/${$('#chart').dataset.pool}?before=${b.dataset.before}`).then((r) => r.json())
-  $('#tr').insertAdjacentHTML('beforeend', r.rows)
-  shown = $('#tr').rows.length
-  if (r.more) (b.outerHTML = r.more), $('#more').addEventListener('click', more)
-  else b.remove()
+let maker = ''
+const tr = $('#tr')
+async function trades(before) {
+  const q = new URLSearchParams()
+  if (before) q.set('before', before)
+  if (maker) q.set('maker', maker)
+  const r = await fetch(`/api/trades/${$('#chart').dataset.pool}?${q}`).then((r) => r.json())
+  if (before && !before.startsWith('4294967295')) tr.insertAdjacentHTML('beforeend', r.rows)
+  else tr.innerHTML = r.rows
+  shown = Math.max(50, tr.rows.length)
+  $('#more')?.remove()
+  if (r.more) tr.closest('table').insertAdjacentHTML('afterend', r.more)
+}
+document.addEventListener('click', (e) => {
+  const more = e.target.closest('#more')
+  if (more) return (more.disabled = true), trades(more.dataset.before)
+  const mk = e.target.closest('.mk')
+  const all = e.target.closest('#flt button')
+  if (!mk && !all) return
+  maker = mk ? mk.dataset.maker : ''
+  $('#flt')?.remove()
+  if (maker)
+    tr.closest('.card').querySelector('h2').insertAdjacentHTML(
+      'afterend',
+      `<p class="flt" id="flt">Trades by <span class="mono">${maker.slice(0, 6)}…${maker.slice(-4)}</span> <a class="mono" href="https://basescan.org/address/${maker}" rel="nofollow">Basescan ↗</a><button type="button">Show all</button></p>`
+    )
+  trades(maker ? '' : '4294967295-4294967295')
 })
 
 // Pair lists (home tabs, search) take fresh rows every few seconds while visible. The rows
@@ -126,31 +146,60 @@ async function chart(el) {
     const r = el.getBoundingClientRect()
     return [e.clientX - r.left, e.clientY - r.top]
   }
+  // Zoom around `x` (px from the left) to `next` visible candles.
+  const zoom = (x, next) => {
+    next = Math.min(Math.max(next, 10), Math.max(cs.length + 20, 60))
+    const slots = x / (w.plot_w(el.clientWidth) / count)
+    start += slots - (slots * next) / count
+    count = next
+    redraw()
+  }
+  // Pointers down: one drags (pans), two pinch (touch zoom).
+  const down = new Map()
+  let pinch = null
+  const spread = () => {
+    const [a, b] = [...down.values()]
+    return [Math.hypot(a[0] - b[0], a[1] - b[1]), (a[0] + b[0]) / 2]
+  }
   el.addEventListener('pointermove', (e) => {
     cur = pos(e)
-    if (drag) {
-      start = drag[1] - (cur[0] - drag[0]) / (w.plot_w(el.clientWidth) / count)
-    }
+    if (down.has(e.pointerId)) down.set(e.pointerId, cur)
+    if (pinch && down.size === 2) {
+      const [d, mid] = spread()
+      if (d > 0) zoom(mid, (pinch.count * pinch.d) / d)
+    } else if (drag) start = drag[1] - (cur[0] - drag[0]) / (w.plot_w(el.clientWidth) / count)
     redraw()
   })
   el.addEventListener('pointerdown', (e) => {
-    drag = [pos(e)[0], start]
+    down.set(e.pointerId, pos(e))
     el.setPointerCapture(e.pointerId)
+    if (down.size === 2) (pinch = { d: spread()[0], count }), (drag = null)
+    else drag = [pos(e)[0], start]
   })
-  el.addEventListener('pointerup', () => (drag = null))
-  el.addEventListener('pointerleave', () => {
-    cur = drag = null
+  const up = (e) => {
+    down.delete(e.pointerId)
+    pinch = null
+    drag = null
+  }
+  el.addEventListener('pointerup', up)
+  el.addEventListener('pointercancel', up)
+  el.addEventListener('pointerleave', (e) => {
+    up(e)
+    cur = null
     redraw()
   })
+  // Wheels and trackpads zoom by how far they moved (a mouse notch is ~100 px, a
+  // trackpad sends many small steps); pinches arrive as ctrl+wheel; sideways scrolls pan.
   el.addEventListener(
     'wheel',
     (e) => {
       e.preventDefault()
-      const x = pos(e)[0] / (w.plot_w(el.clientWidth) / count) // slots from the left edge
-      const next = Math.min(Math.max(count * (e.deltaY > 0 ? 1.12 : 0.89), 10), Math.max(cs.length + 20, 60))
-      start += x - (x * next) / count
-      count = next
-      redraw()
+      const px = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? el.clientHeight : 1
+      if (!e.ctrlKey && Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        start += (e.deltaX * px) / (w.plot_w(el.clientWidth) / count)
+        return redraw()
+      }
+      zoom(pos(e)[0], count * Math.exp(e.deltaY * px * (e.ctrlKey ? 0.01 : 0.0015)))
     },
     { passive: false }
   )
@@ -214,7 +263,9 @@ async function chart(el) {
       redraw()
     }
     if (rows && u.t) {
-      rows.insertAdjacentHTML('afterbegin', u.t)
+      const t = document.createElement('tbody')
+      t.innerHTML = u.t
+      rows.prepend(...[...t.rows].filter((r) => !maker || r.querySelector('.mk')?.dataset.maker === maker))
       while (rows.rows.length > shown) rows.deleteRow(-1)
       const m = $('#more')
       if (m) m.dataset.before = rows.rows[rows.rows.length - 1].dataset.k

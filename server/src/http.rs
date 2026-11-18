@@ -341,17 +341,31 @@ fn trade_cursor(s: &str) -> Option<(u32, u32)> {
 #[derive(Deserialize)]
 struct TradesQ {
     before: Option<String>,
+    /// Only this wallet's trades.
+    maker: Option<String>,
 }
 
 async fn trades(Ax(app): A, Path(id): Path<String>, Query(q): Query<TradesQ>) -> Response {
     let st = read(&app);
     let Some(p) = pool_of(&st, &id) else { return StatusCode::NOT_FOUND.into_response() };
-    let Some(before) = q.before.as_deref().and_then(trade_cursor) else {
-        return StatusCode::BAD_REQUEST.into_response();
+    let maker: Option<[u8; 20]> = match q.maker.as_deref() {
+        Some(m) => match unhex(m).and_then(|b| b.try_into().ok()) {
+            Some(a) => Some(a),
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
     };
-    // Older trades never change.
-    let mut r = cached("application/json", 0, pages::trades_page(&st, &app.sh.store, p, before));
-    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600, s-maxage=86400"));
+    let before = match q.before.as_deref().map(trade_cursor) {
+        Some(Some(b)) => b,
+        Some(None) => return StatusCode::BAD_REQUEST.into_response(),
+        None if maker.is_some() => (u32::MAX, u32::MAX),
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let mut r = cached("application/json", 0, pages::trades_page(&st, &app.sh.store, p, before, maker));
+    // Older trades never change; a wallet's latest do.
+    let cache =
+        if q.before.is_some() { "public, max-age=3600, s-maxage=86400" } else { "public, max-age=0, s-maxage=5" };
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     r
 }
 

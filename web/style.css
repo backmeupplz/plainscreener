@@ -60,6 +60,12 @@ main{padding:28px 0 56px}
 .chartcard:fullscreen{display:flex;flex-direction:column;padding:16px;border-radius:0;background:var(--card)}
 .chartcard:fullscreen #chart{flex:1;height:auto}
 .more{display:flex;margin:6px auto 14px}
+.lq{color:var(--accent2)}
+.trades .mk{min-height:0;padding:0;border:0;border-radius:4px;background:none;color:var(--muted);font-weight:400}
+.trades .mk:hover{color:var(--fg);text-decoration:underline}
+.flt{display:flex;align-items:center;gap:10px;margin:0 16px 8px;padding:8px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;color:var(--muted)}
+.flt .mono{color:var(--fg)}
+.flt button{margin-left:auto;min-height:28px}
 /* token card and other pairs */
 .card h2 .m{font-weight:400}
 .tok .desc{margin:0;padding:2px 16px 12px;color:var(--muted);font-size:14px;line-height:1.55;white-space:pre-line;overflow-wrap:anywhere}

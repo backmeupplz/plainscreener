@@ -2,7 +2,7 @@
 //! The indexer applies logs in chain order and flushes changes to the store in batches.
 
 use crate::abi::{self, Addr, Event, Id, Kind, RawLog, WETH, hex20};
-use crate::model::{Candle, Pool, RES, Stats, Token, Trade};
+use crate::model::{Candle, Pool, RES, Stats, Token, Trade, TradeKind};
 use crate::store::{Store, candle_key, trade_key};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -193,10 +193,18 @@ impl State {
                 pool.bal0 += d0 / s0;
                 pool.bal1 += d1 / s1;
             }
+            Event::Liquidity { d0, d1, add, moves } => {
+                if moves {
+                    pool.bal0 += d0 / s0;
+                    pool.bal1 += d1 / s1;
+                }
+                self.liquidity(p, log, ts, d0 / s0, d1 / s1, add);
+            }
             Event::Modify { tick_lower, tick_upper, liquidity } => {
                 let (a0, a1) = amounts(pool.sqrt_price / Q96, tick_lower, tick_upper, liquidity);
                 pool.bal0 += a0 / s0;
                 pool.bal1 += a1 / s1;
+                self.liquidity(p, log, ts, (a0 / s0).abs(), (a1 / s1).abs(), liquidity > 0.0);
             }
             Event::Created { .. } => {}
         }
@@ -251,6 +259,32 @@ impl State {
         self.pools.push(pool);
         self.pool_ix.insert(id, p);
         self.dirty_pools.insert(p);
+    }
+
+    /// Records liquidity added or removed (whole tokens, positive) for the trades list.
+    /// It isn't a trade: no candles, volume or price.
+    fn liquidity(&mut self, p: u32, log: &RawLog, ts: u32, a0: f64, a1: f64, add: bool) {
+        let pool = &self.pools[p as usize];
+        let (base, quote) = if pool.quote0 { (a1, a0) } else { (a0, a1) };
+        if base == 0.0 && quote == 0.0 {
+            return;
+        }
+        let qusd = self.tokens[pool.quote() as usize].usd;
+        let usd = quote * qusd + base * pool.price_usd;
+        let trade = Trade {
+            ts,
+            tx: log.tx,
+            maker: log.from,
+            buy: false,
+            base,
+            quote,
+            usd: if usd.is_finite() { usd as f32 } else { f32::NAN },
+            price_usd: pool.price_usd as f32,
+            price_native: pool.price_native as f32,
+            kind: if add { TradeKind::Add } else { TradeKind::Remove },
+        };
+        self.trades.push((trade_key(p, log.block, log.index), trade.encode()));
+        self.touched.insert(p);
     }
 
     /// Records a swap given the pool's balance deltas in whole tokens. The price is what
@@ -313,6 +347,7 @@ impl State {
             usd: vol as f32,
             price_usd: usd as f32,
             price_native: native as f32,
+            kind: TradeKind::Swap,
         };
         self.trades.push((trade_key(p, log.block, log.index), trade.encode()));
 
@@ -472,6 +507,16 @@ mod tests {
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].1.sells, 1);
         assert_eq!(store.trades(2, (u32::MAX, 0), 10).len(), 1);
+
+        // Liquidity added to MEME/WETH shows in its trades as an Add, without touching
+        // candles or 24 h volume.
+        let vol = s.stats[&2].window(s.head_ts, 86_400).vol;
+        s.apply(&log(11, pool_b, vec![T.v2_mint, pad(&[7; 20])], [word(500e18), word(0.005e18)].concat()), &store);
+        s.flush(&store, 12).unwrap();
+        let last = &store.trades(2, (u32::MAX, 0), 1)[0].1;
+        assert_eq!((last.kind, last.base, last.quote), (TradeKind::Add, 500.0, 0.005));
+        assert_eq!(s.stats[&2].window(s.head_ts, 86_400).vol, vol);
+        assert_eq!(store.candles(2, 0, 0, u32::MAX, 10)[0].1.buys + store.candles(2, 0, 0, u32::MAX, 10)[0].1.sells, 1);
 
         // Trades in three different minutes before one flush keep three 1 m candles.
         for minute in 1..=3 {

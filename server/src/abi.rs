@@ -58,8 +58,11 @@ pub enum Event {
     SwapV2 { d0: f64, d1: f64 },
     /// Concentrated-liquidity swap: pool balance deltas (raw), price after, LP fee in pips (v4).
     SwapCl { d0: f64, d1: f64, sqrt_price: f64, fee: u32 },
-    /// v3 Mint (+) and Collect (-): tokens entering or leaving the pool.
+    /// v3 Collect: tokens leaving the pool (withdrawn liquidity and fees).
     Flow { d0: f64, d1: f64 },
+    /// Liquidity added or removed, raw amounts (positive). `moves`: the pool's balances
+    /// change by them (v3 Mint); otherwise a Sync or Collect accounts for the tokens.
+    Liquidity { d0: f64, d1: f64, add: bool, moves: bool },
     /// v4 liquidity change; token amounts depend on the current price.
     Modify { tick_lower: i32, tick_upper: i32, liquidity: f64 },
 }
@@ -86,6 +89,10 @@ pub struct Topics {
     pub pancake_swap: [u8; 32],
     pub v3_mint: [u8; 32],
     pub v3_collect: [u8; 32],
+    pub v2_mint: [u8; 32],
+    pub v2_burn: [u8; 32],
+    pub solidly_burn: [u8; 32],
+    pub v3_burn: [u8; 32],
     pub v4_swap: [u8; 32],
     pub v4_modify: [u8; 32],
 }
@@ -104,6 +111,11 @@ pub static T: LazyLock<Topics> = LazyLock::new(|| Topics {
     pancake_swap: keccak("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)"),
     v3_mint: keccak("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
     v3_collect: keccak("Collect(address,address,int24,int24,uint128,uint128)"),
+    // Solidly pools emit the same Mint as v2.
+    v2_mint: keccak("Mint(address,uint256,uint256)"),
+    v2_burn: keccak("Burn(address,uint256,uint256,address)"),
+    solidly_burn: keccak("Burn(address,address,uint256,uint256)"),
+    v3_burn: keccak("Burn(address,int24,int24,uint128,uint256,uint256)"),
     v4_swap: keccak("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"),
     v4_modify: keccak("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"),
 });
@@ -124,6 +136,10 @@ impl Topics {
             self.pancake_swap,
             self.v3_mint,
             self.v3_collect,
+            self.v2_mint,
+            self.v2_burn,
+            self.solidly_burn,
+            self.v3_burn,
         ]
     }
     /// Topics accepted only from the v4 PoolManager.
@@ -154,7 +170,13 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
     } else if t0 == t.v3_swap || t0 == t.pancake_swap {
         Event::SwapCl { d0: i256_f64(w(0)?), d1: i256_f64(w(1)?), sqrt_price: u256_f64(w(2)?), fee: 0 }
     } else if t0 == t.v3_mint {
-        Event::Flow { d0: u256_f64(w(2)?), d1: u256_f64(w(3)?) }
+        Event::Liquidity { d0: u256_f64(w(2)?), d1: u256_f64(w(3)?), add: true, moves: true }
+    } else if t0 == t.v3_burn {
+        Event::Liquidity { d0: u256_f64(w(1)?), d1: u256_f64(w(2)?), add: false, moves: false }
+    } else if t0 == t.v2_mint || t0 == t.v2_burn {
+        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: t0 == t.v2_mint, moves: false }
+    } else if t0 == t.solidly_burn {
+        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: false, moves: false }
     } else if t0 == t.v3_collect {
         Event::Flow { d0: -u256_f64(w(1)?), d1: -u256_f64(w(2)?) }
     } else if log.address == V4_POOL_MANAGER {

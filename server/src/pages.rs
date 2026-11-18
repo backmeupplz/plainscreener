@@ -3,7 +3,7 @@
 
 use crate::App;
 use crate::abi::hex;
-use crate::model::{Pool, RES, RES_NAMES, Trade, Window};
+use crate::model::{Pool, RES, RES_NAMES, Trade, TradeKind, Window};
 use crate::state::{NONE, State};
 use crate::store::Store;
 use chart::fmt;
@@ -346,27 +346,56 @@ fn more_button(page: &[((u32, u32), Trade)]) -> String {
     }
 }
 
-/// An older page of trade rows for "Load more": `{"rows": html, "more": html}`.
-pub fn trades_page(st: &State, store: &Store, p: u32, before: (u32, u32)) -> String {
+/// Trades a wallet filter looks through per page.
+const MAKER_SCAN: usize = 20_000;
+
+/// A page of trade rows for "Load more" or a wallet filter: `{"rows": html, "more": html}`.
+pub fn trades_page(st: &State, store: &Store, p: u32, before: (u32, u32), maker: Option<[u8; 20]>) -> String {
     let pool = &st.pools[p as usize];
-    let page = store.trades(p, before, TRADES);
+    let (page, more) = match maker {
+        None => {
+            let page = store.trades(p, before, TRADES);
+            let more = more_button(&page);
+            (page, more)
+        }
+        Some(m) => {
+            let (page, last) = store.trades_by(p, m, before, TRADES, MAKER_SCAN);
+            // More may follow while we stopped early, or the scan limit cut the search short.
+            let more = match last {
+                Some((b, i)) if page.len() == TRADES || store.trades(p, (b, i), 1).len() == 1 => format!(
+                    r#"<button type="button" class="more" id="more" data-before="{b}-{i}">Load more trades</button>"#
+                ),
+                _ => String::new(),
+            };
+            (page, more)
+        }
+    };
     let rows: String = page.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
-    serde_json::json!({"rows": rows, "more": more_button(&page)}).to_string()
+    serde_json::json!({"rows": rows, "more": more}).to_string()
 }
 
 /// A trades table row; `data-k` is its cursor (block-index) for paging.
 pub fn trade_row(st: &State, pool: &Pool, (block, index): (u32, u32), t: &Trade) -> String {
-    let cls = if t.buy { "u" } else { "d" };
+    let (kind, cls) = match t.kind {
+        TradeKind::Swap if t.buy => ("Buy", "u"),
+        TradeKind::Swap => ("Sell", "d"),
+        TradeKind::Add => ("Add", "lq"),
+        TradeKind::Remove => ("Remove", "lq"),
+    };
+    let amount = s(|o| {
+        fmt::compact(o, t.base);
+        let _ = write!(o, " {}", Esc(sym(st, pool.base())));
+        // Liquidity moves both tokens.
+        if t.kind != TradeKind::Swap {
+            o.push_str(" + ");
+            fmt::compact(o, t.quote);
+            let _ = write!(o, " {}", Esc(sym(st, pool.quote())));
+        }
+    });
+    let price = if t.kind == TradeKind::Swap { s(|o| fmt::usd(o, t.price_usd as f64)) } else { "–".into() };
     format!(
-        r#"<tr data-k="{block}-{index}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><a class="mono" href="{EXPLORER}/address/{maker}" rel="nofollow">{maker_s}</a></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
+        r#"<tr data-k="{block}-{index}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{maker_s}</button></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
         time = s(|o| fmt::date_clock(o, t.ts as i64)),
-        kind = if t.buy { "Buy" } else { "Sell" },
-        price = s(|o| fmt::usd(o, t.price_usd as f64)),
-        amount = s(|o| {
-            fmt::compact(o, t.base);
-            o.push(' ');
-            let _ = write!(o, "{}", Esc(sym(st, pool.base())));
-        }),
         total = s(|o| fmt::usd_compact(o, t.usd as f64)),
         maker = hex(&t.maker),
         maker_s = short(&t.maker),

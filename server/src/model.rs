@@ -151,6 +151,16 @@ pub struct Trade {
     pub usd: f32,
     pub price_usd: f32,
     pub price_native: f32,
+    /// What happened (stored last, so older records read as swaps).
+    pub kind: TradeKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TradeKind {
+    #[default]
+    Swap,
+    Add,
+    Remove,
 }
 
 /// Recent activity of a pool: 60 one-minute and 24 one-hour buckets.
@@ -412,6 +422,7 @@ impl Trade {
             .f32(self.usd)
             .f32(self.price_usd)
             .f32(self.price_native)
+            .u8(self.kind as u8)
             .0
     }
     pub fn decode(b: &[u8]) -> Trade {
@@ -426,6 +437,11 @@ impl Trade {
             usd: r.f32(),
             price_usd: r.f32(),
             price_native: r.f32(),
+            kind: match r.u8() {
+                1 => TradeKind::Add,
+                2 => TradeKind::Remove,
+                _ => TradeKind::Swap,
+            },
         }
     }
 }
