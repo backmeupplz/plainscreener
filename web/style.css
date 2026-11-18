@@ -190,7 +190,6 @@ img.av{background:var(--raise);object-fit:cover}
 .tt button[aria-selected=true]{background:var(--raise);color:var(--fg);box-shadow:inset 0 0 0 1px var(--line)}
 .trades td,.trades th{padding:8px 12px;font-size:13px}
 .trades td:last-child,.trades th:last-child{width:1%;padding-left:0}
-.trades small.m{display:block;font-size:11px}
 .trades .mk{min-height:0;padding:0;border:0;background:none;color:var(--muted);font-weight:400}
 .trades .mk:hover{color:var(--fg);text-decoration:underline}
 .tsub{margin:0 16px 8px;font-size:13px}
@@ -222,16 +221,46 @@ img.av{background:var(--raise);object-fit:cover}
 .info{padding-bottom:4px}
 .info p{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:36px;margin:0;padding:2px 16px}
 .info p>span:first-child{color:var(--muted)}
-.info p.fine{display:block;min-height:0;padding:6px 16px 10px;color:var(--muted);font-size:12px}
+
 .addr{display:flex;align-items:center;gap:2px}
 .addr .mono{margin-right:4px}
-.sv{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin-left:6px;border-radius:50%;background:var(--raise);color:var(--muted);font-style:normal;font-size:10px;font-weight:700}
-.sv.ok{background:var(--upbg);color:var(--up)}
-.sv.warn{background:var(--downbg);color:var(--down)}
-.tok .links{display:flex;flex-wrap:wrap;gap:6px;padding:2px 16px 10px}
-.tok .links .ic{min-height:32px}
-.tok .desc{margin:0;padding:0 16px 12px;color:var(--muted);font-size:13px;line-height:1.55;white-space:pre-line;overflow-wrap:anywhere}
-.tok .info{border-top:1px solid var(--line2)}
+/* safety: a checklist */
+.checks{margin:0;padding:2px 8px 4px;list-style:none}
+.checks li{display:flex;align-items:center;gap:10px;min-height:34px;padding:0 8px;border-radius:8px;font-size:13px}
+.checks li>span{flex:1;color:var(--muted)}
+.checks li>b{font-weight:550;text-align:right}
+.checks .i{color:var(--muted)}
+.checks .ok .i{color:var(--up)}
+.checks .warn .i{color:var(--down)}
+.checks .warn{background:var(--downbg)}
+.checks .warn>span{color:var(--fg)}
+.fine{margin:0;padding:6px 16px 12px;color:var(--muted);font-size:11px;line-height:1.5}
+/* about: title links to the token page, link icons beside it, numbers in a strip */
+.hl2{display:flex;align-items:center;gap:4px;min-width:0}
+.hl2 h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hl2 .i{width:14px;height:14px;color:var(--muted)}
+.hl2:hover h2,.hl2:hover .i{color:var(--fg)}
+.ch2 .links{display:flex;gap:2px;margin-left:auto}
+.ch2 .links .ic{width:28px;min-height:28px;border:0;background:none;border-radius:8px}
+.ch2 .links .ic:hover{background:var(--raise)}
+.tok .desc{margin:0;padding:0 16px 10px;color:var(--muted);font-size:13px;line-height:1.55;white-space:pre-line;overflow-wrap:anywhere}
+.mini{display:grid;grid-template-columns:repeat(3,1fr);margin:0;border-top:1px solid var(--line2)}
+.mini div{min-width:0;padding:10px 16px}
+.mini div+div{border-left:1px solid var(--line2)}
+.mini dt{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mini dd{margin:2px 0 0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* top traders */
+.tops td{vertical-align:middle}
+.tops td small{display:block;color:var(--muted);font-size:11px;font-weight:400}
+.tops td b{font-weight:600}
+/* skeletons: bars in the same cells as the rows they stand for, so heights match */
+.sk i{display:inline-block;height:10px;vertical-align:middle;border-radius:5px;background:var(--raise)}
+.sk i.c{width:24px;height:24px;margin-right:10px;border-radius:50%}
+.sk i.q{width:26px;height:26px;border-radius:7px}
+.sk i.s{display:block;height:9px;margin:4px 0 3px auto}
+.sk{animation:pulse 1.3s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.4}}
+@media (prefers-reduced-motion:reduce){.sk{animation:none}}
 .pairs{padding-bottom:6px}
 .pairs>a{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 16px;font-size:13px;transition:background .12s}
 .pairs>a:hover{background:var(--hover);color:inherit}

@@ -2,6 +2,23 @@
 // same Rust renderer compiled to wasm), live updates, and copy buttons.
 const $ = (s, el = document) => el.querySelector(s)
 
+// Skeleton rows in the shape of the rows they stand for: one cell per column, each a bar
+// of the given width ('c' for an avatar, 'q' for an icon button, a second number for a small second line, 'h' to
+// hide on phones like the real column). Same cells, same heights: nothing jumps when the
+// data arrives.
+const skeleton = (n, cols) =>
+  `<tr class="sk" aria-hidden="true">${cols
+    .map((c) => {
+      const [w, w2, opt] = [].concat(c)
+      const bar = (x, cls = '') => (x === 'c' || x === 'q' ? `<i class="${x}"></i>` : `<i class="${cls}" style="width:${x}px"></i>`)
+      return `<td class="${typeof w === 'string' && w.startsWith('l') ? 'l' : ''}${opt === 'h' ? ' hide-s' : ''}">${String(w).replace('l', '').split('+').map((x) => bar(isNaN(x) ? x : +x)).join('')}${w2 ? bar(w2, 's') : ''}</td>`
+    })
+    .join('')}</tr>`.repeat(n)
+// Rows of a trades table, top traders, and pair lists.
+const SK_TRADES = ['l84', 'l30', 54, 70, 44, [80, 0, 'h'], ['q', 0, 'h']]
+const SK_TRADERS = ['l14', 'l90', [52, 64], [52, 64], [56, 40], [44, 0, 'h']]
+const SK_LIST = ['l20', 'lc+120', 60, [40, 0, 'h'], [40, 0, 'h'], [40, 0, 'h'], 44, 50, 50, [50, 0, 'h'], [36, 0, 'h'], [24, 0, 'h']]
+
 // Farcaster mini app: the host keeps the app hidden until it says it's ready. This is the
 // mini app SDK's sdk.actions.ready() (one comlink call to the host) without loading the SDK.
 // Elsewhere (an iframe on some site, X's player) nobody listens and it's ignored.
@@ -82,7 +99,7 @@ function tab(name) {
   for (const el of [tr.closest('table'), $('#more'), $('#flt')]) if (el) el.hidden = name === 'traders'
   if (name === 'traders' && !traders.dataset.loaded) {
     traders.dataset.loaded = 1
-    traders.innerHTML = '<p class="empty">Adding up trades…</p>'
+    traders.innerHTML = `<p class="tsub"><i class="sk" style="display:inline-block;width:60%;height:10px;border-radius:5px;background:var(--raise)"></i></p><div class="scroll"><table class="trades tops"><thead><tr><th class="l">#</th><th class="l">Wallet</th><th>Bought</th><th>Sold</th><th>Profit</th><th class="hide-s">Buys / sells</th></tr></thead><tbody>${skeleton(10, SK_TRADERS)}</tbody></table></div>`
     fetch(`/api/traders/${$('#chart').dataset.pool}`)
       .then((r) => r.text())
       .then((h) => (traders.innerHTML = h))
@@ -97,8 +114,12 @@ async function trades(before) {
   const q = new URLSearchParams()
   if (before) q.set('before', before)
   if (maker) q.set('maker', maker)
+  const append = before && !before.startsWith('4294967295')
+  if (append) tr.insertAdjacentHTML('beforeend', skeleton(8, SK_TRADES))
+  else tr.innerHTML = skeleton(12, SK_TRADES)
   const r = await fetch(`/api/trades/${$('#chart').dataset.pool}?${q}`).then((r) => r.json())
-  if (before && !before.startsWith('4294967295')) tr.insertAdjacentHTML('beforeend', r.rows)
+  tr.querySelectorAll('.sk').forEach((s) => s.remove())
+  if (append) tr.insertAdjacentHTML('beforeend', r.rows)
   else tr.innerHTML = r.rows
   shown = Math.max(50, tr.rows.length)
   $('#more')?.remove()
@@ -190,6 +211,10 @@ document.querySelectorAll('input[type=search]').forEach((input, n) => {
     clearTimeout(timer)
     const q = input.value.trim()
     if (q.length < 2) return show(false)
+    if (box.hidden) {
+      box.innerHTML = '<li class="sk"><a><i class="c"></i><i style="width:45%"></i></a></li>'.repeat(3)
+      show(true)
+    }
     timer = setTimeout(async () => {
       asked = q
       const r = await fetch(`/api/v1/search?q=${encodeURIComponent(q)}`).then((r) => (r.ok ? r.json() : { pairs: [] }), () => ({ pairs: [] }))
@@ -247,7 +272,7 @@ if (list) {
     const rows = await fetch(u).then((r) => (r.ok ? r.text() : ''), () => '')
     if (rows && rows !== last) (list.querySelector('tbody').innerHTML = last = rows), stars()
   }
-  if (watch) refresh()
+  if (watch && watched().length) (list.querySelector('tbody').innerHTML = skeleton(Math.min(watched().length, 12), SK_LIST)), refresh()
   setInterval(() => document.hidden || refresh(), 3000)
 }
 

@@ -394,7 +394,7 @@ async fn traders(Ax(app): A, Path(id): Path<String>) -> Response {
     let Some(p) = pool_of(&st, &id) else { return StatusCode::NOT_FOUND.into_response() };
     let rows = pages::top_traders(&st, &app.sh.store, p);
     let body = format!(
-        r#"<p class="sub tsub">Most profitable wallets in the last 100,000 trades. Profit counts what they still hold at today's price.</p><table class="trades"><thead><tr><th class="l">#</th><th class="l">Maker</th><th>Bought</th><th>Sold</th><th>Profit</th><th class="hide-s">Trades</th></tr></thead><tbody>{rows}</tbody></table>"#
+        r#"<p class="tsub">Profit on what each wallet bought here (last 100K trades), with anything still held at today's price.</p><div class="scroll"><table class="trades tops"><thead><tr><th class="l">#</th><th class="l">Wallet</th><th>Bought</th><th>Sold</th><th>Profit</th><th class="hide-s">Buys / sells</th></tr></thead><tbody>{rows}</tbody></table></div>"#
     );
     let mut r = cached("text/html; charset=utf-8", 0, body);
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=0, s-maxage=60"));

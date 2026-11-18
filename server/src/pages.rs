@@ -359,41 +359,56 @@ pub fn fields_full(st: &State, store: &Store, p: u32) -> Vec<(String, String, &'
     fs
 }
 
-/// The most profitable wallets among a pool's last `TRADER_SCAN` trades, as table rows:
-/// what they bought and sold, and profit counting what they still hold at today's price.
-pub fn top_traders(st: &State, store: &Store, p: u32) -> String {
-    #[derive(Default)]
-    struct W {
-        bought: f64,
-        sold: f64,
-        got: f64,
-        gave: f64,
-        n: u32,
+/// Trading results of one wallet in a pool: what it paid and got, both sides.
+#[derive(Default, Clone, Copy)]
+struct Wallet {
+    bought: f64,
+    sold: f64,
+    got: f64,
+    gave: f64,
+    buys: u32,
+    sells: u32,
+}
+
+impl Wallet {
+    /// Profit on what it bought here: sales of those tokens at their average sell price,
+    /// plus any still held at `price`, minus what it paid. Tokens sold beyond what it
+    /// bought here came from elsewhere, so they don't count. None without buys.
+    fn pnl(&self, price: f64) -> Option<f64> {
+        if self.got <= 0.0 || self.bought <= 0.0 {
+            return None;
+        }
+        let avg_buy = self.bought / self.got;
+        let matched = self.got.min(self.gave);
+        let realized = if self.gave > 0.0 { matched * (self.sold / self.gave - avg_buy) } else { 0.0 };
+        let open = (self.got - self.gave).max(0.0);
+        let unrealized = if price.is_finite() { open * (price - avg_buy) } else { 0.0 };
+        Some(realized + unrealized)
     }
+}
+
+/// The most profitable wallets among a pool's last `TRADER_SCAN` trades, as table rows
+/// (see `Wallet::pnl`).
+pub fn top_traders(st: &State, store: &Store, p: u32) -> String {
     let pool = &st.pools[p as usize];
-    let mut by: std::collections::HashMap<[u8; 20], W> = Default::default();
+    let mut by: std::collections::HashMap<[u8; 20], Wallet> = Default::default();
     for (_, t) in store.trades(p, (u32::MAX, u32::MAX), TRADER_SCAN) {
         if t.kind != TradeKind::Swap || !t.usd.is_finite() {
             continue;
         }
         let w = by.entry(t.maker).or_default();
-        w.n += 1;
         if t.buy {
-            (w.bought, w.got) = (w.bought + t.usd as f64, w.got + t.base);
+            (w.bought, w.got, w.buys) = (w.bought + t.usd as f64, w.got + t.base, w.buys + 1);
         } else {
-            (w.sold, w.gave) = (w.sold + t.usd as f64, w.gave + t.base);
+            (w.sold, w.gave, w.sells) = (w.sold + t.usd as f64, w.gave + t.base, w.sells + 1);
         }
     }
-    let price = pool.price_usd;
-    let mut ws: Vec<([u8; 20], W, f64)> = by
-        .into_iter()
-        .map(|(a, w)| {
-            let held = (w.got - w.gave).max(0.0) * if price.is_finite() { price } else { 0.0 };
-            let pnl = w.sold + held - w.bought;
-            (a, w, pnl)
-        })
-        .collect();
+    let mut ws: Vec<([u8; 20], Wallet, f64)> =
+        by.into_iter().filter_map(|(a, w)| Some((a, w, w.pnl(pool.price_usd)?))).collect();
     ws.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+    if ws.is_empty() {
+        return r#"<tr><td colspan="6" class="empty">No wallet has bought here yet.</td></tr>"#.into();
+    }
     let bs = Esc(sym(st, pool.base())).to_string();
     ws.iter()
         .take(50)
@@ -407,21 +422,23 @@ pub fn top_traders(st: &State, store: &Store, p: u32) -> String {
                     let _ = write!(o, " {bs}</small>");
                 })
             };
+            let cls = if *pnl >= 0.0 { "u" } else { "d" };
             format!(
-                r#"<tr><td class="l m">{n}</td><td class="l"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{short}</button></td><td class="u">{bought}</td><td class="d">{sold}</td><td class="{cls}">{pnl}</td><td class="hide-s">{trades}</td></tr>"#,
+                r#"<tr><td class="l m">{n}</td><td class="l"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{short}</button></td><td>{bought}</td><td>{sold}</td><td class="{cls}"><b>{pnl}</b><small>{roi}</small></td><td class="hide-s"><span class="u">{buys}</span> <span class="m">/</span> <span class="d">{sells}</span></td></tr>"#,
                 n = i + 1,
                 maker = hex(a),
                 short = short(a),
                 bought = amount(w.bought, w.got),
-                sold = amount(w.sold, w.gave),
-                cls = if *pnl >= 0.0 { "u" } else { "d" },
+                sold = if w.sells > 0 { amount(w.sold, w.gave) } else { r#"<span class="m">–</span>"#.into() },
                 pnl = s(|o| {
                     if *pnl >= 0.0 {
                         o.push('+');
                     }
                     fmt::usd_compact(o, *pnl);
                 }),
-                trades = w.n,
+                roi = s(|o| fmt::pct(o, pnl / w.bought)),
+                buys = w.buys,
+                sells = w.sells,
             )
         })
         .collect()
@@ -452,17 +469,12 @@ pub fn fields(st: &State, p: u32) -> Vec<(String, String, &'static str)> {
         out.push((format!("b{name}"), s(|o| fmt::uint(o, m.w[i].buys as u64)), ""));
         out.push((format!("s{name}"), s(|o| fmt::uint(o, m.w[i].sells as u64)), ""));
     }
-    let amount = |x: f64, t: u32| {
-        s(|o| {
-            fmt::compact(o, x);
-            o.push(' ');
-            o.push_str(sym(st, t));
-        })
-    };
+    // Amounts without the symbol: their labels name the token.
+    let amount = |x: f64| s(|o| fmt::compact(o, x));
     let (bb, qb) = if pool.quote0 { (pool.bal1, pool.bal0) } else { (pool.bal0, pool.bal1) };
-    out.push(("sup".into(), amount(st.tokens[pool.base() as usize].supply, pool.base()), ""));
-    out.push(("pb".into(), amount(bb, pool.base()), ""));
-    out.push(("pq".into(), amount(qb, pool.quote()), ""));
+    out.push(("sup".into(), amount(st.tokens[pool.base() as usize].supply), ""));
+    out.push(("pb".into(), amount(bb), ""));
+    out.push(("pq".into(), amount(qb), ""));
     out
 }
 
@@ -897,7 +909,8 @@ fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'s
     let base = &st.tokens[pool.base() as usize];
     let (desc, links) = profile(store, base.addr);
     format!(
-        r#"<div class="card tok"><div class="ch2"><h2>About {name}</h2><a class="more-link" href="/base/token/{addr}">Token page</a></div>{links}{desc}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
+        r#"<div class="card tok"><div class="ch2"><a class="hl2" href="/base/token/{addr}" title="Token page"><h2>About {name}</h2>{chev}</a>{links}</div>{desc}<dl class="mini"><div><dt>Supply</dt><dd>{supply}</dd></div><div><dt>Pooled {bs}</dt><dd>{bb}</dd></div><div><dt>Pooled {qs}</dt><dd>{qb}</dd></div></dl></div>"#,
+        chev = icon("chevron-right"),
         name = Esc(if base.name.is_empty() { sym(st, pool.base()) } else { &base.name }),
         addr = hex(&base.addr),
         supply = field(fs, "sup"),
@@ -921,10 +934,10 @@ fn safety_card(st: &State, store: &Store, p: u32) -> String {
         rows.push(("Contract checks", "Not run yet".into(), None));
     } else {
         rows.push(match v["owner"].as_str().unwrap_or("none") {
-            "renounced" => ("Ownership", "Renounced".into(), Some(true)),
-            "none" => ("Ownership", "No owner".into(), Some(true)),
+            "renounced" => ("Owner", "Renounced".into(), Some(true)),
+            "none" => ("Owner", "None".into(), Some(true)),
             a => (
-                "Ownership",
+                "Owner",
                 format!(
                     r#"<a class="mono" href="{EXPLORER}/address/{0}" rel="nofollow">{1}</a>"#,
                     Esc(a),
@@ -942,51 +955,47 @@ fn safety_card(st: &State, store: &Store, p: u32) -> String {
             let on = v[key].as_bool().unwrap_or(false);
             ((if on { yes } else { no }).to_string(), Some(!on))
         };
-        let (t, ok) = flag("upgradeable", "Yes, by its admin", "No");
+        let (t, ok) = flag("upgradeable", "Yes", "No");
         rows.push(("Upgradeable", t, ok));
-        let (t, ok) = flag("mint", "Has a mint function", "None found");
-        rows.push(("Minting", t, ok));
+        let (t, ok) = flag("mint", "Yes", "No");
+        rows.push(("Can mint", t, ok));
         let on = v["pause"].as_bool().unwrap_or(false) || v["blacklist"].as_bool().unwrap_or(false);
-        rows.push(("Pause or blacklist", (if on { "Found" } else { "None found" }).into(), Some(!on)));
+        rows.push(("Can pause or blacklist", (if on { "Yes" } else { "No" }).into(), Some(!on)));
         match &v["lp"] {
             lp if lp["pool"].as_str() == Some(pool.key().as_str()) => {
                 let burned = lp["burned"].as_f64().unwrap_or(0.0);
                 rows.push((
-                    "Liquidity burned",
+                    "LP burned",
                     s(|o| fmt::pct(o, burned)).trim_start_matches('+').to_string(),
                     Some(burned >= 0.95),
                 ));
             }
-            _ if pool.is_address() && matches!(pool.kind, crate::abi::Kind::V2 | crate::abi::Kind::Solidly) => {}
-            _ => rows.push(("Liquidity burned", "n/a (positions, not LP tokens)".into(), None)),
+            // Concentrated liquidity has positions, not LP tokens to burn.
+            _ => {}
         }
     }
     let (_, buyers, sellers) = makers(store, p, st.head_ts)[3];
-    rows.push((
-        "Sellers in 24h",
-        format!("{sellers} wallet{}", if sellers == 1 { "" } else { "s" }),
-        if buyers > 0 { Some(sellers > 0) } else { None },
-    ));
+    rows.push(("Sellers, 24h", s(|o| fmt::uint(o, sellers as u64)), if buyers > 0 { Some(sellers > 0) } else { None }));
+    let warnings = rows.iter().filter(|r| r.2 == Some(false)).count();
     let rows: String = rows
         .iter()
         .map(|(label, value, ok)| {
-            let (cls, mark) = match ok {
-                Some(true) => ("ok", "✓"),
-                Some(false) => ("warn", "!"),
-                None => ("", "·"),
+            let (cls, i, what) = match ok {
+                Some(true) => ("ok", "circle-check", "Fine"),
+                Some(false) => ("warn", "triangle-alert", "Warning"),
+                None => ("", "circle-minus", "Unknown"),
             };
             format!(
-                r#"<p><span>{label}</span><span>{value} <i class="sv {cls}" aria-hidden="true">{mark}</i></span></p>"#
+                r##"<li class="{cls}"><svg class="i" role="img" aria-label="{what}"><use href="#i-{i}"/></svg><span>{label}</span><b>{value}</b></li>"##
             )
         })
         .collect();
-    let warnings = rows.matches(r#"class="sv warn""#).count();
     let summary = match warnings {
         0 => r#"<span class="pill ok">No flags</span>"#.to_string(),
         n => format!(r#"<span class="pill warn">{n} flag{}</span>"#, if n == 1 { "" } else { "s" }),
     };
     format!(
-        r#"<div class="card info safety"><div class="ch2"><h2>{shield}Safety</h2>{summary}</div>{rows}<p class="fine">Read from the contract and recent trades. A heuristic, not an audit.</p></div>"#,
+        r#"<div class="card safety"><div class="ch2"><h2>{shield}Safety</h2>{summary}</div><ul class="checks">{rows}</ul><p class="fine">Read from the contract and recent trades: a heuristic, not an audit.</p></div>"#,
         shield = icon("shield-check"),
     )
 }
@@ -1308,6 +1317,18 @@ pub fn own_pool(st: &State, token: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_profit() {
+        // Bought 10 at $1, sold 4 at $2, holds 6 at $3: 4 + 12 = $16 on $10 paid.
+        let w = Wallet { bought: 10.0, got: 10.0, sold: 8.0, gave: 4.0, buys: 1, sells: 1 };
+        assert!((w.pnl(3.0).unwrap() - 16.0).abs() < 1e-9);
+        // Sold 268 having bought 7 here: only the 7 count.
+        let w = Wallet { bought: 7.0, got: 7.0, sold: 268.0 * 1.5, gave: 268.0, buys: 1, sells: 9 };
+        assert!((w.pnl(1.5).unwrap() - 7.0 * 0.5).abs() < 1e-9);
+        // Only sells: no profit to speak of.
+        assert!(Wallet { sold: 100.0, gave: 50.0, sells: 3, ..Default::default() }.pnl(2.0).is_none());
+    }
 
     #[test]
     fn escapes_and_css() {
