@@ -16,17 +16,31 @@ const EXPLORER: &str = "https://basescan.org";
 pub const CHART_CANDLES: usize = 300;
 
 /// Colors: (name, light, dark). The page gets them as CSS variables, OG images inline.
-pub const PALETTE: [(&str, &str, &str); 11] = [
-    ("bg", "#f6f6f4", "#0d0f12"),
-    ("card", "#ffffff", "#15181d"),
-    ("fg", "#17181b", "#e8eaed"),
-    ("muted", "#5d6167", "#9aa0a6"),
-    ("line", "#e6e4e0", "#262a31"),
-    ("grid", "#efede9", "#1c2026"),
-    ("hover", "#f3f2ef", "#1a1e24"),
-    ("up", "#0a7a3d", "#2fbf71"),
-    ("down", "#c22f2a", "#f0605d"),
-    ("accent", "#1f5fd6", "#6ea8fe"),
+/// Near-black surfaces, hairline borders, one blue accent.
+pub const PALETTE: [(&str, &str, &str); 23] = [
+    // Avatar background and letter lightness (hue comes from the token address).
+    ("avbg", "90%", "22%"),
+    ("avfg", "30%", "82%"),
+    ("bg", "#fafafa", "#000000"),
+    ("card", "#ffffff", "#0d0d0d"),
+    ("raise", "#f4f4f5", "#1a1a1a"),
+    ("fg", "#0a0a0a", "#f5f5f5"),
+    ("fg2", "#1f4fd1", "#ffffff"),
+    ("muted", "#666666", "#a3a3a3"),
+    ("line", "rgba(0,0,0,0.08)", "rgba(255,255,255,0.08)"),
+    ("line2", "rgba(0,0,0,0.05)", "rgba(255,255,255,0.05)"),
+    ("line3", "rgba(0,0,0,0.2)", "rgba(255,255,255,0.2)"),
+    ("grid", "rgba(0,0,0,0.05)", "rgba(255,255,255,0.05)"),
+    ("hover", "rgba(0,0,0,0.025)", "rgba(255,255,255,0.03)"),
+    ("nav", "rgba(250,250,250,0.8)", "rgba(0,0,0,0.75)"),
+    ("up", "#0a7a3d", "#3ecf8e"),
+    ("down", "#d0283c", "#ff5d6c"),
+    ("upbg", "rgba(10,122,61,0.1)", "rgba(62,207,142,0.12)"),
+    ("downbg", "rgba(208,40,60,0.1)", "rgba(255,93,108,0.12)"),
+    ("accent", "#2d63ea", "#2d63ea"),
+    ("accent2", "#1f53d6", "#3d72f5"),
+    ("ring", "rgba(45,99,234,0.2)", "rgba(45,99,234,0.35)"),
+    ("shadow", "0 1px 2px rgba(0,0,0,0.04)", "0 12px 32px -16px rgba(0,0,0,0.65)"),
     ("white", "#ffffff", "#ffffff"),
 ];
 
@@ -55,7 +69,7 @@ pub fn page_css() -> String {
     )
 }
 
-pub const LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#16181d"/><path d="M9 7v18M16 10v16M23 5v16" stroke="#9aa0a6" stroke-width="1.6"/><rect x="7" y="11" width="4" height="9" rx="1" fill="#2fbf71"/><rect x="14" y="14" width="4" height="8" rx="1" fill="#f0605d"/><rect x="21" y="8" width="4" height="9" rx="1" fill="#2fbf71"/></svg>"##;
+pub const LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" aria-hidden="true"><rect x=".5" y=".5" width="31" height="31" rx="8" fill="#0d0d0d" stroke="#ffffff" stroke-opacity=".14"/><path d="M9 7v18M16 10v16M23 5v16" stroke="#a3a3a3" stroke-width="1.6"/><rect x="7" y="11" width="4" height="9" rx="1" fill="#3ecf8e"/><rect x="14" y="14" width="4" height="8" rx="1" fill="#ff5d6c"/><rect x="21" y="8" width="4" height="9" rx="1" fill="#3ecf8e"/></svg>"##;
 
 /// HTML-escapes untrusted text (token names and symbols come from anyone's contract).
 pub struct Esc<'a>(pub &'a str);
@@ -123,7 +137,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
                 "button": {"title": "Open chart", "action": {
                     "type": action, "name": SITE, "url": launch,
                     "splashImageUrl": format!("{}/icon.png", app.cfg.public_url),
-                    "splashBackgroundColor": "#0d0f12"
+                    "splashBackgroundColor": "#000000"
                 }}
             });
             let _ = write!(meta, r#"<meta name="{name}" content="{}">"#, Esc(&card.to_string()));
@@ -133,7 +147,8 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         String::new()
     } else {
         format!(
-            r#"<header class="top"><div class="wrap"><a class="logo" href="/" aria-label="{SITE} home">{LOGO}<span>plain<b>screener</b></span></a><form action="/search" role="search"><input type="search" name="q" placeholder="Search token, pair or address" aria-label="Search tokens, pairs and addresses" autocomplete="off" enterkeyhint="search"></form></div></header>"#
+            r#"<header class="top"><div class="wrap"><a class="logo" href="/" aria-label="{SITE} home">{LOGO}<span>plain<b>screener</b></span></a>{search}<a class="gh" href="{REPO}">GitHub ↗</a></div></header>"#,
+            search = SEARCH_FORM,
         )
     };
     // While the indexer replays history, say so instead of passing old data off as live.
@@ -142,7 +157,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
     let header = if !h.embed && now > head as u64 + 600 {
         let at = if head == 0 { "the start".to_string() } else { s(|o| fmt::date_year(o, head as i64)) };
         format!(
-            r#"{header}<p class="note wrap">Still replaying Base history, now at {at}. Prices and lists here are from that day until the indexer reaches the present.</p>"#
+            r#"{header}<div class="wrap"><p class="note">Still replaying Base history, now at {at}. Prices and lists here are from that day until the indexer reaches the present.</p></div>"#
         )
     } else {
         header
@@ -155,7 +170,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         )
     };
     format!(
-        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#0d0f12" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">{meta}<style>{css}</style></head><body>{header}{body}{footer}<script type="module" src="{js}"></script></body></html>"##,
+        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">{meta}<style>{css}</style></head><body>{header}{body}{footer}<script type="module" src="{js}"></script></body></html>"##,
         cls = if h.embed { r#" class="embed""# } else { "" },
         css = app.css,
         js = app.js_url,
@@ -273,9 +288,21 @@ pub fn trade_row(st: &State, pool: &Pool, t: &Trade) -> String {
     )
 }
 
+const SEARCH_FORM: &str = r#"<form action="/search" role="search"><input type="search" name="q" placeholder="Search token, pair or address" aria-label="Search tokens, pairs and addresses" autocomplete="off" enterkeyhint="search"></form>"#;
+
+/// A round badge with the token's first letter, its color derived from the address
+/// (we don't host logos, and anyone can name a token anything).
+fn avatar(st: &State, token: u32, large: bool) -> String {
+    let t = &st.tokens[token as usize];
+    let hue = (u16::from_be_bytes([t.addr[18], t.addr[19]]) % 360) as u32;
+    let letter: String = t.symbol.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_else(|| "?".into());
+    format!(r#"<span class="av{}" style="--h:{hue}" aria-hidden="true">{}</span>"#, if large { " lg" } else { "" }, Esc(&letter))
+}
+
 fn pair_name(st: &State, pool: &Pool, dex: bool) -> String {
     let mut out = format!(
-        r#"<span class="pairname"><b>{}</b><span>/{}</span>"#,
+        r#"<span class="pairname">{}<span><b>{}</b><span class="q">/{}</span></span>"#,
+        avatar(st, pool.base(), false),
         Esc(sym(st, pool.base())),
         Esc(sym(st, pool.quote()))
     );
@@ -373,7 +400,7 @@ pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
         })
         .collect();
     let body = format!(
-        r#"<main class="wrap"><h1>Every token on Base, live</h1><p class="sub">Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain.</p><nav class="tabs" aria-label="Lists">{tabs}</nav>{}</main>"#,
+        r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain. Free, fast and open source.</p>{SEARCH_FORM}<div class="links">Embed any chart · <a href="{REPO}">Read the code ↗</a></div></div></section><main class="wrap"><nav class="tabs" aria-label="Lists">{tabs}</nav>{}</main>"#,
         table(st, pools)
     );
     let path = match tab {
@@ -475,7 +502,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         wasm = app.wasm_url,
         json = candles_json(&candles),
     );
-    let price_head = format!(r#"<span class="big">{}</span> {}"#, f("p"), f("c24h"));
+    let price_head = format!(r#"<span class="big">{}</span> <span class="chg">{}</span>"#, f("p"), f("c24h"));
     let url = format!("{}/base/{key}", app.cfg.public_url);
     let m = metrics(st, p);
     let price_text = price_label(st, p, &m);
@@ -540,8 +567,10 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         urlencode(&format!("{url}?s={}", st.head_ts / 3600))
     );
     let body = format!(
-        r#"<main class="wrap"><div class="pair"><section><div class="head"><h1>{name}</h1><span class="badge">{dex}</span><span class="name">{bname}</span><div class="px">{price_head}</div><div class="m">{pn}</div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table></div></section><aside><dl class="kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div><div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" data-copy="{embed_e}">Copy embed</button><a href="{share}" target="_blank" rel="noopener">Share on X</a></div></div></aside></div></main>"#,
-        name = pair_name(st, pool, false),
+        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span></div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table></div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div><div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
+        av = avatar(st, pool.base(), true),
+        bs_e = Esc(bs),
+        c24 = f("c24h"),
         dex = pool.dex(),
         bname = Esc(&base.name),
         pn = f("pn"),

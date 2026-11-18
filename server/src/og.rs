@@ -34,7 +34,8 @@ pub fn png(svg: &str) -> Result<Vec<u8>> {
 fn frame(w: u32, h: u32, body: &str) -> String {
     let css = chart_css(dark);
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{FONT}"><style>{css}.fg{{fill:{fg}}}.mu{{fill:{mu}}}.up{{fill:{up}}}.dn{{fill:{dn}}}</style><rect width="{w}" height="{h}" fill="{bg}"/>{body}</svg>"#,
+        // Same backdrop as the site's hero: a faint 48 px grid fading out from the top.
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" font-family="{FONT}"><style>{css}.fg{{fill:{fg}}}.mu{{fill:{mu}}}.up{{fill:{up}}}.dn{{fill:{dn}}}</style><defs><pattern id="gp" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M48 0H0V48" fill="none" stroke="#ffffff" stroke-opacity="0.045"/></pattern><radialGradient id="gf" cx="0.5" cy="0.25" r="0.75"><stop offset="0.3" stop-color="#fff"/><stop offset="1" stop-color="#000"/></radialGradient><mask id="gm"><rect width="{w}" height="{h}" fill="url(#gf)"/></mask></defs><rect width="{w}" height="{h}" fill="{bg}"/><rect width="{w}" height="{h}" fill="url(#gp)" mask="url(#gm)"/>{body}</svg>"##,
         fg = dark("fg"),
         mu = dark("muted"),
         up = dark("up"),
@@ -58,7 +59,7 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let mut b = String::new();
     let _ = write!(
         b,
-        r#"{logo}<text x="128" y="96" font-size="54" font-weight="700" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="72" font-weight="700" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
+        r#"{logo}<text x="128" y="96" font-size="54" font-weight="600" letter-spacing="-1.6" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="72" font-weight="600" letter-spacing="-2.4" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
         logo = logo(56, 44, 56),
         base = sym(pool.base()),
         quote = sym(pool.quote()),
@@ -82,7 +83,7 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
         let x = w - 56 - (2 - i as u32) * 230;
         let _ = write!(
             b,
-            r#"<text x="{x}" y="166" font-size="24" text-anchor="end" class="mu">{label}</text><text x="{x}" y="206" font-size="34" font-weight="700" text-anchor="end" class="fg">{val}</text>"#
+            r#"<text x="{x}" y="166" font-size="24" text-anchor="end" class="mu">{label}</text><text x="{x}" y="206" font-size="34" font-weight="600" letter-spacing="-0.8" text-anchor="end" class="fg">{val}</text>"#
         );
     }
     // The chart is drawn at 1/1.6 size and scaled up, so its labels read at OG size.
@@ -107,7 +108,7 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
 /// The site card used by the home page.
 pub fn site_card() -> String {
     let body = format!(
-        r#"{logo}<text x="600" y="380" font-size="76" text-anchor="middle" class="fg">plain<tspan font-weight="800">screener</tspan></text><text x="600" y="450" font-size="34" text-anchor="middle" class="mu">Live prices and charts for every token on Base</text>"#,
+        r#"{logo}<text x="600" y="380" font-size="76" letter-spacing="-2.6" text-anchor="middle" class="fg">plain<tspan font-weight="800">screener</tspan></text><text x="600" y="450" font-size="34" text-anchor="middle" class="mu">Live prices and charts for every token on Base</text>"#,
         logo = logo(540, 160, 120),
     );
     frame(1200, 630, &body)
