@@ -141,6 +141,8 @@ pub struct Head {
     pub image: Option<String>,
     /// Farcaster mini app card: (3:2 image, launch URL).
     pub miniapp: Option<(String, String)>,
+    /// X player card: a page X frames inside the post (the pair's embed).
+    pub player: Option<String>,
     pub embed: bool,
 }
 
@@ -155,8 +157,19 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
     if let Some(img) = &h.image {
         let _ = write!(
             meta,
-            r#"<meta property="og:image" content="{img}"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="{title}"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:image" content="{img}">"#
+            r#"<meta property="og:image" content="{img}"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="{title}"><meta name="twitter:image" content="{img}">"#
         );
+    }
+    match &h.player {
+        // Playable in the post: X frames the embed; the image is the fallback.
+        Some(player) => {
+            let _ = write!(
+                meta,
+                r#"<meta name="twitter:card" content="player"><meta name="twitter:player" content="{player}"><meta name="twitter:player:width" content="640"><meta name="twitter:player:height" content="400">"#
+            );
+        }
+        None if h.image.is_some() => meta.push_str(r#"<meta name="twitter:card" content="summary_large_image">"#),
+        None => {}
     }
     if let Some((img, launch)) = &h.miniapp {
         for (name, action) in [("fc:miniapp", "launch_miniapp"), ("fc:frame", "launch_frame")] {
@@ -204,6 +217,14 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         css = app.css,
         js = app.js_url,
     )
+}
+
+/// A pair page's title, which live updates keep current.
+pub fn pair_title(st: &State, p: u32) -> String {
+    let pool = &st.pools[p as usize];
+    let m = metrics(st, p);
+    let (bs, qs) = (sym(st, pool.base()), sym(st, pool.quote()));
+    format!("{bs} {} {} | {bs}/{qs} on Base | {SITE}", price_label(st, p, &m), s(|o| fmt::pct(o, change(&m, 3))))
 }
 
 /// Everything shown about a pool right now.
@@ -289,6 +310,17 @@ pub fn fields(st: &State, p: u32) -> Vec<(String, String, &'static str)> {
         out.push((format!("b{name}"), s(|o| fmt::uint(o, m.w[i].buys as u64)), ""));
         out.push((format!("s{name}"), s(|o| fmt::uint(o, m.w[i].sells as u64)), ""));
     }
+    let amount = |x: f64, t: u32| {
+        s(|o| {
+            fmt::compact(o, x);
+            o.push(' ');
+            o.push_str(sym(st, t));
+        })
+    };
+    let (bb, qb) = if pool.quote0 { (pool.bal1, pool.bal0) } else { (pool.bal0, pool.bal1) };
+    out.push(("sup".into(), amount(st.tokens[pool.base() as usize].supply, pool.base()), ""));
+    out.push(("pb".into(), amount(bb, pool.base()), ""));
+    out.push(("pq".into(), amount(qb, pool.quote()), ""));
     out
 }
 
@@ -424,10 +456,19 @@ pub fn list(st: &State, tab: Tab) -> Vec<u32> {
     rows.into_iter().map(|(p, _)| p).collect()
 }
 
-fn table(st: &State, pools: &[u32]) -> String {
+/// A list of pairs; `src` serves fresh rows (see `list_rows`) that app.js swaps in.
+fn table(st: &State, pools: &[u32], src: &str) -> String {
     if pools.is_empty() {
         return r#"<p class="empty">Nothing here yet. The indexer may still be catching up.</p>"#.into();
     }
+    format!(
+        r#"<div class="card scroll" data-list="{src}"><table class="list"><thead><tr><th>#</th><th class="l">Pair</th><th>Price</th><th class="hide-s">5m</th><th class="hide-s">1h</th><th class="hide-s">6h</th><th>24h</th><th>Volume</th><th>Liquidity</th><th class="hide-s">FDV</th><th class="hide-s">Txns</th><th class="hide-s">Age</th></tr></thead><tbody>{}</tbody></table></div>"#,
+        list_rows(st, pools)
+    )
+}
+
+/// The rows of a pair list.
+pub fn list_rows(st: &State, pools: &[u32]) -> String {
     let mut rows = String::new();
     for (i, &p) in pools.iter().enumerate() {
         let pool = &st.pools[p as usize];
@@ -456,9 +497,7 @@ fn table(st: &State, pools: &[u32]) -> String {
             age = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
         );
     }
-    format!(
-        r#"<div class="card scroll"><table class="list"><thead><tr><th>#</th><th class="l">Pair</th><th>Price</th><th class="hide-s">5m</th><th class="hide-s">1h</th><th class="hide-s">6h</th><th>24h</th><th>Volume</th><th>Liquidity</th><th class="hide-s">FDV</th><th class="hide-s">Txns</th><th class="hide-s">Age</th></tr></thead><tbody>{rows}</tbody></table></div>"#
-    )
+    rows
 }
 
 pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
@@ -472,7 +511,7 @@ pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
         .collect();
     let body = format!(
         r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain. Free, fast and open source.</p>{SEARCH_FORM}<div class="links">Embed any chart · <a href="{REPO}">Read the code ↗</a></div></div></section><main class="wrap"><nav class="tabs" aria-label="Lists">{tabs}</nav>{}</main>"#,
-        table(st, pools)
+        table(st, pools, &format!("/api/list?tab={}", TABS.iter().find(|x| x.0 == tab).map(|x| x.1).unwrap_or("")))
     );
     let path = match tab {
         Tab::Trending => "/".to_string(),
@@ -484,6 +523,7 @@ pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
         path,
         image: Some(format!("{}/og.png", app.cfg.public_url)),
         miniapp: None,
+        player: None,
         embed: false,
     };
     layout(app, &head, &body)
@@ -494,7 +534,7 @@ pub fn search(app: &App, st: &State, q: &str, pools: &[u32]) -> String {
         r#"<main class="wrap"><h1>Results for “{}”</h1><p class="sub">{} pairs, most liquid first.</p>{}</main>"#,
         Esc(q),
         pools.len(),
-        table(st, pools)
+        table(st, pools, &format!("/api/list?q={}", urlencode(q)))
     );
     let head = Head {
         title: format!("{} on Base | {SITE}", q),
@@ -502,6 +542,7 @@ pub fn search(app: &App, st: &State, q: &str, pools: &[u32]) -> String {
         path: format!("/search?q={}", urlencode(q)),
         image: None,
         miniapp: None,
+        player: None,
         embed: false,
     };
     layout(app, &head, &body)
@@ -514,6 +555,7 @@ pub fn not_found(app: &App) -> String {
         path: "/404".into(),
         image: None,
         miniapp: None,
+        player: None,
         embed: false,
     };
     layout(
@@ -547,7 +589,7 @@ pub fn chart_data(
 
 /// The base token: what it says about itself (see `icons`), its supply, and what this
 /// pool holds.
-fn token_card(st: &State, store: &Store, pool: &Pool) -> String {
+fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'static str)]) -> String {
     let base = &st.tokens[pool.base() as usize];
     let profile: serde_json::Value =
         store.profiles.get(base.addr).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default();
@@ -569,21 +611,14 @@ fn token_card(st: &State, store: &Store, pool: &Pool) -> String {
         })
         .collect();
     let links = if links.is_empty() { links } else { format!(r#"<div class="links">{links}</div>"#) };
-    let (bb, qb) = if pool.quote0 { (pool.bal1, pool.bal0) } else { (pool.bal0, pool.bal1) };
-    let amount = |x: f64, t: u32| {
-        s(|o| {
-            fmt::compact(o, x);
-            let _ = write!(o, " {}", Esc(sym(st, t)));
-        })
-    };
     format!(
         r#"<div class="card tok"><h2>About {name}</h2>{desc}{links}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
         name = Esc(if base.name.is_empty() { sym(st, pool.base()) } else { &base.name }),
-        supply = amount(base.supply, pool.base()),
+        supply = field(fs, "sup"),
         bs = Esc(sym(st, pool.base())),
         qs = Esc(sym(st, pool.quote())),
-        bb = amount(bb, pool.base()),
-        qb = amount(qb, pool.quote()),
+        bb = field(fs, "pb"),
+        qb = field(fs, "pq"),
     )
 }
 
@@ -689,7 +724,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let url = format!("{}/base/{key}", app.cfg.public_url);
     let m = metrics(st, p);
     let price_text = price_label(st, p, &m);
-    let title = format!("{bs} {price_text} {} | {bs}/{qs} on Base | {SITE}", s(|o| fmt::pct(o, change(&m, 3))));
+    let title = pair_title(st, p);
     let desc = format!(
         "{bs} ({}) price {}, 24h volume {}, liquidity {} on {}. Live chart and trades for the {bs}/{qs} pool on Base.",
         if base.name.is_empty() { bs } else { &base.name },
@@ -706,6 +741,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         path: format!("/base/{key}"),
         image: Some(format!("{}/og/base/{key}.png?v={v}", app.cfg.public_url)),
         miniapp: Some((format!("{}/og/base/{key}.png?s=fc&v={v}", app.cfg.public_url), url.clone())),
+        player: Some(format!("{}/embed/base/{key}", app.cfg.public_url)),
         embed,
     };
 
@@ -757,7 +793,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span></div></div>{chart}<div class="card scroll"><h2>Trades</h2><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table>{more}</div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l">Window</th><th>Change</th><th>Volume</th><th>Buys</th><th>Sells</th></tr></thead><tbody>{windows}</tbody></table></div>{token}{others}<div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
         av = avatar(st, pool.base(), true),
         more = more_button(&trades),
-        token = token_card(st, store, pool),
+        token = token_card(st, store, pool, &fs),
         others = other_pairs(st, p),
         bs_e = Esc(bs),
         c24 = f("c24h"),
@@ -802,7 +838,7 @@ pub fn live(st: &State, store: &Store, p: u32, after: (u32, u32)) -> (String, (u
     };
     let newest = trades.first().map(|(k, _)| *k).unwrap_or(after);
     let rows: String = trades.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
-    (serde_json::json!({"f": fs, "c": candles, "n": native, "t": rows}).to_string(), newest)
+    (serde_json::json!({"f": fs, "c": candles, "n": native, "t": rows, "T": pair_title(st, p)}).to_string(), newest)
 }
 
 pub fn sitemap(app: &App, st: &State) -> String {

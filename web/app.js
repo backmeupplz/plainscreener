@@ -36,6 +36,18 @@ $('#more')?.addEventListener('click', async function more(e) {
   else b.remove()
 })
 
+// Pair lists (home tabs, search) take fresh rows every few seconds while visible. The rows
+// are cached at the edge for 2 s, so every viewer shares one render.
+const list = $('[data-list]')
+if (list) {
+  let last = ''
+  setInterval(async () => {
+    if (document.hidden) return
+    const rows = await fetch(list.dataset.list).then((r) => (r.ok ? r.text() : ''), () => '')
+    if (rows && rows !== last) list.querySelector('tbody').innerHTML = last = rows
+  }, 3000)
+}
+
 const el = $('#chart')
 if (el) chart(el)
 
@@ -186,6 +198,7 @@ async function chart(el) {
   const live = new EventSource(`/api/live/${pool}?after=${rows ? rows.dataset.last : '0-0'}`)
   live.onmessage = (m) => {
     const u = JSON.parse(m.data)
+    if (u.T) document.title = u.T
     for (const [id, [text, cls]] of Object.entries(u.f))
       document.querySelectorAll(`[data-f="${id}"]`).forEach((n) => {
         n.textContent = text

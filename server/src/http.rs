@@ -40,6 +40,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/candles/{id}", get(candles))
         .route("/api/live/{id}", get(live))
         .route("/api/trades/{id}", get(trades))
+        .route("/api/list", get(list))
         .route("/healthz", get(health))
         .fallback(|Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) })
         .layer(axum::middleware::from_fn(no_www))
@@ -117,10 +118,31 @@ struct HomeQ {
     tab: Option<String>,
 }
 
+fn tab_of(slug: Option<&str>) -> Tab {
+    pages::TABS.iter().find(|t| Some(t.1) == slug).map(|t| t.0).unwrap_or(Tab::Trending)
+}
+
 async fn home(Ax(app): A, Query(q): Query<HomeQ>) -> Response {
-    let tab = pages::TABS.iter().find(|t| Some(t.1) == q.tab.as_deref()).map(|t| t.0).unwrap_or(Tab::Trending);
+    let tab = tab_of(q.tab.as_deref());
     let pools = app.list(tab);
     html(pages::home(&app, &read(&app), tab, &pools), 15)
+}
+
+#[derive(Deserialize)]
+struct ListQ {
+    tab: Option<String>,
+    q: Option<String>,
+}
+
+/// Fresh rows for a home tab or search results; pages poll this while open.
+async fn list(Ax(app): A, Query(q): Query<ListQ>) -> Response {
+    let pools = match q.q.as_deref().map(str::trim) {
+        Some(needle) if !needle.is_empty() => search_pools(&app, &read(&app), needle),
+        _ => app.list(tab_of(q.tab.as_deref())),
+    };
+    let mut r = cached("text/html; charset=utf-8", 0, pages::list_rows(&read(&app), &pools));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=0, s-maxage=2"));
+    r
 }
 
 #[derive(Deserialize)]
@@ -138,6 +160,13 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
     if let Some(p) = pool_of(&st, q) {
         return Redirect::to(&format!("/base/{}", st.pools[p as usize].key())).into_response();
     }
+    let pools = search_pools(&app, &st, q);
+    html(pages::search(&app, &st, q, &pools), 30)
+}
+
+/// Pools for tokens whose symbol starts with or name contains `q`: exact symbol matches
+/// first, then pools from known DEXes, then by liquidity.
+fn search_pools(app: &App, st: &State, q: &str) -> Vec<u32> {
     let needle = q.to_lowercase();
     let index = app.search.read().unwrap_or_else(|e| e.into_inner());
     // Exact symbol matches first, then pools from known DEXes, then by liquidity.
@@ -153,7 +182,7 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
     let mut pools: Vec<u32> = hits.into_iter().map(|h| h.2).collect();
     pools.dedup();
     pools.truncate(50);
-    html(pages::search(&app, &st, q, &pools), 30)
+    pools
 }
 
 #[derive(Deserialize)]

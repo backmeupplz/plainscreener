@@ -145,6 +145,11 @@ footer{border-top:1px solid var(--line);color:var(--muted);padding:24px 0 36px;f
 .embed body{display:flex;flex-direction:column;height:100vh}
 .embed .chartcard{flex:1;display:flex;flex-direction:column;min-height:0;padding:8px;border:0;border-radius:0;box-shadow:none}
 .embed #chart{flex:1;height:auto;min-height:0}
+/* embeds (and X's player, ~350x219 on phones): one scrolling toolbar row, slimmer when short */
+.embed .bar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
+.embed .tools{flex-wrap:nowrap}
+.embed .res,.embed .tools>*{flex:none}
 @media (max-width:980px){.pair{grid-template-columns:minmax(0,1fr)}#chart{height:380px}.px{margin-left:0;text-align:left}}
 @media (max-width:640px){.tabs,.tools{flex-wrap:nowrap;max-width:100%;overflow-x:auto;scrollbar-width:none}.tools{margin-left:0}.tabs a{padding:0 11px;white-space:nowrap}.top .wrap{gap:12px}.logo span,.gh{display:none}.big{font-size:28px}.hide-s{display:none}#chart{height:320px}.hero{padding:44px 0 32px}.hero p{font-size:16px}}
 @media (max-width:440px){.embed .eh .chg{display:none}}
+@media (max-height:480px){.embed .eh{height:44px}.embed .eh .big{font-size:17px}.embed .chartcard{padding:6px}.embed .bar{gap:6px;margin-bottom:2px}.embed .res,.embed .seg{padding:2px}.embed .res a,.embed .seg button{min-height:24px;padding:0 8px;font-size:12px}.embed .tools>button{min-height:30px}.embed .tools .ic{width:30px}}
