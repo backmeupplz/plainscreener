@@ -307,8 +307,15 @@ async fn health(Ax(app): A) -> Response {
     let st = read(&app);
     let lag = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
         - st.head_ts as i64;
-    let body = format!("head_ts {} lag {lag}s pools {} tokens {}\n", st.head_ts, st.pools.len(), st.tokens.len());
-    let code = if lag < 120 { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let live = lag < 120;
+    let body = format!(
+        "status {} head_ts {} lag {lag}s pools {} tokens {}\n",
+        if live { "live" } else { "catching-up" },
+        st.head_ts,
+        st.pools.len(),
+        st.tokens.len()
+    );
+    let code = if live { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let mut r = (code, body).into_response();
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
