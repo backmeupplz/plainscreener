@@ -12,7 +12,7 @@ pub const NONE: u32 = u32::MAX;
 const MIN_REF_LIQ: f64 = 1_000.0;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
-const STABLES: [Addr; 4] = [
+pub const STABLES: [Addr; 4] = [
     hex20("833589fcd6edb6e08f4c7c32d4f71b54bda02913"), // USDC
     hex20("d9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca"), // USDbC
     hex20("fde4c96c8593536e31f229ea8f37b2ada2699bb2"), // USDT

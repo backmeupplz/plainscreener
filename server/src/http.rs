@@ -1,7 +1,7 @@
 //! Routes. Pages are rendered per request (microseconds) and cached by Cloudflare for a
 //! few seconds; live data goes over SSE.
 
-use crate::abi::{pad, unhex};
+use crate::abi::{hex, pad, unhex};
 use crate::lists::{self, Filter, Tab};
 use crate::model::{RES, res_index};
 use crate::pages;
@@ -201,14 +201,24 @@ fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Res
     };
     let p = match found {
         Found::Pool(p) => p,
-        Found::Token(t) => match pages::best_pool(&st, t) {
-            Some(p) => {
-                let prefix = if embed { "/embed/base" } else { "/base" };
-                return Redirect::to(&format!("{prefix}/{}", st.pools[p as usize].key())).into_response();
+        // A token's chart is a pool where it's priced; a token only ever quoted (a stablecoin,
+        // say) gets its token page instead of some other token's price. Embeds need a chart.
+        Found::Token(t) => match (pages::own_pool(&st, t), embed) {
+            (Some(p), _) => {
+                return Redirect::to(&format!(
+                    "{}/{}",
+                    if embed { "/embed/base" } else { "/base" },
+                    st.pools[p as usize].key()
+                ))
+                .into_response();
             }
-            None => {
-                return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response();
+            (None, false) => {
+                return Redirect::to(&format!("/base/token/{}", hex(&st.tokens[t as usize].addr))).into_response();
             }
+            (None, true) => match pages::best_pool(&st, t) {
+                Some(p) => return Redirect::to(&format!("/embed/base/{}", st.pools[p as usize].key())).into_response(),
+                None => return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response(),
+            },
         },
     };
     let ri = q.res.as_deref().and_then(res_index).unwrap_or_else(|| pages::default_res(&st, p, 2));

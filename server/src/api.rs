@@ -7,7 +7,7 @@ use crate::http::{cached, pool_of, read, search_pools, trade_cursor};
 use crate::lists::{self, Filter, TABS};
 use crate::model::{RES, TradeKind};
 use crate::pages::{WINDOWS, change, metrics};
-use crate::state::{NONE, State};
+use crate::state::State;
 use crate::store::Store;
 use crate::{App, pages};
 use axum::extract::{Path, Query, Request, State as Ax};
@@ -147,7 +147,27 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
         None => search_pools(&app, &st, q),
     };
     let pairs: Vec<Value> = pools.iter().take(20).map(|&p| pair_json(&app, &st, p)).collect();
-    ok(json!({ "pairs": pairs }), 30)
+    // Tokens whose symbol is exactly the query, deepest first: their own page and price.
+    let needle = q.to_lowercase();
+    let mut tokens: Vec<(f64, u32)> = app
+        .search
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(sym, _, _)| *sym == needle)
+        .filter_map(|(_, _, t)| Some((st.liq(pages::best_pool(&st, *t)?), *t)))
+        .collect();
+    tokens.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    let tokens: Vec<Value> = tokens
+        .iter()
+        .take(3)
+        .map(|&(_, t)| {
+            let mut v = token_json(&st, t);
+            v["url"] = format!("/base/token/{}", hex(&st.tokens[t as usize].addr)).into();
+            v
+        })
+        .collect();
+    ok(json!({ "tokens": tokens, "pairs": pairs }), 30)
 }
 
 async fn pair(Ax(app): A, Path(id): Path<String>) -> Response {
@@ -259,7 +279,7 @@ async fn token(Ax(app): A, Path(addr): Path<String>) -> Response {
     let mut token = token_json(&st, t);
     token["supply"] = num(tok.supply);
     token["fdv_usd"] = num(tok.supply * tok.usd);
-    token["best_pair"] = (tok.best_pool != NONE).then(|| st.pools[tok.best_pool as usize].key()).into();
+    token["best_pair"] = pages::best_pool(&st, t).map(|p| st.pools[p as usize].key()).into();
     let profile = get(&app.sh.store.profiles);
     token["description"] = profile["d"].clone();
     token["links"] = profile["l"].clone();

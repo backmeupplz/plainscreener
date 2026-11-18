@@ -183,8 +183,9 @@ pub fn rows(st: &State, pools: &[u32]) -> String {
         let key = pool.key();
         let _ = write!(
             rows,
-            r#"<tr><td class="n"><button type="button" class="star" data-star="{key}" aria-pressed="false" aria-label="Watch this pair">★</button>{n}</td><td class="l"><a href="/base/{key}">{name}</a></td><td>{price}</td>"#,
+            r#"<tr><td class="n"><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button>{n}</td><td class="l"><a href="/base/{key}">{name}</a></td><td>{price}</td>"#,
             n = i + 1,
+            star = crate::pages::icon("star"),
             name = pair_name(st, pool, true),
             price = s(|o| fmt::usd(o, m.price)),
         );
@@ -245,23 +246,38 @@ pub fn table(st: &State, pools: &[u32], f: Option<&Filter>, src: &str, empty: &s
     )
 }
 
-/// Tabs and the filter bar above the home list. The form keeps the tab and sort.
+/// Tabs, the ranking window and a Filters menu above the home list. The menu's form keeps
+/// the tab, window and sort.
 pub fn controls(f: &Filter) -> String {
     let tab = f.tab();
     let tabs: String = TABS
         .iter()
         .map(|(t, slug, label)| {
             let cur = if *t == tab { r#" aria-current="page""# } else { "" };
-            let star = if *t == Tab::Watch { "★ " } else { "" };
+            let star = if *t == Tab::Watch { crate::pages::icon("star") } else { String::new() };
             format!(
                 r#"<a href="/?{}"{cur}>{star}{label}</a>"#,
                 Esc(&Filter { tab: Some(slug.to_string()), ..Default::default() }.query(&[]))
             )
         })
         .collect();
+    let tabs = format!(r#"<nav class="tabs" aria-label="Lists">{tabs}</nav>"#);
     if tab == Tab::Watch {
-        return format!(r#"<nav class="tabs" aria-label="Lists">{tabs}</nav>"#);
+        return format!(r#"<div class="listbar">{tabs}</div>"#);
     }
+    let window = if matches!(tab, Tab::Trending | Tab::Gainers | Tab::Losers) {
+        let links: String = WINDOWS
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| {
+                let cur = if i == f.window() { r#" aria-current="true""# } else { "" };
+                format!(r#"<a href="/?{}" rel="nofollow"{cur}>{n}</a>"#, Esc(&f.query(&[("w", n)])))
+            })
+            .collect();
+        format!(r#"<nav class="res" aria-label="Window">{links}</nav>"#)
+    } else {
+        String::new()
+    };
     let select = |name: &str, label: &str, opts: &[(u64, &str)], cur: u64| {
         let o: String = opts
             .iter()
@@ -269,26 +285,22 @@ pub fn controls(f: &Filter) -> String {
             .collect();
         format!(r#"<label>{label}<select name="{name}">{o}</select></label>"#)
     };
-    let window = if matches!(tab, Tab::Trending | Tab::Gainers | Tab::Losers) {
-        let o: String = WINDOWS
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| format!(r#"<option{}>{n}</option>"#, if i == f.window() { " selected" } else { "" }))
-            .collect();
-        format!(r#"<label>Window<select name="w">{o}</select></label>"#)
-    } else {
-        String::new()
-    };
-    let keep: String = [("tab", &f.tab), ("sort", &f.sort), ("dir", &f.dir)]
+    let keep: String = [("tab", &f.tab), ("w", &f.w), ("sort", &f.sort), ("dir", &f.dir)]
         .iter()
         .filter_map(|(k, v)| Some(format!(r#"<input type="hidden" name="{k}" value="{}">"#, Esc(v.as_deref()?))))
         .collect();
+    let active = [f.liq, f.vol, f.txns, f.age].iter().filter(|v| **v > 0).count();
+    let count = if active > 0 { format!(r#"<b class="cnt">{active}</b>"#) } else { String::new() };
+    let reset =
+        Filter { tab: f.tab.clone(), w: f.w.clone(), sort: f.sort.clone(), dir: f.dir.clone(), ..Default::default() };
     format!(
-        r#"<nav class="tabs" aria-label="Lists">{tabs}</nav><form class="filters" action="/" aria-label="Filters">{keep}{window}{}{}{}{}<button type="submit">Apply</button></form>"#,
+        r#"<div class="listbar">{tabs}<div class="lb-r">{window}<button type="button" class="btn" popovertarget="filters">{funnel}Filters{count}</button></div><form id="filters" class="menu filters" action="/" popover aria-label="Filters"><p>Filters</p>{keep}{}{}{}{}<div class="row"><a class="btn" href="/?{}">Reset</a><button type="submit" class="btn btn-primary">Apply</button></div></form></div>"#,
         select("liq", "Liquidity", &LIQ, f.liq),
         select("vol", "Volume 24h", &VOL, f.vol),
         select("txns", "Txns 24h", &TXNS, f.txns),
         select("age", "Age under", &AGE, f.age),
+        Esc(&reset.query(&[])),
+        funnel = crate::pages::icon("funnel"),
     )
 }
 

@@ -102,7 +102,10 @@ pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     )
 });
 
-const THEME_BUTTON: &str = r#"<button type="button" class="theme" aria-label="Switch between light and dark theme"><svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"/></svg><svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z"/></svg></button>"#;
+const THEME_BUTTON: &str = r##"<button type="button" class="ic theme" aria-label="Switch between light and dark theme" title="Theme"><svg class="i sun" aria-hidden="true"><use href="#i-sun"/></svg><svg class="i moon" aria-hidden="true"><use href="#i-moon"/></svg></button>"##;
+
+/// The icon sprite (Lucide and Phosphor paths), inlined once per page for `icon`.
+const ICONS: &str = include_str!("../../web/icons.svg");
 
 pub const LOGO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" aria-hidden="true"><rect x=".5" y=".5" width="31" height="31" rx="8" fill="#0d0d0d" stroke="#ffffff" stroke-opacity=".14"/><path d="M9 7v18M16 10v16M23 5v16" stroke="#a3a3a3" stroke-width="1.6"/><rect x="7" y="11" width="4" height="9" rx="1" fill="#3ecf8e"/><rect x="14" y="14" width="4" height="8" rx="1" fill="#ff5d6c"/><rect x="21" y="8" width="4" height="9" rx="1" fill="#3ecf8e"/></svg>"##;
 
@@ -123,6 +126,11 @@ impl Display for Esc<'_> {
         }
         Ok(())
     }
+}
+
+/// An icon from the sprite (web/icons.svg), sized by CSS.
+pub(crate) fn icon(name: &str) -> String {
+    format!(r##"<svg class="i" aria-hidden="true"><use href="#i-{name}"/></svg>"##)
 }
 
 pub(crate) fn s(f: impl FnOnce(&mut String)) -> String {
@@ -195,8 +203,9 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         String::new()
     } else {
         format!(
-            r#"<header class="top"><div class="wrap"><a class="logo" href="/" aria-label="{SITE} home">{LOGO}<span>plain<b>screener</b></span></a>{search}<a class="gh" href="{REPO}">GitHub ↗</a>{THEME_BUTTON}</div></header>"#,
+            r#"<header class="top"><div class="wrap"><a class="logo" href="/" aria-label="{SITE} home">{LOGO}<span>plain<b>screener</b></span></a>{search}<nav class="hn" aria-label="Site"><a class="hl" href="/api">API</a><a class="ic" href="{REPO}" aria-label="Source code on GitHub" title="GitHub">{gh}</a>{THEME_BUTTON}</nav></div></header>"#,
             search = SEARCH_FORM,
+            gh = icon("github"),
         )
     };
     // While the indexer replays history, say so instead of passing old data off as live.
@@ -218,7 +227,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         )
     };
     format!(
-        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">{meta}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script><style>{css}</style></head><body>{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
+        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">{meta}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script><style>{css}</style></head><body>{ICONS}{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
         cls = if h.embed { r#" class="embed""# } else { "" },
         css = app.css,
         js = app.js_url,
@@ -332,10 +341,20 @@ pub fn makers(store: &Store, p: u32, now: u32) -> [(u32, u32, u32); 4] {
 }
 
 /// Live fields plus makers per window (`k5m` …), which need the store.
+/// Live fields plus wallets per window (`k5m` …, buyers `kb5m`, sellers `ks5m`), which
+/// need the store, and the buy shares of trades and wallets for the bars (`rb5m`, `rk5m`).
 pub fn fields_full(st: &State, store: &Store, p: u32) -> Vec<(String, String, &'static str)> {
     let mut fs = fields(st, p);
-    for ((name, _), (makers, _, _)) in WINDOWS.iter().zip(makers(store, p, st.head_ts)) {
+    let m = metrics(st, p);
+    let share = |a: u32, b: u32| {
+        if a + b == 0 { "50%".to_string() } else { format!("{:.1}%", a as f64 * 100.0 / (a + b) as f64) }
+    };
+    for (i, ((name, _), (makers, buyers, sellers))) in WINDOWS.iter().zip(makers(store, p, st.head_ts)).enumerate() {
         fs.push((format!("k{name}"), s(|o| fmt::uint(o, makers as u64)), ""));
+        fs.push((format!("kb{name}"), s(|o| fmt::uint(o, buyers as u64)), ""));
+        fs.push((format!("ks{name}"), s(|o| fmt::uint(o, sellers as u64)), ""));
+        fs.push((format!("rb{name}"), share(m.w[i].buys, m.w[i].sells), "bar"));
+        fs.push((format!("rk{name}"), share(buyers, sellers), "bar"));
     }
     fs
 }
@@ -452,7 +471,11 @@ pub fn fields(st: &State, p: u32) -> Vec<(String, String, &'static str)> {
 fn field(fs: &[(String, String, &'static str)], id: &str) -> String {
     fs.iter()
         .find(|(i, ..)| i == id)
-        .map(|(i, text, cls)| format!(r#"<span data-f="{i}" class="{cls}">{}</span>"#, Esc(text)))
+        .map(|(i, text, cls)| match *cls {
+            // A bar's width is its text (app.js does the same on live updates).
+            "bar" => format!(r#"<i data-f="{i}" class="bar" style="--r:{0}">{0}</i>"#, Esc(text)),
+            _ => format!(r#"<span data-f="{i}" class="{cls}">{}</span>"#, Esc(text)),
+        })
         .unwrap_or_default()
 }
 
@@ -517,7 +540,7 @@ pub fn trade_row(st: &State, pool: &Pool, (block, index): (u32, u32), t: &Trade)
     });
     let price = if t.kind == TradeKind::Swap { s(|o| fmt::usd(o, t.price_usd as f64)) } else { "–".into() };
     format!(
-        r#"<tr data-k="{block}-{index}" data-t="{ts}" data-u="{pu}" data-n="{pn}" data-s="{side}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{maker_s}</button></td><td class="hide-s"><a class="mono" href="{EXPLORER}/tx/{tx}" rel="nofollow">{tx_s}</a></td></tr>"#,
+        r#"<tr data-k="{block}-{index}" data-t="{ts}" data-u="{pu}" data-n="{pn}" data-s="{side}"><td class="l m">{time}</td><td class="l {cls}">{kind}</td><td class="{cls}">{price}</td><td>{amount}</td><td>{total}</td><td class="hide-s"><button type="button" class="mk mono" data-maker="{maker}" title="Only this wallet's trades">{maker_s}</button></td><td class="hide-s"><a class="ic sm" href="{EXPLORER}/tx/{tx}" rel="nofollow" target="_blank" aria-label="Transaction {tx_s} on Basescan" title="Transaction">{ext}</a></td></tr>"#,
         time = s(|o| fmt::date_clock(o, t.ts as i64)),
         ts = t.ts,
         pu = t.price_usd,
@@ -532,10 +555,11 @@ pub fn trade_row(st: &State, pool: &Pool, (block, index): (u32, u32), t: &Trade)
         maker_s = short(&t.maker),
         tx = hex(&t.tx),
         tx_s = &hex(&t.tx)[..10],
+        ext = icon("external-link"),
     )
 }
 
-const SEARCH_FORM: &str = r#"<form action="/search" role="search"><input type="search" name="q" placeholder="Search token, pair or address" aria-label="Search tokens, pairs and addresses" autocomplete="off" enterkeyhint="search"></form>"#;
+const SEARCH_FORM: &str = r##"<form action="/search" role="search" class="sf"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input type="search" name="q" placeholder="Search token, pair or address" aria-label="Search tokens, pairs and addresses" autocomplete="off" enterkeyhint="search"></form>"##;
 
 /// The token's icon (see `icons`), or a round badge with its first letter, colored by
 /// its address.
@@ -587,7 +611,7 @@ pub fn home(app: &App, st: &State, f: &Filter, pools: &[u32]) -> String {
         _ => format!("/api/list?{}", f.query(&[])),
     };
     let body = format!(
-        r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades from every Uniswap, Aerodrome and PancakeSwap pool on Base, indexed straight from the chain. Free, fast and open source.</p>{SEARCH_FORM}<div class="links">Embed any chart · <a href="/api">Free API</a> · <a href="{REPO}">Read the code ↗</a></div></div></section><main class="wrap">{}{}</main>"#,
+        r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades for every Uniswap, Aerodrome and PancakeSwap pool, straight from the chain. Free and open source.</p>{SEARCH_FORM}<div class="links"><a href="/api">Free API</a> · <a href="{REPO}">Source code</a></div></div></section><main class="wrap">{}{}</main>"#,
         lists::controls(f),
         lists::table(st, pools, Some(f), &src, empty),
     );
@@ -783,9 +807,18 @@ fn profile(store: &Store, token: crate::abi::Addr) -> (String, String) {
         .filter_map(|l| {
             let url = l[1].as_str()?;
             let kind = crate::icons::link_kind(url)?;
+            let i = match kind {
+                "X" => "xlogo",
+                "Telegram" => "telegram",
+                "Discord" => "discord",
+                "Farcaster" => "farcaster",
+                "GitHub" => "github",
+                _ => "globe",
+            };
             Some(format!(
-                r#"<a class="btn" href="{}" target="_blank" rel="nofollow ugc noopener noreferrer">{kind} ↗</a>"#,
-                Esc(url)
+                r#"<a class="btn ic" href="{}" target="_blank" rel="nofollow ugc noopener noreferrer" aria-label="{kind}" title="{kind}">{}</a>"#,
+                Esc(url),
+                icon(i)
             ))
         })
         .collect();
@@ -797,7 +830,7 @@ fn profile(store: &Store, token: crate::abi::Addr) -> (String, String) {
 /// checks and every pair it trades in.
 pub fn token(app: &App, st: &State, store: &Store, t: u32) -> String {
     let tok = &st.tokens[t as usize];
-    let best = tok.best_pool;
+    let best = best_pool(st, t).unwrap_or(NONE);
     let mut pools: Vec<u32> = st.base_pools.get(&t).cloned().unwrap_or_default();
     pools.sort_unstable_by(|a, b| st.liq(*b).total_cmp(&st.liq(*a)));
     let (liq, vol) = pools.iter().fold((0.0, 0.0), |(l, v), &p| {
@@ -812,17 +845,19 @@ pub fn token(app: &App, st: &State, store: &Store, t: u32) -> String {
     } else {
         let pool = &st.pools[best as usize];
         let buy = format!(
-            r#"<a class="btn btn-primary buy" href="{}" target="_blank" rel="noopener nofollow">Buy on Uniswap ↗</a>"#,
-            buy_url(st, pool)
+            r#"<a class="btn btn-primary buy" href="{}" target="_blank" rel="noopener nofollow" title="Swap on Uniswap">{}Buy</a>"#,
+            buy_url(st, pool),
+            icon("arrow-left-right")
         );
         (change(&metrics(st, best), 3), buy, safety_card(st, store, best))
     };
+    pools.truncate(50);
     let keys: Vec<String> = pools.iter().map(|&p| st.pools[p as usize].key()).collect();
     let table =
         lists::table(st, &pools, None, &format!("/api/list?pairs={}", keys.join(",")), "No pairs on known DEXes yet.");
     let stat = |label: &str, v: String| format!("<div><dt>{label}</dt><dd>{v}</dd></div>");
     let body = format!(
-        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><h1>{name_e}</h1><span class="name">{sym_e} · <a class="mono m" href="{EXPLORER}/token/{addr}" rel="nofollow">{short}</a></span></div></div><div class="px"><div><div class="big">{price}</div></div><span class="chg"><span class="{cls}">{ch}</span></span>{buy}</div></div><div class="pair"><section><dl class="card kv kv4">{stats}</dl><h2 class="sect">Pairs</h2>{table}</section><aside><div class="card tok"><h2>About {name_e}</h2>{desc}{links}</div>{safety}</aside></div></main>"#,
+        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><h1>{name_e}</h1><span class="name">{sym_e} · <a class="mono m" href="{EXPLORER}/token/{addr}" rel="nofollow">{short}</a></span></div></div><div class="px"><div class="pv"><div class="big">{price}</div></div><span class="chg"><span class="{cls}">{ch}</span></span>{buy}</div></div><div class="pair"><section><dl class="card kv kv4">{stats}</dl><h2 class="sect">Pairs</h2>{table}</section><aside><div class="card tok"><div class="ch2"><h2>About {name_e}</h2></div>{links}{desc}</div>{safety}</aside></div></main>"#,
         av = avatar(st, t, true),
         name_e = Esc(name),
         sym_e = Esc(symbol),
@@ -862,7 +897,7 @@ fn token_card(st: &State, store: &Store, pool: &Pool, fs: &[(String, String, &'s
     let base = &st.tokens[pool.base() as usize];
     let (desc, links) = profile(store, base.addr);
     format!(
-        r#"<div class="card tok"><h2>About {name} <a class="m" href="/base/token/{addr}">· token page</a></h2>{desc}{links}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
+        r#"<div class="card tok"><div class="ch2"><h2>About {name}</h2><a class="more-link" href="/base/token/{addr}">Token page</a></div>{links}{desc}<div class="info"><p><span>Total supply</span><span>{supply}</span></p><p><span>Pooled {bs}</span><span>{bb}</span></p><p><span>Pooled {qs}</span><span>{qb}</span></p></div></div>"#,
         name = Esc(if base.name.is_empty() { sym(st, pool.base()) } else { &base.name }),
         addr = hex(&base.addr),
         supply = field(fs, "sup"),
@@ -945,8 +980,14 @@ fn safety_card(st: &State, store: &Store, p: u32) -> String {
             )
         })
         .collect();
+    let warnings = rows.matches(r#"class="sv warn""#).count();
+    let summary = match warnings {
+        0 => r#"<span class="pill ok">No flags</span>"#.to_string(),
+        n => format!(r#"<span class="pill warn">{n} flag{}</span>"#, if n == 1 { "" } else { "s" }),
+    };
     format!(
-        r#"<div class="card info safety"><h2>Safety checks</h2>{rows}<p class="fine">Read from the contract and recent trades. A heuristic, not an audit.</p></div>"#
+        r#"<div class="card info safety"><div class="ch2"><h2>{shield}Safety</h2>{summary}</div>{rows}<p class="fine">Read from the contract and recent trades. A heuristic, not an audit.</p></div>"#,
+        shield = icon("shield-check"),
     )
 }
 
@@ -982,33 +1023,40 @@ fn other_pairs(st: &State, p: u32) -> String {
         })
         .collect();
     format!(
-        r#"<div class="card pairs"><h2>Other pairs <a class="m" href="/base/token/{}">· all</a></h2>{rows}</div>"#,
+        r#"<div class="card pairs"><div class="ch2"><h2>Other pairs</h2><a class="more-link" href="/base/token/{}">All</a></div>{rows}</div>"#,
         hex(&st.tokens[pool.base() as usize].addr)
     )
 }
 
-/// Chart options (applied by app.js): price or market cap, USD or quote token, line, moving
-/// averages, reset and fullscreen. Choices without data (no supply, no USD price) are left out.
+/// The chart toolbar's options (applied by app.js): price or market cap, USD or the quote
+/// token, candles or line, an indicators menu, and fullscreen. Choices that would change
+/// nothing are left out: no supply, no USD price, or a stablecoin quote (USD is the same).
 fn chart_tools(st: &State, pool: &Pool) -> String {
-    let seg = |opt: &str, a: &str, b: &str| {
+    let seg = |opt: &str, a: &str, b: &str, label: &str| {
         format!(
-            r#"<span class="seg"><button type="button" data-o="{opt}" data-v="0" aria-pressed="true">{a}</button><button type="button" data-o="{opt}" data-v="1" aria-pressed="false">{b}</button></span>"#
+            r#"<span class="seg" role="group" aria-label="{label}"><button type="button" data-o="{opt}" data-v="0" aria-pressed="true">{a}</button><button type="button" data-o="{opt}" data-v="1" aria-pressed="false">{b}</button></span>"#
         )
     };
     let mut out = String::from(r#"<div class="tools" role="toolbar" aria-label="Chart options">"#);
     if st.tokens[pool.base() as usize].supply > 0.0 {
-        out.push_str(&seg("mcap", "Price", "MCap"));
+        out.push_str(&seg("mcap", "Price", "MCap", "Price or market cap"));
     }
-    if pool.price_usd.is_finite() {
-        out.push_str(&seg("native", "USD", &Esc(sym(st, pool.quote())).to_string()));
+    let quote = &st.tokens[pool.quote() as usize];
+    if pool.price_usd.is_finite() && !crate::state::STABLES.contains(&quote.addr) {
+        out.push_str(&seg("native", "USD", &Esc(sym(st, pool.quote())).to_string(), "Price in"));
     }
-    out.push_str(concat!(
-        r#"<span class="seg"><button type="button" data-o="line" aria-pressed="false">Line</button><button type="button" data-o="log" aria-pressed="false" title="Logarithmic price scale">Log</button></span>"#,
-        r#"<span class="seg"><button type="button" data-o="ma" aria-pressed="false" title="Moving averages, 20 and 50 candles">MA</button><button type="button" data-o="vwap" aria-pressed="false" title="Volume-weighted average price, from each day's start">VWAP</button><button type="button" data-o="rsi" aria-pressed="false" title="Relative strength index, 14 candles">RSI</button></span>"#,
-        r#"<button type="button" class="ic" data-o="reset" aria-label="Reset chart view" title="Reset view"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/></svg></button>"#,
-        r#"<button type="button" class="ic" data-o="full" aria-label="Fullscreen chart" title="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>"#,
-        "</div>"
-    ));
+    let _ = write!(
+        out,
+        r#"<span class="seg" role="group" aria-label="Chart type"><button type="button" class="ic" data-o="line" data-v="0" aria-pressed="true" aria-label="Candles" title="Candles">{}</button><button type="button" class="ic" data-o="line" data-v="1" aria-pressed="false" aria-label="Line" title="Line">{}</button></span>"#,
+        icon("chart-candlestick"),
+        icon("chart-line"),
+    );
+    let _ = write!(
+        out,
+        r#"<button type="button" class="ic ind" popovertarget="ind" aria-label="Indicators" title="Indicators">{}<b class="cnt" hidden></b></button><div id="ind" class="menu" popover><p>Indicators</p><label><input type="checkbox" data-o="ma"><i class="sw ma"></i>Moving averages <small>20, 50</small></label><label><input type="checkbox" data-o="vwap"><i class="sw vw"></i>VWAP <small>from each day's start</small></label><label><input type="checkbox" data-o="rsi"><i class="sw rs"></i>RSI <small>14</small></label><hr><label><input type="checkbox" data-o="log">Log scale</label></div><button type="button" class="ic full" data-o="full" aria-label="Fullscreen" title="Fullscreen">{}</button></div>"#,
+        icon("activity"),
+        icon("maximize"),
+    );
     out
 }
 
@@ -1044,8 +1092,9 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         })
         .collect();
     let chart = format!(
-        r#"<div class="card chartcard"><div class="bar"><nav class="res" aria-label="Candle size">{res_nav}</nav>{tools}</div><div id="chart" data-pool="{key}" data-res="{res}" data-wasm="{wasm}" data-supply="{supply}">{svg}</div></div><script id="cd" type="application/json">{json}</script>"#,
+        r#"<div class="card chartcard"><div class="cbar"><nav class="res" aria-label="Candle size">{res_nav}</nav>{tools}</div><div class="plot"><div id="chart" data-pool="{key}" data-res="{res}" data-wasm="{wasm}" data-supply="{supply}">{svg}</div><button type="button" class="ic latest" hidden aria-label="Back to the latest candles" title="Latest">{latest}</button></div></div><script id="cd" type="application/json">{json}</script>"#,
         tools = chart_tools(st, pool),
+        latest = icon("chevrons-right"),
         supply = base.supply,
         res = RES[ri],
         wasm = app.wasm_url,
@@ -1087,23 +1136,48 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let trades = store.trades(p, (u32::MAX, u32::MAX), TRADES);
     let rows: String = trades.iter().map(|(k, t)| trade_row(st, pool, *k, t)).collect();
     let last = trades.first().map(|(k, _)| format!("{}-{}", k.0, k.1)).unwrap_or_else(|| "0-0".into());
-    let windows: String = WINDOWS
+    // Stats per window: tabs with the change, panels with volume and buy/sell bars.
+    let wtabs: String = WINDOWS
         .iter()
         .map(|(n, _)| {
+            let cur = *n == "24h";
             format!(
-                r#"<tr><td class="l">{n}</td><td>{}</td><td>{}</td><td><span class="u">{}</span> <span class="m">/</span> <span class="d">{}</span></td><td>{}</td></tr>"#,
-                f(&format!("c{n}")),
-                f(&format!("v{n}")),
-                f(&format!("b{n}")),
-                f(&format!("s{n}")),
-                f(&format!("k{n}"))
+                r#"<button type="button" role="tab" aria-selected="{cur}" data-w="{n}"><span>{n}</span>{}</button>"#,
+                f(&format!("c{n}"))
             )
         })
         .collect();
-    let copy = |label: &str, a: &str, link: &str| {
+    let wpanels: String = WINDOWS
+        .iter()
+        .map(|(n, _)| {
+            let bar = |label: &str, total: &str, a: &str, al: &str, b: &str, bl: &str, ratio: &str| {
+                format!(
+                    r#"<div class="split"><div class="sh"><span>{label}</span><b>{total}</b></div><div class="track">{ratio}</div><div class="sl"><span class="u">{a} {al}</span><span class="d">{b} {bl}</span></div></div>"#
+                )
+            };
+            format!(
+                r#"<div class="wp" data-w="{n}"{hidden}><div class="sh vol"><span>Volume</span><b>{vol}</b></div>{txns}{makers}</div>"#,
+                hidden = if *n == "24h" { "" } else { " hidden" },
+                vol = f(&format!("v{n}")),
+                txns = bar("Txns", "", &f(&format!("b{n}")), "buys", &f(&format!("s{n}")), "sells", &f(&format!("rb{n}"))),
+                makers = bar(
+                    "Makers",
+                    &f(&format!("k{n}")),
+                    &f(&format!("kb{n}")),
+                    "buyers",
+                    &f(&format!("ks{n}")),
+                    "sellers",
+                    &f(&format!("rk{n}"))
+                ),
+            )
+        })
+        .collect();
+    let addr_row = |label: &str, a: &str, link: &str| {
         format!(
-            r#"<p><span>{label}</span><span><a class="mono" href="{EXPLORER}/{link}" rel="nofollow">{short}</a> <button type="button" data-copy="{a}" aria-label="Copy {label} address">Copy</button></span></p>"#,
+            r#"<p><span>{label}</span><span class="addr"><span class="mono">{short}</span><button type="button" class="ic sm" data-copy="{a}" aria-label="Copy {label} address" title="Copy address">{copy}</button><a class="ic sm" href="{EXPLORER}/{link}" rel="nofollow" target="_blank" aria-label="{label} on Basescan" title="Basescan">{ext}</a></span></p>"#,
             short = if a.len() > 12 { format!("{}…{}", &a[..6], &a[a.len() - 4..]) } else { a.to_string() },
+            copy = icon("copy"),
+            ext = icon("external-link"),
         )
     };
     let pool_link = if pool.is_address() {
@@ -1112,7 +1186,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         format!("address/{}", hex(&crate::abi::V4_POOL_MANAGER))
     };
     let embed_code = format!(
-        r#"<iframe src="{}/embed/base/{key}" width="100%" height="480" style="border:0;border-radius:12px" title="{} chart on {SITE}" loading="lazy"></iframe>"#,
+        r#"<iframe src="{}/embed/base/{key}" width="100%" height="480" style="border:0;border-radius:12px" title="{} chart on {SITE}" loading="lazy" allowfullscreen></iframe>"#,
         app.cfg.public_url,
         Esc(&format!("{bs}/{qs}")),
     );
@@ -1122,8 +1196,17 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         urlencode(&format!("{url}?s={}", st.head_ts / 3600))
     );
     let body = format!(
-        r#"<main class="wrap"><div class="pair"><section><div class="head"><div class="id">{av}<div class="meta"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><span class="name">{bname} <span class="badge">{dex}</span></span></div><button type="button" class="star" data-star="{key}" aria-pressed="false" aria-label="Watch this pair">★</button></div><div class="px"><div><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span><a class="btn btn-primary buy" href="{buy}" target="_blank" rel="noopener nofollow">Buy on Uniswap ↗</a></div></div>{chart}<div class="card scroll"><div class="tt" role="tablist" aria-label="Trades"><button type="button" role="tab" aria-selected="true" data-tab="trades">Trades</button><button type="button" role="tab" aria-selected="false" data-tab="traders">Top traders</button></div><div id="traders" hidden></div><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Total</th><th class="hide-s">Maker</th><th class="hide-s">Tx</th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table>{more}</div></section><aside><dl class="card kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="card scroll"><table class="win"><thead><tr><th class="l"><span class="sr">Window</span></th><th>Change</th><th>Volume</th><th>Buys / Sells</th><th title="Unique wallets that traded">Makers</th></tr></thead><tbody>{windows}</tbody></table></div>{token}{safety}{others}<div class="card info">{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Embed or share</h2><textarea readonly aria-label="Embed code">{embed_e}</textarea><div class="row"><button type="button" class="btn-primary" data-copy="{embed_e}">Copy embed code</button><a class="btn" href="{share}" target="_blank" rel="noopener">Share on X ↗</a></div></div></aside></div></main>"#,
+        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><div class="t"><h1>{bs_e}<span class="q">/{qs_e}</span></h1><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button></div><span class="name"><a href="/base/token/{base_addr}">{bname}</a><span class="badge">{dex}</span></span></div></div><div class="px"><div class="pv"><div class="big">{p}</div><div class="pn">{pn}</div></div><span class="chg">{c24}</span><a class="btn btn-primary buy" href="{buy}" target="_blank" rel="noopener nofollow" title="Swap on Uniswap">{swap}Buy</a></div></div>
+<div class="pair"><section>{chart}<div class="card trades-card"><div class="tt" role="tablist" aria-label="Trades"><button type="button" role="tab" aria-selected="true" data-tab="trades">Trades</button><button type="button" role="tab" aria-selected="false" data-tab="traders">Top traders</button></div><div id="traders" hidden></div><div class="scroll"><table class="trades"><thead><tr><th class="l">Time (UTC)</th><th class="l">Type</th><th>Price</th><th>Amount</th><th>Value</th><th class="hide-s">Maker</th><th class="hide-s"><span class="sr">Transaction</span></th></tr></thead><tbody id="tr" data-last="{last}">{rows}</tbody></table></div>{more}</div></section>
+<aside><div class="card stats"><dl class="kv"><div><dt>Price USD</dt><dd>{p}</dd></div><div><dt>Price {qs_e}</dt><dd>{pn}</dd></div><div><dt>Liquidity</dt><dd>{liq}</dd></div><div><dt>FDV</dt><dd>{fdv}</dd></div></dl><div class="wt" role="tablist" aria-label="Window">{wtabs}</div>{wpanels}</div>{safety}{token}{others}<div class="card info"><h2>Pair</h2>{pair_c}{base_c}{quote_c}<p><span>DEX</span><span>{dex}</span></p><p><span>Created</span><span>{created} ago</span></p></div><div class="card share"><h2>Share</h2><div class="row"><button type="button" class="btn" data-copy="{url}" title="Copy link">{link}Link</button><button type="button" class="btn" popovertarget="embed" title="Embed code">{code}Embed</button><a class="btn" href="{share}" target="_blank" rel="noopener" title="Post on X">{xlogo}Post</a></div><div id="embed" class="menu wide" popover><p>Embed this chart</p><textarea readonly aria-label="Embed code">{embed_e}</textarea><button type="button" class="btn btn-primary" data-copy="{embed_e}">{copy}Copy code</button></div></div></aside></div></main>"#,
         av = avatar(st, pool.base(), true),
+        star = icon("star"),
+        swap = icon("arrow-left-right"),
+        link = icon("link"),
+        code = icon("code-xml"),
+        xlogo = icon("xlogo"),
+        copy = icon("copy"),
+        base_addr = hex(&base.addr),
         buy = buy_url(st, pool),
         more = more_button(&trades),
         token = token_card(st, store, pool, &fs),
@@ -1132,15 +1215,15 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         bs_e = Esc(bs),
         c24 = f("c24h"),
         dex = pool.dex(),
-        bname = Esc(&base.name),
+        bname = Esc(if base.name.is_empty() { bs } else { &base.name }),
         pn = f("pn"),
         p = f("p"),
         liq = f("liq"),
         fdv = f("fdv"),
         qs_e = Esc(qs),
-        pair_c = copy("Pair", &key, &pool_link),
-        base_c = copy(&format!("{}", Esc(bs)), &hex(&base.addr), &format!("token/{}", hex(&base.addr))),
-        quote_c = copy(&format!("{}", Esc(qs)), &hex(&quote.addr), &format!("token/{}", hex(&quote.addr))),
+        pair_c = addr_row("Pair", &key, &pool_link),
+        base_c = addr_row(&format!("{}", Esc(bs)), &hex(&base.addr), &format!("token/{}", hex(&base.addr))),
+        quote_c = addr_row(&format!("{}", Esc(qs)), &hex(&quote.addr), &format!("token/{}", hex(&quote.addr))),
         created = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
         embed_e = Esc(&embed_code),
     );
@@ -1205,9 +1288,20 @@ pub fn urlencode(s: &str) -> String {
 }
 
 /// The pool a token links to, if it has any.
+/// Where a token links to: its deepest pool on a known DEX where it is the base (so the
+/// page shows its own price: USDC goes to a USDC/stable pair at $1, not WETH/USDC at ETH's
+/// price), else the deepest pool it's in at all.
 pub fn best_pool(st: &State, token: u32) -> Option<u32> {
-    let p = st.tokens.get(token as usize)?.best_pool;
-    (p != NONE).then_some(p)
+    own_pool(st, token).or_else(|| {
+        let p = st.tokens.get(token as usize)?.best_pool;
+        (p != NONE).then_some(p)
+    })
+}
+
+/// A token's deepest pool on a known DEX where it is the base (at least $1k deep).
+pub fn own_pool(st: &State, token: u32) -> Option<u32> {
+    let ps = st.base_pools.get(&token)?;
+    ps.iter().map(|&p| (st.liq(p), p)).filter(|(l, _)| *l >= 1_000.0).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, p)| p)
 }
 
 #[cfg(test)]

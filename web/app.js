@@ -11,14 +11,47 @@ const $ = (s, el = document) => el.querySelector(s)
   else if (window.parent !== window) window.parent.postMessage(ready, '*')
 }
 
-document.addEventListener('click', (e) => {
+// Copy buttons. Icon-only ones flash a check; others say "Copied". Where the clipboard is
+// blocked (some frames), fall back to selecting a hidden textarea.
+document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-copy]')
   if (!b) return
-  navigator.clipboard.writeText(b.dataset.copy).then(() => {
-    const t = b.textContent
-    b.textContent = 'Copied'
-    setTimeout(() => (b.textContent = t), 1200)
-  })
+  try {
+    await navigator.clipboard.writeText(b.dataset.copy)
+  } catch {
+    const t = Object.assign(document.createElement('textarea'), { value: b.dataset.copy })
+    document.body.append(t)
+    t.select()
+    document.execCommand('copy')
+    t.remove()
+  }
+  const html = b.innerHTML
+  b.innerHTML = b.classList.contains('ic') ? '<svg class="i" aria-hidden="true"><use href="#i-check"/></svg>' : html.replace(/[^>]*$/, 'Copied')
+  setTimeout(() => (b.innerHTML = html), 1200)
+})
+
+// Popover menus open under their button (inside the viewport).
+document.addEventListener(
+  'toggle',
+  (e) => {
+    const menu = e.target
+    if (!menu.matches?.('[popover]') || e.newState !== 'open') return
+    const b = document.querySelector(`[popovertarget="${menu.id}"]`)
+    if (!b) return
+    const r = b.getBoundingClientRect()
+    const m = menu.getBoundingClientRect()
+    menu.style.left = `${Math.max(12, Math.min(r.right - m.width, innerWidth - m.width - 12))}px`
+    menu.style.top = `${r.bottom + m.height + 8 > innerHeight ? Math.max(12, r.top - m.height - 8) : r.bottom + 8}px`
+  },
+  true
+)
+
+// Stats windows (5m, 1h, 6h, 24h).
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('.wt [data-w]')
+  if (!t) return
+  t.parentElement.querySelectorAll('[data-w]').forEach((b) => b.setAttribute('aria-selected', String(b === t)))
+  document.querySelectorAll('.wp').forEach((p) => (p.hidden = p.dataset.w !== t.dataset.w))
 })
 
 // Theme: follows the system until picked here; the choice is applied before paint by
@@ -118,24 +151,40 @@ document.querySelectorAll('input[type=search]').forEach((input, n) => {
     if (text != null) e.textContent = text
     return e
   }
-  const render = (pairs) => {
-    box.replaceChildren(
-      ...pairs.map((p, i) => {
-        const li = el('li')
-        li.id = `${box.id}-${i}`
-        li.setAttribute('role', 'option')
-        const a = el('a')
-        a.href = `/base/${p.pair}`
-        const icon = p.base.icon ? Object.assign(el('img', 'av'), { src: p.base.icon, alt: '', width: 26, height: 26 }) : el('span', 'av', (p.base.symbol[0] || '?').toUpperCase())
+  const avatar = (t) =>
+    t.icon ? Object.assign(el('img', 'av'), { src: t.icon, alt: '', width: 24, height: 24 }) : el('span', 'av', (t.symbol[0] || '?').toUpperCase())
+  const option = (i, href, parts) => {
+    const li = el('li')
+    li.id = `${box.id}-${i}`
+    li.setAttribute('role', 'option')
+    const a = el('a')
+    a.href = href
+    a.append(...parts)
+    li.append(a)
+    return li
+  }
+  // Exact token matches first (their own price, on the token page), then pairs.
+  const render = ({ tokens = [], pairs = [] }) => {
+    const items = [
+      ...tokens.map((t, i) => {
+        const name = el('span', 'nm')
+        name.append(el('b', '', t.symbol), el('span', 'm', ` ${t.name}`), el('small', '', 'Token'))
+        return option(i, t.url, [avatar(t), name, el('span', 'pr', usd(t.price_usd, { maximumSignificantDigits: 4 })), el('span', 'm lq2', '')])
+      }),
+      ...pairs.slice(0, 8 - tokens.length).map((p, i) => {
         const name = el('span', 'nm')
         name.append(el('b', '', p.base.symbol), el('span', 'm', `/${p.quote.symbol}`), el('small', '', p.dex))
-        a.append(icon, name, el('span', 'pr', usd(p.price_usd, { maximumSignificantDigits: 4 })), el('span', 'm lq2', usd(p.liquidity_usd, { notation: 'compact', maximumFractionDigits: 1 })))
-        li.append(a)
-        return li
-      })
-    )
+        return option(tokens.length + i, `/base/${p.pair}`, [
+          avatar(p.base),
+          name,
+          el('span', 'pr', usd(p.price_usd, { maximumSignificantDigits: 4 })),
+          el('span', 'm lq2', usd(p.liquidity_usd, { notation: 'compact', maximumFractionDigits: 1 })),
+        ])
+      }),
+    ]
+    box.replaceChildren(...items)
     active = -1
-    show(pairs.length > 0)
+    show(items.length > 0)
   }
   input.addEventListener('input', () => {
     clearTimeout(timer)
@@ -144,7 +193,7 @@ document.querySelectorAll('input[type=search]').forEach((input, n) => {
     timer = setTimeout(async () => {
       asked = q
       const r = await fetch(`/api/v1/search?q=${encodeURIComponent(q)}`).then((r) => (r.ok ? r.json() : { pairs: [] }), () => ({ pairs: [] }))
-      if (asked === q && input.value.trim() === q) render(r.pairs.slice(0, 8))
+      if (asked === q && input.value.trim() === q) render(r)
     }, 150)
   })
   input.addEventListener('keydown', (e) => {
@@ -182,9 +231,6 @@ document.addEventListener('click', (e) => {
 })
 stars()
 
-// Filters apply as soon as they change.
-$('.filters')?.addEventListener('change', (e) => e.currentTarget.requestSubmit())
-
 // Pair lists (home tabs, search, watchlist) take fresh rows every few seconds while
 // visible. The rows are cached at the edge for 2 s, so every viewer shares one render.
 const list = $('[data-list]')
@@ -195,6 +241,9 @@ if (list) {
   const refresh = async () => {
     const u = src()
     if (!u) return
+    // Not while someone is pointing at or tabbing through the rows: a swap would drop
+    // their hover, focus or a click in progress.
+    if (list.matches(':hover') || list.contains(document.activeElement)) return
     const rows = await fetch(u).then((r) => (r.ok ? r.text() : ''), () => '')
     if (rows && rows !== last) (list.querySelector('tbody').innerHTML = last = rows), stars()
   }
@@ -219,6 +268,7 @@ async function chart(el) {
   } catch {}
   for (const o in opt) if (!$(`[data-o="${o}"]`)) opt[o] = 0
   const supply = +el.dataset.supply
+  const latest = el.parentElement.querySelector('.latest')
   // chart::LINE, MA, COMPACT, LOG, RSI, VWAP
   const flags = () => opt.line | (opt.ma << 1) | (opt.mcap << 2) | (opt.log << 3) | (opt.rsi << 4) | (opt.vwap << 5)
   // The filtered wallet's buys and sells, at their price in the chart's unit.
@@ -247,6 +297,8 @@ async function chart(el) {
     start = w.start()
     count = w.count()
     if (start < 10 && !done && !busy) older()
+    // "Latest" shows once the newest candle has scrolled out of view.
+    if (latest) latest.hidden = start + count >= cs.length + 1
   }
   const redraw = () => frame || (frame = requestAnimationFrame(draw))
   const get = (q) => fetch(`/api/candles/${pool}?res=${res}&unit=${opt.native ? 'n' : 'u'}${q}`).then((r) => r.json())
@@ -257,6 +309,7 @@ async function chart(el) {
     start = NaN
     load()
     draw()
+    sync()
   }
 
   // Candles that closed while the page sat in a cache: take the latest from the API,
@@ -361,31 +414,62 @@ async function chart(el) {
     })
   )
 
+  // Toolbar: segmented choices (data-v) and the indicators menu's checkboxes. Indicators
+  // that can't draw here are disabled with the reason: VWAP restarts daily, so daily
+  // candles have none; averages and RSI need enough candles.
   const card = el.closest('.chartcard')
-  const press = () =>
-    card.querySelectorAll('[data-o]').forEach((b) => {
-      const o = b.dataset.o
-      if (o in opt) b.setAttribute('aria-pressed', b.dataset.v ? String(opt[o] === +b.dataset.v) : String(!!opt[o]))
+  const ind = card.querySelector('.ind')
+  const need = { ma: 21, rsi: 15, vwap: 1 }
+  const sync = () => {
+    card.querySelectorAll('button[data-o][data-v]').forEach((b) => b.setAttribute('aria-pressed', String(opt[b.dataset.o] === +b.dataset.v)))
+    let on = 0
+    card.querySelectorAll('input[data-o]').forEach((c) => {
+      const o = c.dataset.o
+      const why = o === 'vwap' && res >= 86400 ? 'VWAP restarts each day: pick candles under 1d' : cs.length < (need[o] || 0) ? 'Not enough candles yet' : ''
+      c.disabled = !!why
+      c.closest('label').title = why
+      c.checked = !!opt[o]
+      if (opt[o] && !why && o !== 'log') on++
     })
-  card.querySelector('.tools')?.addEventListener('click', (e) => {
-    const b = e.target.closest('[data-o]')
-    if (!b) return
-    const o = b.dataset.o
-    if (o === 'reset') return (start = NaN), draw()
-    if (o === 'full') return document.fullscreenElement ? document.exitFullscreen() : card.requestFullscreen()
-    const prev = opt[o]
-    opt[o] = b.dataset.v ? +b.dataset.v : 1 - opt[o]
-    if (opt[o] === prev) return
+    const n = ind?.querySelector('.cnt')
+    if (n) (n.hidden = !on), (n.textContent = on)
+    ind?.classList.toggle('on', on > 0)
+  }
+  const set = (o, v) => {
+    if (opt[o] === v) return
+    opt[o] = v
     try {
       localStorage.setItem('chart', JSON.stringify(opt))
     } catch {}
-    press()
+    sync()
     if (o === 'native') return reload()
     load()
     draw()
+  }
+  card.querySelector('.tools')?.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-o]')
+    if (!b) return
+    if (b.dataset.o === 'full') return document.fullscreenElement ? document.exitFullscreen() : card.requestFullscreen()
+    set(b.dataset.o, +b.dataset.v)
   })
-  el.addEventListener('dblclick', () => ((start = NaN), draw()))
-  press()
+  card.addEventListener('change', (e) => {
+    const c = e.target.closest('input[data-o]')
+    if (c) set(c.dataset.o, c.checked ? 1 : 0)
+  })
+  // Fullscreen where the browser allows it (not in some frames, nor iPhone Safari).
+  const full = card.querySelector('.full')
+  if (full) {
+    full.hidden = !document.fullscreenEnabled
+    document.addEventListener('fullscreenchange', () => {
+      const on = document.fullscreenElement === card
+      full.innerHTML = `<svg class="i" aria-hidden="true"><use href="#i-${on ? 'minimize' : 'maximize'}"/></svg>`
+      full.setAttribute('aria-label', on ? 'Exit fullscreen' : 'Fullscreen')
+    })
+  }
+  const back = () => ((start = NaN), draw())
+  latest?.addEventListener('click', back)
+  el.addEventListener('dblclick', back)
+  sync()
   if (opt.native) reload()
   else if (flags()) load(), draw()
 
@@ -398,6 +482,7 @@ async function chart(el) {
       document.querySelectorAll(`[data-f="${id}"]`).forEach((n) => {
         n.textContent = text
         n.className = cls
+        if (cls === 'bar') n.style.setProperty('--r', text) // bar widths travel as text
       })
     const c = u[opt.native ? 'n' : 'c'][res]
     if (c) {
