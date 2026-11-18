@@ -2,6 +2,15 @@
 // same Rust renderer compiled to wasm), live updates, and copy buttons.
 const $ = (s, el = document) => el.querySelector(s)
 
+// Farcaster mini app: the host keeps the app hidden until it says it's ready. This is the
+// mini app SDK's sdk.actions.ready() (one comlink call to the host) without loading the SDK.
+// Elsewhere (an iframe on some site, X's player) nobody listens and it's ignored.
+{
+  const ready = { id: 'ready', type: 'APPLY', path: ['ready'], argumentList: [{ type: 'RAW', value: {} }] }
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(ready))
+  else if (window.parent !== window) window.parent.postMessage(ready, '*')
+}
+
 document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-copy]')
   if (!b) return
