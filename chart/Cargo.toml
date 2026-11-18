@@ -1,0 +1,9 @@
+[package]
+name = "chart"
+description = "Candlestick chart rendered to SVG, shared by the server and the browser (wasm)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]

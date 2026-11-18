@@ -1,0 +1,21 @@
+[workspace]
+members = ["chart", "server"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = "thin"
+debug = false
+
+# The chart shipped to browsers: `cargo build -p chart --profile wasm --target wasm32-unknown-unknown`.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,34 @@
+# Production: runs next to the Base node (docker compose project base-node-v2), whose
+# network gives us its RPC at http://execution:8545 without opening any port.
+# Secrets live in deploy/.env (HYPERSYNC_TOKEN, TUNNEL_TOKEN), never in git.
+name: plainscreener
+
+services:
+  app:
+    build: ..
+    image: plainscreener:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RPC_URL: http://execution:8545
+      DATA_DIR: /data
+    volumes:
+      - /mnt/chain/plainscreener:/data
+    networks: [node]
+    # Leave the node most of the machine.
+    cpus: 4
+    mem_limit: 24g
+    stop_grace_period: 60s
+
+  tunnel:
+    image: cloudflare/cloudflared:2026.11.1
+    command: tunnel --no-autoupdate run
+    restart: unless-stopped
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    networks: [node]
+
+networks:
+  node:
+    name: base-node-v2_default
+    external: true

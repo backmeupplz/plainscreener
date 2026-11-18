@@ -1,0 +1,6 @@
+[Unit]
+Description=Deploy plainscreener when main changes
+
+[Service]
+Type=oneshot
+ExecStart=/opt/plainscreener/deploy/update.sh
