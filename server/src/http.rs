@@ -174,7 +174,7 @@ fn search_pools(app: &App, st: &State, q: &str) -> Vec<u32> {
         .iter()
         .filter(|(sym, name, _)| sym.starts_with(&needle) || name.contains(&needle))
         .filter_map(|(sym, _, t)| {
-            let p = pages::best_pool(&st, *t)?;
+            let p = pages::best_pool(st, *t)?;
             Some(((*sym == needle, st.pools[p as usize].trusted()), st.liq(p), p))
         })
         .collect();
