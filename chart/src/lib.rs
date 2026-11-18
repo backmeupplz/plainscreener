@@ -148,12 +148,15 @@ pub fn render(cs: &[Candle], v: &View, out: &mut String) {
     }
     let tstep = STEPS.iter().copied().find(|s| s / v.res * f.step >= 84.0).unwrap_or(STEPS[STEPS.len() - 1]);
     let mut prev = f64::NAN;
+    let mut last_x = f64::NEG_INFINITY;
     for (k, c) in vis.iter().enumerate() {
         let lt = c.t + v.tz;
         let bucket = (lt / tstep).floor();
         if bucket != prev && !prev.is_nan() {
             let x = f.x(i0 + k);
-            if x > 24.0 && x < pw - 24.0 {
+            // Candles are spaced by index, so gaps in trading bunch boundaries together.
+            if x > 24.0 && x < pw - 24.0 && x - last_x >= 76.0 {
+                last_x = x;
                 out_v(&mut grid, x, base);
                 // Label the boundary (16:45), not the first candle after a gap (16:46).
                 let lt = (bucket * tstep) as i64;

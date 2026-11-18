@@ -41,6 +41,8 @@ pub struct State {
     dirty_pools: HashSet<u32>,
     dirty_tokens: HashSet<u32>,
     dirty_candles: HashSet<(u32, usize)>,
+    /// Candles that closed since the last flush (a batch spans many candle periods).
+    closed_candles: Vec<([u8; 9], Vec<u8>)>,
     trades: Vec<([u8; 12], Vec<u8>)>,
     /// Pools that traded since the last flush (for live updates).
     touched: HashSet<u32>,
@@ -239,7 +241,15 @@ impl State {
             let t = ts - ts % res;
             let open = match self.candles.get(&(p, ri)) {
                 Some((ct, _)) if *ct == t => None,
-                _ => Some(store.candles.get(candle_key(p, ri, t)).ok().flatten()),
+                previous => {
+                    // The previous candle closes; keep it for the flush before replacing it.
+                    if let Some((pt, pc)) = previous
+                        && self.dirty_candles.contains(&(p, ri))
+                    {
+                        self.closed_candles.push((candle_key(p, ri, *pt), pc.encode()));
+                    }
+                    Some(store.candles.get(candle_key(p, ri, t)).ok().flatten())
+                }
             };
             let entry = self.candles.entry((p, ri)).or_insert((t, Candle::default()));
             if let Some(stored) = open {
@@ -309,6 +319,9 @@ impl State {
         }
         for t in self.dirty_tokens.drain() {
             b.insert(&store.tokens, t.to_be_bytes().to_vec(), self.tokens[t as usize].encode());
+        }
+        for (k, v) in self.closed_candles.drain(..) {
+            b.insert(&store.candles, k.to_vec(), v);
         }
         for (p, ri) in self.dirty_candles.drain() {
             if let Some((t, c)) = self.candles.get(&(p, ri)) {
@@ -421,6 +434,15 @@ mod tests {
         assert_eq!(candles.len(), 1);
         assert_eq!(candles[0].1.sells, 1);
         assert_eq!(store.trades(2, (u32::MAX, 0), 10).len(), 1);
+
+        // Trades in three different minutes before one flush keep three 1 m candles.
+        for minute in 1..=3 {
+            let mut l = swap(pool_b, 1000e18, 0.0, 0.0, 0.01e18);
+            l.ts += minute * 60;
+            s.apply(&l, &store);
+        }
+        s.flush(&store, 13).unwrap();
+        assert_eq!(store.candles(2, 0, 0, u32::MAX, 10).len(), 4, "every closed candle is stored");
 
         // A smaller pool can't move the price while the deep one holds liquidity…
         let pool_c = [5u8; 20];
