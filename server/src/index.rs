@@ -31,20 +31,10 @@ pub async fn run(cfg: Arc<Config>, sh: Shared) {
     }
 }
 
-async fn step(
-    cfg: &Config,
-    sh: &Shared,
-    rpc: &Rpc,
-    sqd: &Sqd,
-    cursor: &mut Option<u32>,
-) -> Result<()> {
+async fn step(cfg: &Config, sh: &Shared, rpc: &Rpc, sqd: &Sqd, cursor: &mut Option<u32>) -> Result<()> {
     let at = match *cursor {
         Some(c) => c,
-        None => sh
-            .store
-            .cursor()?
-            .map(|(block, _)| block)
-            .unwrap_or(cfg.start_block),
+        None => sh.store.cursor()?.map(|(block, _)| block).unwrap_or(cfg.start_block),
     };
     let head = rpc.block_number().await?;
     let node_from = head.saturating_sub(NODE_HISTORY);
@@ -77,15 +67,7 @@ async fn step(
 
 /// Indexes `[from, to)` in `chunk`-block ranges, fetching up to `ahead` ranges at once
 /// and applying them in order. Returns the next block to index.
-async fn catch_up<F, Fut>(
-    rpc: &Rpc,
-    sh: &Shared,
-    from: u32,
-    to: u32,
-    chunk: u32,
-    ahead: usize,
-    fetch: F,
-) -> Result<u32>
+async fn catch_up<F, Fut>(rpc: &Rpc, sh: &Shared, from: u32, to: u32, chunk: u32, ahead: usize, fetch: F) -> Result<u32>
 where
     F: Fn(u32, u32) -> Fut,
     Fut: Future<Output = Result<Vec<RawLog>>> + Send + 'static,
@@ -113,21 +95,10 @@ where
 
 /// Applies a batch of logs in order and persists the result with the next block to index.
 async fn process(rpc: &Rpc, sh: &Shared, logs: Vec<RawLog>, next: u32) -> Result<Vec<u32>> {
-    let unknown = sh
-        .state
-        .read()
-        .map_err(|_| anyhow!("state lock poisoned"))?
-        .unknown_tokens(&logs);
+    let unknown = sh.state.read().map_err(|_| anyhow!("state lock poisoned"))?.unknown_tokens(&logs);
     let addrs: Vec<Addr> = unknown.iter().map(|(a, _)| *a).collect();
-    let metas = if addrs.is_empty() {
-        Vec::new()
-    } else {
-        rpc.meta(&addrs).await?
-    };
-    let mut s = sh
-        .state
-        .write()
-        .map_err(|_| anyhow!("state lock poisoned"))?;
+    let metas = if addrs.is_empty() { Vec::new() } else { rpc.meta(&addrs).await? };
+    let mut s = sh.state.write().map_err(|_| anyhow!("state lock poisoned"))?;
     for ((addr, block), meta) in unknown.into_iter().zip(metas) {
         s.add_token(addr, meta, block);
     }
@@ -145,11 +116,7 @@ struct Progress {
 
 impl Progress {
     fn new(block: u32) -> Progress {
-        Progress {
-            at: Instant::now(),
-            block,
-            logs: 0,
-        }
+        Progress { at: Instant::now(), block, logs: 0 }
     }
 
     fn tick(&mut self, block: u32, logs: usize, sh: &Shared) {

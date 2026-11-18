@@ -53,18 +53,10 @@ pub struct Pool {
 
 impl Pool {
     pub fn base(&self) -> u32 {
-        if self.quote0 {
-            self.token1
-        } else {
-            self.token0
-        }
+        if self.quote0 { self.token1 } else { self.token0 }
     }
     pub fn quote(&self) -> u32 {
-        if self.quote0 {
-            self.token0
-        } else {
-            self.token1
-        }
+        if self.quote0 { self.token0 } else { self.token1 }
     }
     pub fn bal_base(&self) -> f64 {
         if self.quote0 { self.bal1 } else { self.bal0 }.max(0.0)
@@ -77,11 +69,7 @@ impl Pool {
     }
     /// Pool id as shown in URLs: an address for v2/v3, the 32-byte id for v4.
     pub fn key(&self) -> String {
-        crate::abi::hex(if self.is_address() {
-            &self.id[12..]
-        } else {
-            &self.id
-        })
+        crate::abi::hex(if self.is_address() { &self.id[12..] } else { &self.id })
     }
     /// Pools from known factories, or v4 (whose PoolManager does the accounting).
     /// Anyone can deploy a contract that emits pool events with made-up reserves, so only
@@ -91,69 +79,29 @@ impl Pool {
     }
 
     pub fn dex(&self) -> &'static str {
-        DEXES
-            .iter()
-            .find(|(a, _)| *a == self.origin)
-            .map(|(_, n)| *n)
-            .unwrap_or(match self.kind {
-                Kind::V2 => "v2 fork",
-                Kind::Solidly => "Solidly fork",
-                Kind::V3 => "v3 fork",
-                Kind::V4 => "Uniswap v4",
-            })
+        DEXES.iter().find(|(a, _)| *a == self.origin).map(|(_, n)| *n).unwrap_or(match self.kind {
+            Kind::V2 => "v2 fork",
+            Kind::Solidly => "Solidly fork",
+            Kind::V3 => "v3 fork",
+            Kind::V4 => "Uniswap v4",
+        })
     }
 }
 
 /// Known factories on Base (each checked on-chain). Anything else is labelled by pool type.
 const DEXES: [(Addr, &str); 12] = [
-    (
-        hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6"),
-        "Uniswap v2",
-    ),
-    (
-        hex20("33128a8fc17869897dce68ed026d694621f6fdfd"),
-        "Uniswap v3",
-    ),
-    (
-        hex20("420dd381b31aef6683db6b902084cb0ffece40da"),
-        "Aerodrome",
-    ),
-    (
-        hex20("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"),
-        "Aerodrome CL",
-    ),
-    (
-        hex20("ade65c38cd4849adba595a4323a8c7ddfe89716a"),
-        "Aerodrome CL",
-    ),
-    (
-        hex20("0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"),
-        "PancakeSwap v3",
-    ),
-    (
-        hex20("02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e"),
-        "PancakeSwap v2",
-    ),
-    (
-        hex20("71524b4f93c58fcbf659783284e38825f0622859"),
-        "SushiSwap v2",
-    ),
-    (
-        hex20("c35dadb65012ec5796536bd9864ed8773abc74c4"),
-        "SushiSwap v3",
-    ),
-    (
-        hex20("fda619b6d20975be80a10332cd39b9a4b0faa8bb"),
-        "BaseSwap",
-    ),
-    (
-        hex20("04c9f118d21e8b767d2e50c946f0cc9f6c367300"),
-        "SwapBased",
-    ),
-    (
-        hex20("3e84d913803b02a4a7f027165e8ca42c14c0fde7"),
-        "AlienBase",
-    ),
+    (hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6"), "Uniswap v2"),
+    (hex20("33128a8fc17869897dce68ed026d694621f6fdfd"), "Uniswap v3"),
+    (hex20("420dd381b31aef6683db6b902084cb0ffece40da"), "Aerodrome"),
+    (hex20("5e7bb104d84c7cb9b682aac2f3d509f5f406809a"), "Aerodrome CL"),
+    (hex20("ade65c38cd4849adba595a4323a8c7ddfe89716a"), "Aerodrome CL"),
+    (hex20("0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"), "PancakeSwap v3"),
+    (hex20("02a84c1b3bbd7401a5f7fa98a384ebc70bb5749e"), "PancakeSwap v2"),
+    (hex20("71524b4f93c58fcbf659783284e38825f0622859"), "SushiSwap v2"),
+    (hex20("c35dadb65012ec5796536bd9864ed8773abc74c4"), "SushiSwap v3"),
+    (hex20("fda619b6d20975be80a10332cd39b9a4b0faa8bb"), "BaseSwap"),
+    (hex20("04c9f118d21e8b767d2e50c946f0cc9f6c367300"), "SwapBased"),
+    (hex20("3e84d913803b02a4a7f027165e8ca42c14c0fde7"), "AlienBase"),
 ];
 
 /// A stored candle: USD and native (quote) OHLC, USD volume, buy and sell counts.
@@ -175,17 +123,7 @@ pub struct Candle {
 impl Candle {
     pub fn open(usd: f64, native: f64) -> Candle {
         let (u, n) = (usd as f32, native as f32);
-        Candle {
-            o: u,
-            h: u,
-            l: u,
-            c: u,
-            no: n,
-            nh: n,
-            nl: n,
-            nc: n,
-            ..Default::default()
-        }
+        Candle { o: u, h: u, l: u, c: u, no: n, nh: n, nl: n, nc: n, ..Default::default() }
     }
     pub fn add(&mut self, usd: f64, native: f64, vol: f64, buy: bool) {
         let (u, n) = (usd as f32, native as f32);
@@ -242,10 +180,7 @@ pub struct Window {
 
 impl Stats {
     pub fn new() -> Box<Stats> {
-        Box::new(Stats {
-            m: [Bucket::default(); 60],
-            h: [Bucket::default(); 24],
-        })
+        Box::new(Stats { m: [Bucket::default(); 60], h: [Bucket::default(); 24] })
     }
 
     /// Adds a trade. `open` is the price before it (start of a new bucket).
@@ -254,11 +189,7 @@ impl Stats {
             let t = ts - ts % len;
             let b = &mut ring[(t / len) as usize % ring.len()];
             if b.t != t {
-                *b = Bucket {
-                    t,
-                    open: open as f32,
-                    ..Default::default()
-                };
+                *b = Bucket { t, open: open as f32, ..Default::default() };
             }
             b.bump(vol, buy);
         }
@@ -266,33 +197,16 @@ impl Stats {
 
     /// Restores a bucket from a stored candle.
     pub fn restore(&mut self, res: u32, t: u32, c: &Candle) {
-        let ring = if res == 60 {
-            &mut self.m[..]
-        } else {
-            &mut self.h[..]
-        };
+        let ring = if res == 60 { &mut self.m[..] } else { &mut self.h[..] };
         let n = ring.len();
-        ring[(t / res) as usize % n] = Bucket {
-            t,
-            open: c.o,
-            vol: c.v,
-            buys: c.buys,
-            sells: c.sells,
-        };
+        ring[(t / res) as usize % n] = Bucket { t, open: c.o, vol: c.v, buys: c.buys, sells: c.sells };
     }
 
     /// Activity in the last `secs` seconds (5 min and 1 h use minutes, longer windows hours).
     pub fn window(&self, now: u32, secs: u32) -> Window {
-        let (ring, len) = if secs <= 3600 {
-            (&self.m[..], 60)
-        } else {
-            (&self.h[..], 3600)
-        };
+        let (ring, len) = if secs <= 3600 { (&self.m[..], 60) } else { (&self.h[..], 3600) };
         let from = (now - now % len).saturating_sub(secs - len);
-        let mut w = Window {
-            open: f64::NAN,
-            ..Default::default()
-        };
+        let mut w = Window { open: f64::NAN, ..Default::default() };
         let mut first = u32::MAX;
         for b in ring.iter().filter(|b| b.t >= from && b.t <= now) {
             w.vol += b.vol as f64;
@@ -461,14 +375,12 @@ impl Pool {
 
 impl Candle {
     pub fn encode(&self) -> Vec<u8> {
-        [
-            self.o, self.h, self.l, self.c, self.no, self.nh, self.nl, self.nc, self.v,
-        ]
-        .iter()
-        .fold(W::default(), |w, &x| w.f32(x))
-        .u32(self.buys)
-        .u32(self.sells)
-        .0
+        [self.o, self.h, self.l, self.c, self.no, self.nh, self.nl, self.nc, self.v]
+            .iter()
+            .fold(W::default(), |w, &x| w.f32(x))
+            .u32(self.buys)
+            .u32(self.sells)
+            .0
     }
     pub fn decode(b: &[u8]) -> Candle {
         let mut r = R(b);
@@ -537,20 +449,8 @@ mod tests {
             icon: false,
         };
         let d = Token::decode(&t.encode());
-        assert_eq!(
-            (d.symbol.as_str(), d.decimals, d.best_pool, d.first_block),
-            ("USDC", 6, 7, 9)
-        );
-        let c = Candle {
-            o: 1.0,
-            h: 2.0,
-            l: 0.5,
-            c: 1.5,
-            v: 10.0,
-            buys: 3,
-            sells: 4,
-            ..Default::default()
-        };
+        assert_eq!((d.symbol.as_str(), d.decimals, d.best_pool, d.first_block), ("USDC", 6, 7, 9));
+        let c = Candle { o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 10.0, buys: 3, sells: 4, ..Default::default() };
         assert_eq!(Candle::decode(&c.encode()), c);
     }
 

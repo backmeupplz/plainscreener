@@ -51,34 +51,17 @@ pub struct RawLog {
 #[derive(Debug, PartialEq)]
 pub enum Event {
     /// `origin` is the factory (v2/v3/Solidly) or the hooks contract (v4); it names the DEX.
-    Created {
-        kind: Kind,
-        pool: Id,
-        token0: Addr,
-        token1: Addr,
-        fee: u32,
-        sqrt_price: f64,
-        origin: Addr,
-    },
+    Created { kind: Kind, pool: Id, token0: Addr, token1: Addr, fee: u32, sqrt_price: f64, origin: Addr },
     /// v2/Solidly reserves after a change, raw token units.
     Sync { r0: f64, r1: f64 },
     /// v2/Solidly swap, raw units: pool balance deltas.
     SwapV2 { d0: f64, d1: f64 },
     /// Concentrated-liquidity swap: pool balance deltas (raw), price after, LP fee in pips (v4).
-    SwapCl {
-        d0: f64,
-        d1: f64,
-        sqrt_price: f64,
-        fee: u32,
-    },
+    SwapCl { d0: f64, d1: f64, sqrt_price: f64, fee: u32 },
     /// v3 Mint (+) and Collect (-): tokens entering or leaving the pool.
     Flow { d0: f64, d1: f64 },
     /// v4 liquidity change; token amounts depend on the current price.
-    Modify {
-        tick_lower: i32,
-        tick_upper: i32,
-        liquidity: f64,
-    },
+    Modify { tick_lower: i32, tick_upper: i32, liquidity: f64 },
 }
 
 fn keccak(s: &str) -> [u8; 32] {
@@ -118,9 +101,7 @@ pub static T: LazyLock<Topics> = LazyLock::new(|| Topics {
     v2_swap: keccak("Swap(address,uint256,uint256,uint256,uint256,address)"),
     solidly_swap: keccak("Swap(address,address,uint256,uint256,uint256,uint256)"),
     v3_swap: keccak("Swap(address,address,int256,int256,uint160,uint128,int24)"),
-    pancake_swap: keccak(
-        "Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)",
-    ),
+    pancake_swap: keccak("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)"),
     v3_mint: keccak("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
     v3_collect: keccak("Collect(address,address,int24,int24,uint128,uint128)"),
     v4_swap: keccak("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"),
@@ -158,11 +139,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
     let w = |i: usize| word(&log.data, i);
     let own = pad(&log.address);
     let ev = if t0 == t.v2_pair_created || t0 == t.solidly_pool_created {
-        let kind = if t0 == t.v2_pair_created {
-            Kind::V2
-        } else {
-            Kind::Solidly
-        };
+        let kind = if t0 == t.v2_pair_created { Kind::V2 } else { Kind::Solidly };
         let pool = pad(&addr(w(0)?));
         return created(log, kind, pool, 0, 0.0);
     } else if t0 == t.v3_pool_created {
@@ -171,32 +148,15 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
     } else if t0 == t.slipstream_pool_created {
         return created(log, Kind::V3, pad(&addr(w(0)?)), 0, 0.0);
     } else if t0 == t.v2_sync || t0 == t.solidly_sync {
-        Event::Sync {
-            r0: u256_f64(w(0)?),
-            r1: u256_f64(w(1)?),
-        }
+        Event::Sync { r0: u256_f64(w(0)?), r1: u256_f64(w(1)?) }
     } else if t0 == t.v2_swap || t0 == t.solidly_swap {
-        Event::SwapV2 {
-            d0: u256_f64(w(0)?) - u256_f64(w(2)?),
-            d1: u256_f64(w(1)?) - u256_f64(w(3)?),
-        }
+        Event::SwapV2 { d0: u256_f64(w(0)?) - u256_f64(w(2)?), d1: u256_f64(w(1)?) - u256_f64(w(3)?) }
     } else if t0 == t.v3_swap || t0 == t.pancake_swap {
-        Event::SwapCl {
-            d0: i256_f64(w(0)?),
-            d1: i256_f64(w(1)?),
-            sqrt_price: u256_f64(w(2)?),
-            fee: 0,
-        }
+        Event::SwapCl { d0: i256_f64(w(0)?), d1: i256_f64(w(1)?), sqrt_price: u256_f64(w(2)?), fee: 0 }
     } else if t0 == t.v3_mint {
-        Event::Flow {
-            d0: u256_f64(w(2)?),
-            d1: u256_f64(w(3)?),
-        }
+        Event::Flow { d0: u256_f64(w(2)?), d1: u256_f64(w(3)?) }
     } else if t0 == t.v3_collect {
-        Event::Flow {
-            d0: -u256_f64(w(1)?),
-            d1: -u256_f64(w(2)?),
-        }
+        Event::Flow { d0: -u256_f64(w(1)?), d1: -u256_f64(w(2)?) }
     } else if log.address == V4_POOL_MANAGER {
         let id = *log.topics.get(1)?;
         let ev = if t0 == t.v4_swap {
@@ -208,11 +168,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
                 fee: u256_f64(w(5)?) as u32,
             }
         } else if t0 == t.v4_modify {
-            Event::Modify {
-                tick_lower: i256_i32(w(0)?),
-                tick_upper: i256_i32(w(1)?),
-                liquidity: i256_f64(w(2)?),
-            }
+            Event::Modify { tick_lower: i256_i32(w(0)?), tick_upper: i256_i32(w(1)?), liquidity: i256_f64(w(2)?) }
         } else if t0 == t.v4_initialize {
             let (c0, c1) = (addr(log.topics.get(2)?), addr(log.topics.get(3)?));
             let ev = Event::Created {
@@ -238,18 +194,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
 fn created(log: &RawLog, kind: Kind, pool: Id, fee: u32, sqrt_price: f64) -> Option<(Id, Event)> {
     let token0 = addr(log.topics.get(1)?);
     let token1 = addr(log.topics.get(2)?);
-    Some((
-        pool,
-        Event::Created {
-            kind,
-            pool,
-            token0,
-            token1,
-            fee,
-            sqrt_price,
-            origin: log.address,
-        },
-    ))
+    Some((pool, Event::Created { kind, pool, token0, token1, fee, sqrt_price, origin: log.address }))
 }
 
 /// v4 uses address(0) for native ETH; we price and display it as WETH.
@@ -327,10 +272,7 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
 #[cfg(test)]
@@ -343,26 +285,11 @@ mod tests {
 
     #[test]
     fn known_topics() {
-        assert_eq!(
-            hex(&T.v2_swap),
-            "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
-        );
-        assert_eq!(
-            hex(&T.v3_swap),
-            "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-        );
-        assert_eq!(
-            hex(&T.v2_sync),
-            "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
-        );
-        assert_eq!(
-            hex(&T.v2_pair_created),
-            "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
-        );
-        assert_eq!(
-            hex(&T.v3_pool_created),
-            "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118"
-        );
+        assert_eq!(hex(&T.v2_swap), "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822");
+        assert_eq!(hex(&T.v3_swap), "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+        assert_eq!(hex(&T.v2_sync), "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+        assert_eq!(hex(&T.v2_pair_created), "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9");
+        assert_eq!(hex(&T.v3_pool_created), "0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118");
     }
 
     #[test]
@@ -374,12 +301,7 @@ mod tests {
         five[31] = 5;
         assert_eq!(u256_f64(&five), 5.0);
         assert_eq!(i256_f64(&five), 5.0);
-        assert_eq!(
-            u256_f64(&w(
-                "0x0000000000000000000000000000000000000000000000000de0b6b3a7640000"
-            )),
-            1e18
-        );
+        assert_eq!(u256_f64(&w("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")), 1e18);
     }
 
     #[test]
@@ -393,31 +315,11 @@ mod tests {
         data.extend_from_slice(&pos);
         data.extend_from_slice(&pos); // sqrtPrice
         data.extend_from_slice(&[0; 64]); // liquidity, tick
-        let log = RawLog {
-            topics: vec![T.v3_swap, [0; 32], [0; 32]],
-            data,
-            address: [7; 20],
-            ..Default::default()
-        };
+        let log = RawLog { topics: vec![T.v3_swap, [0; 32], [0; 32]], data, address: [7; 20], ..Default::default() };
         let (id, ev) = decode(&log).unwrap();
         assert_eq!(id, pad(&[7; 20]));
-        assert_eq!(
-            ev,
-            Event::SwapCl {
-                d0: -100.0,
-                d1: 50.0,
-                sqrt_price: 50.0,
-                fee: 0
-            }
-        );
-        let fake_v4 = RawLog {
-            topics: vec![T.v4_swap, [1; 32]],
-            data: vec![0; 192],
-            ..Default::default()
-        };
-        assert!(
-            decode(&fake_v4).is_none(),
-            "v4 events only from the PoolManager"
-        );
+        assert_eq!(ev, Event::SwapCl { d0: -100.0, d1: 50.0, sqrt_price: 50.0, fee: 0 });
+        let fake_v4 = RawLog { topics: vec![T.v4_swap, [1; 32]], data: vec![0; 192], ..Default::default() };
+        assert!(decode(&fake_v4).is_none(), "v4 events only from the PoolManager");
     }
 }

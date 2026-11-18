@@ -22,10 +22,7 @@ pub struct Rpc {
 
 impl Rpc {
     pub fn new(url: &str) -> Rpc {
-        Rpc {
-            url: url.into(),
-            http: reqwest::Client::new(),
-        }
+        Rpc { url: url.into(), http: reqwest::Client::new() }
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -40,15 +37,7 @@ impl Rpc {
             .enumerate()
             .map(|(i, (m, p))| json!({"jsonrpc": "2.0", "id": i, "method": m, "params": p}))
             .collect();
-        let resp: Vec<Value> = self
-            .http
-            .post(&self.url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp: Vec<Value> = self.http.post(&self.url).json(&body).send().await?.error_for_status()?.json().await?;
         let mut out = vec![Value::Null; calls.len()];
         for r in resp {
             let id = r["id"].as_u64().unwrap_or(0) as usize;
@@ -78,52 +67,30 @@ impl Rpc {
         let topics = |ts: Vec<[u8; 32]>| ts.iter().map(|t| hex(t)).collect::<Vec<_>>();
         let res = self
             .batch(vec![
-                (
-                    "eth_getLogs",
-                    json!([range(json!({"topics": [topics(T.any_address())]}))]),
-                ),
-                (
-                    "eth_getLogs",
-                    json!([range(
-                        json!({"address": hex(&V4_POOL_MANAGER), "topics": [topics(T.v4())]})
-                    )]),
-                ),
+                ("eth_getLogs", json!([range(json!({"topics": [topics(T.any_address())]}))])),
+                ("eth_getLogs", json!([range(json!({"address": hex(&V4_POOL_MANAGER), "topics": [topics(T.v4())]}))])),
             ])
             .await?;
-        let mut logs: Vec<RawLog> = res
-            .iter()
-            .flat_map(|r| r.as_array().cloned().unwrap_or_default())
-            .filter_map(|l| parse_log(&l))
-            .collect();
+        let mut logs: Vec<RawLog> =
+            res.iter().flat_map(|r| r.as_array().cloned().unwrap_or_default()).filter_map(|l| parse_log(&l)).collect();
         logs.sort_by_key(|l| (l.block, l.index));
         let mut hashes: Vec<[u8; 32]> = logs.iter().map(|l| l.tx).collect();
         hashes.sort();
         hashes.dedup();
         let mut senders = HashMap::new();
         for chunk in hashes.chunks(200) {
-            let calls = chunk
-                .iter()
-                .map(|h| ("eth_getTransactionByHash", json!([hex(h)])))
-                .collect();
+            let calls = chunk.iter().map(|h| ("eth_getTransactionByHash", json!([hex(h)]))).collect();
             for (h, tx) in chunk.iter().zip(self.batch(calls).await?) {
                 senders.insert(*h, addr20(&tx["from"]).unwrap_or_default());
             }
         }
         let mut blocks: Vec<u32> = logs.iter().map(|l| l.block).collect();
         blocks.dedup();
-        let calls = blocks
-            .iter()
-            .map(|b| ("eth_getBlockByNumber", json!([format!("0x{b:x}"), false])))
-            .collect();
+        let calls = blocks.iter().map(|b| ("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))).collect();
         let times: HashMap<u32, u32> = blocks
             .iter()
             .copied()
-            .zip(
-                self.batch(calls)
-                    .await?
-                    .iter()
-                    .map(|b| num(&b["timestamp"]).unwrap_or(0)),
-            )
+            .zip(self.batch(calls).await?.iter().map(|b| num(&b["timestamp"]).unwrap_or(0)))
             .collect();
         for l in &mut logs {
             l.from = senders.get(&l.tx).copied().unwrap_or_default();
@@ -144,26 +111,13 @@ impl Rpc {
     /// One multicall. When the node rejects the whole call (a token burning all the gas),
     /// split it until the culprit is alone. Network errors propagate so the batch retries:
     /// guessing decimals would corrupt every price of that token for good.
-    fn meta_batch<'a>(
-        &'a self,
-        tokens: &'a [Addr],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Meta>>> + Send + 'a>> {
+    fn meta_batch<'a>(&'a self, tokens: &'a [Addr]) -> Pin<Box<dyn Future<Output = Result<Vec<Meta>>> + Send + 'a>> {
         Box::pin(async move {
-            let calls: Vec<(Addr, [u8; 4])> = tokens
-                .iter()
-                .flat_map(|t| [DECIMALS, SYMBOL, NAME, TOTAL_SUPPLY].map(|sel| (*t, sel)))
-                .collect();
+            let calls: Vec<(Addr, [u8; 4])> =
+                tokens.iter().flat_map(|t| [DECIMALS, SYMBOL, NAME, TOTAL_SUPPLY].map(|sel| (*t, sel))).collect();
             let data = hex(&encode_aggregate3(&calls));
-            let ret = match self
-                .call(
-                    "eth_call",
-                    json!([{"to": MULTICALL3, "data": data}, "latest"]),
-                )
-                .await
-            {
-                Ok(v) => {
-                    decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default())
-                }
+            let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
+                Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
                 Err(e) if e.is::<RpcError>() && tokens.len() > 1 => {
                     let (a, b) = tokens.split_at(tokens.len() / 2);
                     let mut out = self.meta_batch(a).await?;
@@ -174,20 +128,13 @@ impl Rpc {
                 Err(e) => return Err(e),
             };
             if ret.len() != calls.len() {
-                bail!(
-                    "multicall returned {} results for {} calls",
-                    ret.len(),
-                    calls.len()
-                );
+                bail!("multicall returned {} results for {} calls", ret.len(), calls.len());
             }
             Ok((0..tokens.len())
                 .map(|i| {
                     let get = |k: usize| ret[i * 4 + k].as_deref();
                     // Tokens without decimals() are treated as 18, like most wallets do.
-                    let decimals = get(0)
-                        .filter(|d| d.len() == 32)
-                        .map(|d| d[31].min(36))
-                        .unwrap_or(18);
+                    let decimals = get(0).filter(|d| d.len() == 32).map(|d| d[31].min(36)).unwrap_or(18);
                     let scale = 10f64.powi(decimals as i32);
                     Meta {
                         decimals,
@@ -207,25 +154,12 @@ impl Rpc {
     pub async fn strings(&self, token: Addr, sels: &[[u8; 4]]) -> Result<Vec<Option<String>>> {
         let calls: Vec<(Addr, [u8; 4])> = sels.iter().map(|s| (token, *s)).collect();
         let data = hex(&encode_aggregate3(&calls));
-        let ret = match self
-            .call(
-                "eth_call",
-                json!([{"to": MULTICALL3, "data": data}, "latest"]),
-            )
-            .await
-        {
+        let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
             Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
             Err(e) if e.is::<RpcError>() => vec![None; sels.len()],
             Err(e) => return Err(e),
         };
-        Ok(ret
-            .iter()
-            .map(|r| {
-                r.as_deref()
-                    .map(|d| text(d, 1 << 20))
-                    .filter(|s| !s.is_empty())
-            })
-            .collect())
+        Ok(ret.iter().map(|r| r.as_deref().map(|d| text(d, 1 << 20)).filter(|s| !s.is_empty())).collect())
     }
 }
 
@@ -255,11 +189,7 @@ fn parse_log(l: &Value) -> Option<RawLog> {
         ts: 0,
         index: num(&l["logIndex"])?,
         address: addr20(&l["address"])?,
-        topics: l["topics"]
-            .as_array()?
-            .iter()
-            .filter_map(|t| unhex(t.as_str()?)?.try_into().ok())
-            .collect(),
+        topics: l["topics"].as_array()?.iter().filter_map(|t| unhex(t.as_str()?)?.try_into().ok()).collect(),
         data: unhex(l["data"].as_str()?)?,
         tx: unhex(l["transactionHash"].as_str()?)?.try_into().ok()?,
         from: [0; 20],
@@ -327,13 +257,7 @@ fn text(d: &[u8], max: usize) -> String {
     } else {
         d.split(|&c| c == 0).next().unwrap_or_default()
     };
-    String::from_utf8_lossy(raw)
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(max)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    String::from_utf8_lossy(raw).chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
 }
 
 #[cfg(test)]

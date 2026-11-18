@@ -8,7 +8,7 @@ use crate::state::State;
 use crate::{App, og};
 use axum::Router;
 use axum::extract::{Path, Query, State as Ax};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -31,14 +31,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/og/base/{file}", get(og_pair))
         .route("/og.png", get(|| async { png_static(&SITE_PNG) }))
         .route("/icon.png", get(|| async { png_static(&ICON_PNG) }))
-        .route(
-            "/favicon.svg",
-            get(|| async { cached("image/svg+xml", 86_400, pages::LOGO) }),
-        )
-        .route(
-            "/favicon.ico",
-            get(|| async { Redirect::permanent("/favicon.svg") }),
-        )
+        .route("/favicon.svg", get(|| async { cached("image/svg+xml", 86_400, pages::LOGO) }))
+        .route("/favicon.ico", get(|| async { Redirect::permanent("/favicon.svg") }))
         .route("/robots.txt", get(robots))
         .route("/sitemap.xml", get(sitemap))
         .route("/a/{file}", get(asset))
@@ -46,25 +40,15 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/candles/{id}", get(candles))
         .route("/api/live/{id}", get(live))
         .route("/healthz", get(health))
-        .fallback(
-            |Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) },
-        )
+        .fallback(|Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) })
         .layer(axum::middleware::from_fn(no_www))
         .with_state(app)
 }
 
 async fn no_www(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
+    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
     if let Some(apex) = host.strip_prefix("www.") {
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
+        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
         return Redirect::permanent(&format!("https://{apex}{path}")).into_response();
     }
     next.run(req).await
@@ -84,26 +68,15 @@ fn cached(ctype: &'static str, secs: u32, body: impl IntoResponse) -> Response {
 fn html(body: String, edge: u32) -> Response {
     let mut r = body.into_response();
     let h = r.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    if let Ok(v) = HeaderValue::from_str(&format!(
-        "public, max-age=0, s-maxage={edge}, stale-while-revalidate=60"
-    )) {
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    if let Ok(v) = HeaderValue::from_str(&format!("public, max-age=0, s-maxage={edge}, stale-while-revalidate=60")) {
         h.insert(header::CACHE_CONTROL, v);
     }
     if let Ok(v) = HeaderValue::from_str(&pages::CSP) {
         h.insert(header::CONTENT_SECURITY_POLICY, v);
     }
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("strict-origin-when-cross-origin"));
     r
 }
 
@@ -126,10 +99,7 @@ fn resolve(st: &State, id: &str) -> Option<Found> {
             }
             st.token_ix.get(&a).map(|&t| Found::Token(t))
         }
-        32 => st
-            .pool_ix
-            .get(&<[u8; 32]>::try_from(bytes).ok()?)
-            .map(|&p| Found::Pool(p)),
+        32 => st.pool_ix.get(&<[u8; 32]>::try_from(bytes).ok()?).map(|&p| Found::Pool(p)),
         _ => None,
     }
 }
@@ -147,11 +117,7 @@ struct HomeQ {
 }
 
 async fn home(Ax(app): A, Query(q): Query<HomeQ>) -> Response {
-    let tab = pages::TABS
-        .iter()
-        .find(|t| Some(t.1) == q.tab.as_deref())
-        .map(|t| t.0)
-        .unwrap_or(Tab::Trending);
+    let tab = pages::TABS.iter().find(|t| Some(t.1) == q.tab.as_deref()).map(|t| t.0).unwrap_or(Tab::Trending);
     let pools = app.list(tab);
     html(pages::home(&app, &read(&app), tab, &pools), 15)
 }
@@ -179,11 +145,7 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
         .filter(|(sym, name, _)| sym.starts_with(&needle) || name.contains(&needle))
         .filter_map(|(sym, _, t)| {
             let p = pages::best_pool(&st, *t)?;
-            Some((
-                (*sym == needle, st.pools[p as usize].trusted()),
-                st.liq(p),
-                p,
-            ))
+            Some(((*sym == needle, st.pools[p as usize].trusted()), st.liq(p), p))
         })
         .collect();
     hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
@@ -216,19 +178,14 @@ fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Res
         Found::Token(t) => match pages::best_pool(&st, t) {
             Some(p) => {
                 let prefix = if embed { "/embed/base" } else { "/base" };
-                return Redirect::to(&format!("{prefix}/{}", st.pools[p as usize].key()))
-                    .into_response();
+                return Redirect::to(&format!("{prefix}/{}", st.pools[p as usize].key())).into_response();
             }
             None => {
                 return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response();
             }
         },
     };
-    let ri = q
-        .res
-        .as_deref()
-        .and_then(res_index)
-        .unwrap_or_else(|| pages::default_res(&st, p, 2));
+    let ri = q.res.as_deref().and_then(res_index).unwrap_or_else(|| pages::default_res(&st, p, 2));
     // Cached for a minute at the edge: the live stream brings a stale copy up to date
     // as soon as it connects.
     html(pages::pair(&app, &st, &app.sh.store, p, ri, embed), 60)
@@ -249,11 +206,7 @@ async fn og_pair(Ax(app): A, Path(file): Path<String>, Query(q): Query<OgQ>) -> 
         };
         (p, st.head_ts / 60)
     };
-    if let Some((m, png)) = app
-        .og
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(p, fc))
+    if let Some((m, png)) = app.og.lock().unwrap_or_else(|e| e.into_inner()).get(&(p, fc))
         && *m == minute
     {
         return cached("image/png", 300, png.to_vec());
@@ -270,10 +223,7 @@ async fn og_pair(Ax(app): A, Path(file): Path<String>, Query(q): Query<OgQ>) -> 
     match png {
         Ok(Ok(png)) => {
             let png = Arc::new(png);
-            app.og
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((p, fc), (minute, png.clone()));
+            app.og.lock().unwrap_or_else(|e| e.into_inner()).insert((p, fc), (minute, png.clone()));
             cached("image/png", 300, png.to_vec())
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -282,18 +232,14 @@ async fn og_pair(Ax(app): A, Path(file): Path<String>, Query(q): Query<OgQ>) -> 
 
 static SITE_PNG: std::sync::LazyLock<Vec<u8>> =
     std::sync::LazyLock::new(|| og::png(&og::site_card()).unwrap_or_default());
-static ICON_PNG: std::sync::LazyLock<Vec<u8>> =
-    std::sync::LazyLock::new(|| og::png(&og::icon()).unwrap_or_default());
+static ICON_PNG: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| og::png(&og::icon()).unwrap_or_default());
 
 fn png_static(bytes: &'static [u8]) -> Response {
     cached("image/png", 86_400, bytes)
 }
 
 async fn robots(Ax(app): A) -> Response {
-    let body = format!(
-        "User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: {}/sitemap.xml\n",
-        app.cfg.public_url
-    );
+    let body = format!("User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: {}/sitemap.xml\n", app.cfg.public_url);
     cached("text/plain; charset=utf-8", 3600, body)
 }
 
@@ -304,10 +250,7 @@ async fn sitemap(Ax(app): A) -> Response {
 async fn asset(Ax(app): A, Path(file): Path<String>) -> Response {
     let immutable = |ctype, body: &'static [u8]| {
         let mut r = cached(ctype, 31_536_000, body);
-        r.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        );
+        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
         r
     };
     if file == app.js_file {
@@ -321,14 +264,8 @@ async fn asset(Ax(app): A, Path(file): Path<String>) -> Response {
 
 /// A token icon (always a PNG we drew, see `icons`).
 async fn icon(Ax(app): A, Path(file): Path<String>) -> Response {
-    let addr = file
-        .strip_suffix(".png")
-        .and_then(unhex)
-        .filter(|a| a.len() == 20);
-    match addr
-        .and_then(|a| app.sh.store.icons.get(a).ok().flatten())
-        .filter(|v| v.len() > 4)
-    {
+    let addr = file.strip_suffix(".png").and_then(unhex).filter(|a| a.len() == 20);
+    match addr.and_then(|a| app.sh.store.icons.get(a).ok().flatten()).filter(|v| v.len() > 4) {
         Some(png) => cached("image/png", 86_400, png.to_vec()),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -346,14 +283,7 @@ async fn candles(Ax(app): A, Path(id): Path<String>, Query(q): Query<CandlesQ>) 
         return StatusCode::NOT_FOUND.into_response();
     };
     let ri = RES.iter().position(|&r| Some(r) == q.res).unwrap_or(2);
-    let data = pages::chart_data(
-        &st,
-        &app.sh.store,
-        p,
-        ri,
-        q.before.unwrap_or(u32::MAX),
-        pages::CHART_CANDLES,
-    );
+    let data = pages::chart_data(&st, &app.sh.store, p, ri, q.before.unwrap_or(u32::MAX), pages::CHART_CANDLES);
     let edge = if q.before.is_some() { 3600 } else { 3 };
     let mut r = cached("application/json", 0, pages::candles_json(&data));
     if let Ok(v) = HeaderValue::from_str(&format!("public, max-age=0, s-maxage={edge}")) {
@@ -367,13 +297,14 @@ struct LiveQ {
     after: Option<String>,
 }
 
-async fn live(Ax(app): A, Path(id): Path<String>, Query(q): Query<LiveQ>) -> Response {
+async fn live(Ax(app): A, Path(id): Path<String>, Query(q): Query<LiveQ>, headers: HeaderMap) -> Response {
     let Some(p) = pool_of(&read(&app), &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let mut after = q
-        .after
-        .as_deref()
+    // A reconnecting EventSource reports the last trade it got as the last event id.
+    let last_id = headers.get("last-event-id").and_then(|v| v.to_str().ok());
+    let mut after = last_id
+        .or(q.after.as_deref())
         .and_then(|a| a.split_once('-'))
         .and_then(|(b, i)| Some((b.parse().ok()?, i.parse().ok()?)))
         .unwrap_or((0, 0));
@@ -381,7 +312,9 @@ async fn live(Ax(app): A, Path(id): Path<String>, Query(q): Query<LiveQ>) -> Res
     let rx = app.sh.live.subscribe();
     let (first, newest) = pages::live(&read(&app), &app.sh.store, p, after);
     after = newest;
-    let first = tokio_stream::once(Ok::<_, Infallible>(Event::default().data(first)));
+    let event =
+        |json: String, (b, i): (u32, u32)| Ok::<_, Infallible>(Event::default().id(format!("{b}-{i}")).data(json));
+    let first = tokio_stream::once(event(first, after));
     let stream = first.chain(BroadcastStream::new(rx).filter_map(move |msg| {
         let touched = msg.ok()?;
         if !touched.contains(&p) {
@@ -389,24 +322,16 @@ async fn live(Ax(app): A, Path(id): Path<String>, Query(q): Query<LiveQ>) -> Res
         }
         let (json, newest) = pages::live(&read(&app), &app.sh.store, p, after);
         after = newest;
-        Some(Ok::<_, Infallible>(Event::default().data(json)))
+        Some(event(json, after))
     }));
-    let mut r = Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
-        .into_response();
-    r.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-transform"),
-    );
+    let mut r = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(20))).into_response();
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-transform"));
     r
 }
 
 async fn health(Ax(app): A) -> Response {
     let st = read(&app);
-    let lag = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64)
+    let lag = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64)
         - st.head_ts as i64;
     let live = lag < 120;
     let body = format!(
@@ -416,14 +341,9 @@ async fn health(Ax(app): A) -> Response {
         st.pools.len(),
         st.tokens.len()
     );
-    let code = if live {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
+    let code = if live { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let mut r = (code, body).into_response();
-    r.headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     r
 }
 
@@ -453,9 +373,7 @@ pub async fn search_index(app: Arc<App>) {
             st.tokens
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| {
-                    t.best_pool != crate::state::NONE && st.liq(t.best_pool) >= 1_000.0
-                })
+                .filter(|(_, t)| t.best_pool != crate::state::NONE && st.liq(t.best_pool) >= 1_000.0)
                 .map(|(i, t)| (t.symbol.to_lowercase(), t.name.to_lowercase(), i as u32))
                 .collect()
         };

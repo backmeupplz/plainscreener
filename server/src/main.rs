@@ -46,9 +46,7 @@ impl Config {
             sqd_url: var("SQD_URL", "https://portal.sqd.dev/datasets/base-mainnet"),
             start_block: var("START_BLOCK", "0").parse().unwrap_or(0),
             listen: var("LISTEN", "0.0.0.0:8080"),
-            public_url: var("PUBLIC_URL", "https://plainscreener.com")
-                .trim_end_matches('/')
-                .to_string(),
+            public_url: var("PUBLIC_URL", "https://plainscreener.com").trim_end_matches('/').to_string(),
             index: var("INDEX", "1") != "0",
         }
     }
@@ -81,9 +79,7 @@ type OgCache = HashMap<(u32, bool), (u32, Arc<Vec<u8>>)>;
 
 /// FNV-1a, for cache-busting asset names.
 fn hash(bytes: &[u8]) -> String {
-    let h = bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
-        (h ^ b as u64).wrapping_mul(0x100000001b3)
-    });
+    let h = bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
     format!("{:08x}", h as u32)
 }
 
@@ -93,21 +89,9 @@ async fn main() -> Result<()> {
     let store = Store::open(&cfg.data_dir)?;
     let started = std::time::Instant::now();
     let state = State::load(&store)?;
-    eprintln!(
-        "loaded {} pools, {} tokens in {:.1?}",
-        state.pools.len(),
-        state.tokens.len(),
-        started.elapsed()
-    );
-    let sh = Shared {
-        store,
-        state: Arc::new(RwLock::new(state)),
-        live: broadcast::channel(1024).0,
-    };
-    let (js_file, wasm_file) = (
-        format!("app.{}.js", hash(JS.as_bytes())),
-        format!("chart.{}.wasm", hash(WASM)),
-    );
+    eprintln!("loaded {} pools, {} tokens in {:.1?}", state.pools.len(), state.tokens.len(), started.elapsed());
+    let sh = Shared { store, state: Arc::new(RwLock::new(state)), live: broadcast::channel(1024).0 };
+    let (js_file, wasm_file) = (format!("app.{}.js", hash(JS.as_bytes())), format!("chart.{}.wasm", hash(WASM)));
     let app = Arc::new(App {
         css: pages::page_css(),
         js_url: format!("/a/{js_file}"),

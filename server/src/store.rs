@@ -55,43 +55,23 @@ impl Store {
 
     /// The next block to index and the timestamp of the last indexed one.
     pub fn cursor(&self) -> Result<Option<(u32, u32)>> {
-        Ok(self
-            .meta
-            .get("cursor")?
-            .map(|v| (be32(&v[..4]), be32(v.get(4..8).unwrap_or_default()))))
+        Ok(self.meta.get("cursor")?.map(|v| (be32(&v[..4]), be32(v.get(4..8).unwrap_or_default()))))
     }
 
     pub fn set_cursor(&self, batch: &mut fjall::OwnedWriteBatch, block: u32, ts: u32) {
-        batch.insert(
-            &self.meta,
-            "cursor",
-            [block.to_be_bytes(), ts.to_be_bytes()].concat(),
-        );
+        batch.insert(&self.meta, "cursor", [block.to_be_bytes(), ts.to_be_bytes()].concat());
     }
 
     pub fn load_tokens(&self) -> Result<Vec<Token>> {
-        self.tokens
-            .range::<&[u8], _>(..)
-            .map(|g| Ok(Token::decode(&g.into_inner()?.1)))
-            .collect()
+        self.tokens.range::<&[u8], _>(..).map(|g| Ok(Token::decode(&g.into_inner()?.1))).collect()
     }
 
     pub fn load_pools(&self) -> Result<Vec<Pool>> {
-        self.pools
-            .range::<&[u8], _>(..)
-            .map(|g| Ok(Pool::decode(&g.into_inner()?.1)))
-            .collect()
+        self.pools.range::<&[u8], _>(..).map(|g| Ok(Pool::decode(&g.into_inner()?.1))).collect()
     }
 
     /// Up to `limit` candles before `before` (exclusive), oldest first.
-    pub fn candles(
-        &self,
-        pool: u32,
-        res: usize,
-        from: u32,
-        before: u32,
-        limit: usize,
-    ) -> Vec<(u32, Candle)> {
+    pub fn candles(&self, pool: u32, res: usize, from: u32, before: u32, limit: usize) -> Vec<(u32, Candle)> {
         let mut out: Vec<_> = self
             .candles
             .range(candle_key(pool, res, from)..candle_key(pool, res, before))
@@ -110,15 +90,6 @@ impl Store {
             .range(trade_key(pool, 0, 0)..trade_key(pool, before.0, before.1))
             .rev()
             .take(limit)
-            .filter_map(|g| g.into_inner().ok())
-            .map(|(k, v)| ((be32(&k[4..8]), be32(&k[8..12])), Trade::decode(&v)))
-            .collect()
-    }
-
-    /// Trades newer than `after`, oldest first.
-    pub fn trades_after(&self, pool: u32, after: (u32, u32)) -> Vec<((u32, u32), Trade)> {
-        self.trades
-            .range(trade_key(pool, after.0, after.1 + 1)..trade_key(pool + 1, 0, 0))
             .filter_map(|g| g.into_inner().ok())
             .map(|(k, v)| ((be32(&k[4..8]), be32(&k[8..12])), Trade::decode(&v)))
             .collect()

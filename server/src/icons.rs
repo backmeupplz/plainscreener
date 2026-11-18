@@ -22,23 +22,18 @@ const RETRY: u32 = 86_400;
 /// Only tokens with a pool at least this deep get an icon (the rest never reach a list).
 const MIN_LIQ: f64 = 1_000.0;
 const LIST: &str = "https://tokens.coingecko.com/base/all.json";
-const IPFS: [&str; 2] = [
-    "https://magic.decentralized-content.com/ipfs/",
-    "https://gateway.pinata.cloud/ipfs/",
-];
+const IPFS: [&str; 2] = ["https://magic.decentralized-content.com/ipfs/", "https://gateway.pinata.cloud/ipfs/"];
 /// imageUrl(), image(), tokenURI(), contractURI()
-const GETTERS: [[u8; 4]; 4] = [
-    [0xab, 0xa8, 0x31, 0x50],
-    [0xf3, 0xcc, 0xaa, 0xc0],
-    [0x3c, 0x13, 0x0d, 0x90],
-    [0xe8, 0xa3, 0xd4, 0x85],
-];
+const GETTERS: [[u8; 4]; 4] =
+    [[0xab, 0xa8, 0x31, 0x50], [0xf3, 0xcc, 0xaa, 0xc0], [0x3c, 0x13, 0x0d, 0x90], [0xe8, 0xa3, 0xd4, 0x85]];
 
 pub async fn run(app: Arc<App>) {
     let http = client();
     let rpc = Rpc::new(&app.cfg.rpc_url);
     let mut list = Arc::new(HashMap::new());
     let mut list_at: Option<Instant> = None;
+    // Tokens whose lookup failed for a passing reason (rate limit, timeout), and when.
+    let mut backoff: HashMap<Addr, Instant> = HashMap::new();
     loop {
         if list_at.is_none_or(|t| t.elapsed() > Duration::from_secs(86_400)) {
             match coingecko(&http).await {
@@ -46,14 +41,21 @@ pub async fn run(app: Arc<App>) {
                 Err(e) => eprintln!("icons: token list: {e:#}"),
             }
         }
-        let mut set = tokio::task::JoinSet::new();
-        for (t, addr) in todo(&app) {
-            if set.len() >= 4 {
-                set.join_next().await;
-            }
-            let (app, http, rpc, list) = (app.clone(), http.clone(), rpc.clone(), list.clone());
-            set.spawn(async move {
-                match find(&http, &rpc, &list, addr).await {
+        // Without the list, established tokens would be marked icon-less.
+        if list_at.is_some() {
+            backoff.retain(|_, at| at.elapsed() < Duration::from_secs(3600));
+            let mut todo = todo(&app, &backoff).into_iter();
+            let mut set = tokio::task::JoinSet::new();
+            loop {
+                while set.len() < 4
+                    && let Some((t, addr)) = todo.next()
+                {
+                    let (http, rpc, list) = (http.clone(), rpc.clone(), list.clone());
+                    set.spawn(async move { (t, addr, find(&http, &rpc, &list, addr).await) });
+                }
+                let Some(done) = set.join_next().await else { break };
+                let Ok((t, addr, found)) = done else { continue };
+                match found {
                     Ok(Some(png)) => {
                         if app.sh.store.icons.insert(addr, png).is_ok()
                             && let Ok(mut s) = app.sh.state.write()
@@ -62,117 +64,112 @@ pub async fn run(app: Arc<App>) {
                         }
                     }
                     Ok(None) => drop(app.sh.store.icons.insert(addr, now().to_be_bytes())),
-                    Err(_) => {} // node unreachable: try again next round
+                    Err(_) => drop(backoff.insert(addr, Instant::now())),
                 }
-            });
+            }
         }
-        while set.join_next().await.is_some() {}
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
 fn now() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
 }
 
-/// Up to 100 tokens worth an icon that we haven't tried lately, deepest pools first.
-fn todo(app: &App) -> Vec<(u32, Addr)> {
-    let mut out: Vec<(f64, u32, Addr)> = {
-        let Ok(st) = app.sh.state.read() else {
-            return Vec::new();
-        };
+/// Up to 100 tokens worth an icon: never tried first, then ones whose last miss is a day
+/// old; deepest pools first within each.
+fn todo(app: &App, backoff: &HashMap<Addr, Instant>) -> Vec<(u32, Addr)> {
+    let tokens: Vec<(f64, u32, Addr)> = {
+        let Ok(st) = app.sh.state.read() else { return Vec::new() };
         st.tokens
             .iter()
             .enumerate()
-            .filter(|(_, t)| !t.icon && t.best_pool != NONE)
+            .filter(|(_, t)| !t.icon && t.best_pool != NONE && !backoff.contains_key(&t.addr))
             .map(|(i, t)| (st.liq(t.best_pool), i as u32, t.addr))
             .filter(|(liq, ..)| *liq >= MIN_LIQ)
             .collect()
     };
     let cutoff = now().saturating_sub(RETRY);
-    out.retain(|(.., a)| match app.sh.store.icons.get(a) {
-        Ok(Some(v)) => {
-            v.len() == 4 && u32::from_be_bytes(v[..4].try_into().unwrap_or_default()) < cutoff
-        }
-        Ok(None) => true,
-        Err(_) => false,
-    });
-    out.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-    out.into_iter().take(100).map(|(_, t, a)| (t, a)).collect()
+    let mut out: Vec<(bool, f64, u32, Addr)> = tokens
+        .into_iter()
+        .filter_map(|(liq, t, a)| match app.sh.store.icons.get(a) {
+            Ok(None) => Some((false, liq, t, a)),
+            Ok(Some(v)) if v.len() == 4 && u32::from_be_bytes(v[..4].try_into().unwrap_or_default()) < cutoff => {
+                Some((true, liq, t, a))
+            }
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+    out.into_iter().take(100).map(|(.., t, a)| (t, a)).collect()
 }
 
-/// The first usable icon from the token list or the token's own getters.
-/// Errors only when the node can't be reached.
-async fn find(
-    http: &reqwest::Client,
-    rpc: &Rpc,
-    list: &HashMap<Addr, String>,
-    addr: Addr,
-) -> Result<Option<Vec<u8>>> {
+/// The first usable icon from the token list or the token's own getters. `Ok(None)`: the
+/// token has none. `Err`: something failed that may work later (node, rate limit, timeout).
+async fn find(http: &reqwest::Client, rpc: &Rpc, list: &HashMap<Addr, String>, addr: Addr) -> Result<Option<Vec<u8>>> {
     let mut urls: Vec<String> = list.get(&addr).cloned().into_iter().collect();
     urls.extend(rpc.strings(addr, &GETTERS).await?.into_iter().flatten());
     for url in urls {
-        let Some(mut bytes) = get(http, &url).await else {
-            continue;
-        };
+        let Some(mut bytes) = get(http, &url).await? else { continue };
         // Metadata JSON (tokenURI and friends) points at the image.
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let Some(img) = v["image"].as_str() else {
-                continue;
-            };
-            let Some(b) = get(http, img).await else {
-                continue;
-            };
+            let Some(img) = v["image"].as_str() else { continue };
+            let Some(b) = get(http, img).await? else { continue };
             bytes = b;
         }
-        if let Ok(Some(png)) = tokio::task::spawn_blocking(move || og::icon_png(&bytes, SIZE)).await
-        {
+        if let Ok(Some(png)) = tokio::task::spawn_blocking(move || og::icon_png(&bytes, SIZE)).await {
             return Ok(Some(png));
         }
     }
     Ok(None)
 }
 
-/// Contents of a `data:`, `ipfs://` or `https://` URL, up to `MAX_BYTES`.
-async fn get(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+/// Contents of a `data:`, `ipfs://` or `https://` URL, up to `MAX_BYTES`; errors as `fetch`.
+async fn get(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>> {
     let url = url.trim();
     if let Some(d) = url.strip_prefix("data:") {
-        let (meta, body) = d.split_once(',')?;
-        return if meta.ends_with(";base64") {
+        let Some((meta, body)) = d.split_once(',') else { return Ok(None) };
+        return Ok(if meta.ends_with(";base64") {
             STANDARD.decode(body.trim()).ok()
         } else {
             Some(body.as_bytes().to_vec())
-        };
+        });
     }
     if let Some(path) = url.strip_prefix("ipfs://") {
         let path = path.trim_start_matches("ipfs/");
+        let mut err = None;
         for g in IPFS {
-            if let Some(b) = fetch(http, &format!("{g}{path}")).await {
-                return Some(b);
+            match fetch(http, &format!("{g}{path}")).await {
+                Ok(Some(b)) => return Ok(Some(b)),
+                Ok(None) => {}
+                Err(e) => err = Some(e),
             }
         }
-        return None;
+        return err.map_or(Ok(None), Err);
     }
     fetch(http, url).await
 }
 
-async fn fetch(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let url = reqwest::Url::parse(url).ok().filter(allowed)?;
-    let mut r = http.get(url).send().await.ok()?.error_for_status().ok()?;
-    if r.content_length().is_some_and(|n| n > MAX_BYTES as u64) {
-        return None;
+/// `Ok(None)` when the URL is not allowed, missing or too big; `Err` when the request
+/// failed in a way that may pass (no answer, 429, 5xx).
+async fn fetch(http: &reqwest::Client, url: &str) -> Result<Option<Vec<u8>>> {
+    let Some(url) = reqwest::Url::parse(url).ok().filter(allowed) else { return Ok(None) };
+    let mut r = http.get(url).send().await?;
+    let status = r.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        anyhow::bail!("{status}");
+    }
+    if !status.is_success() || r.content_length().is_some_and(|n| n > MAX_BYTES as u64) {
+        return Ok(None);
     }
     let mut out = Vec::new();
-    while let Some(c) = r.chunk().await.ok()? {
+    while let Some(c) = r.chunk().await? {
         out.extend_from_slice(&c);
         if out.len() > MAX_BYTES {
-            return None;
+            return Ok(None);
         }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Token URLs are anyone's to choose, and this box shares a network with the Base node:
@@ -217,10 +214,8 @@ struct PublicDns;
 impl reqwest::dns::Resolve for PublicDns {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), 0))
-                .await?
-                .filter(|a| public(a.ip()))
-                .collect();
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.filter(|a| public(a.ip())).collect();
             if addrs.is_empty() {
                 return Err("no public address".into());
             }
@@ -236,11 +231,7 @@ fn client() -> reqwest::Client {
         .timeout(Duration::from_secs(15))
         .user_agent("plainscreener (+https://plainscreener.com)")
         .redirect(reqwest::redirect::Policy::custom(|a| {
-            if a.previous().len() >= 3 || !allowed(a.url()) {
-                a.stop()
-            } else {
-                a.follow()
-            }
+            if a.previous().len() >= 3 || !allowed(a.url()) { a.stop() } else { a.follow() }
         }))
         .build()
         .unwrap_or_default()
@@ -248,13 +239,7 @@ fn client() -> reqwest::Client {
 
 /// CoinGecko's Base list: token → 250 px logo URL.
 async fn coingecko(http: &reqwest::Client) -> Result<HashMap<Addr, String>> {
-    let v: serde_json::Value = http
-        .get(LIST)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let v: serde_json::Value = http.get(LIST).send().await?.error_for_status()?.json().await?;
     Ok(v["tokens"]
         .as_array()
         .into_iter()
@@ -291,8 +276,14 @@ mod tests {
         }
         assert!(!allowed(&"http://example.com/a.png".parse().unwrap()));
         assert!(!allowed(&"https://10.0.0.1/a.png".parse().unwrap()));
-        assert!(allowed(
-            &"https://assets.coingecko.com/a.png".parse().unwrap()
-        ));
+        assert!(allowed(&"https://assets.coingecko.com/a.png".parse().unwrap()));
+    }
+
+    #[test]
+    fn redraws_rasters_only() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200"><rect width="300" height="200" fill="red"/></svg>"#;
+        assert!(og::icon_png(svg.as_bytes(), SIZE).is_none());
+        let png = og::icon_png(&og::png(svg).unwrap(), SIZE).unwrap();
+        assert_eq!(imagesize::blob_size(&png).map(|d| (d.width, d.height)).ok(), Some((64, 64)));
     }
 }

@@ -40,11 +40,7 @@ pub const PALETTE: [(&str, &str, &str); 25] = [
     ("accent", "#2d63ea", "#2d63ea"),
     ("accent2", "#1f53d6", "#3d72f5"),
     ("ring", "rgba(45,99,234,0.2)", "rgba(45,99,234,0.35)"),
-    (
-        "shadow",
-        "0 1px 2px rgba(0,0,0,0.04)",
-        "0 12px 32px -16px rgba(0,0,0,0.65)",
-    ),
+    ("shadow", "0 1px 2px rgba(0,0,0,0.04)", "0 12px 32px -16px rgba(0,0,0,0.65)"),
     ("white", "#ffffff", "#ffffff"),
     // Which icon the theme button shows.
     ("sun", "none", "block"),
@@ -59,22 +55,14 @@ const CHART_CSS: &str = ".ch .g{stroke:{grid};fill:none}.ch .u{fill:{up}}.ch .d{
 
 /// Chart CSS with colors from `value(name)`.
 pub fn chart_css(value: impl Fn(&str) -> String) -> String {
-    PALETTE
-        .iter()
-        .fold(CHART_CSS.to_string(), |css, (name, ..)| {
-            css.replace(&format!("{{{name}}}"), &value(name))
-        })
+    PALETTE.iter().fold(CHART_CSS.to_string(), |css, (name, ..)| css.replace(&format!("{{{name}}}"), &value(name)))
 }
 
 /// The whole page stylesheet, inlined into every page. The system theme applies unless
 /// the theme button set `data-theme` on `<html>`.
 pub fn page_css() -> String {
     let vars = |dark: bool| {
-        PALETTE
-            .iter()
-            .map(|(n, l, d)| format!("--{n}:{}", if dark { d } else { l }))
-            .collect::<Vec<_>>()
-            .join(";")
+        PALETTE.iter().map(|(n, l, d)| format!("--{n}:{}", if dark { d } else { l })).collect::<Vec<_>>().join(";")
     };
     let (light, dark) = (vars(false), vars(true));
     format!(
@@ -89,15 +77,13 @@ pub fn page_css() -> String {
 const THEME_JS: &str = r##"try{var t=localStorage.getItem("theme");if(t){document.documentElement.dataset.theme=t;document.querySelectorAll("meta[name=theme-color]").forEach(function(m){m.content=t=="dark"?"#000000":"#fafafa"})}}catch(e){}"##;
 
 /// Chrome prerenders a pair page while the pointer rests on its link, so it opens instantly.
-const SPECULATION: &str =
-    r#"{"prerender":[{"where":{"href_matches":"/base/*"},"eagerness":"moderate"}]}"#;
+const SPECULATION: &str = r#"{"prerender":[{"where":{"href_matches":"/base/*"},"eagerness":"moderate"}]}"#;
 
 /// The page CSP: our own scripts plus the two inline ones above, by hash.
 pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     use base64::Engine;
     let hash = |js: &str| {
-        base64::engine::general_purpose::STANDARD
-            .encode(ring::digest::digest(&ring::digest::SHA256, js.as_bytes()))
+        base64::engine::general_purpose::STANDARD.encode(ring::digest::digest(&ring::digest::SHA256, js.as_bytes()))
     };
     format!(
         "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{}' 'sha256-{}'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'",
@@ -169,10 +155,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         );
     }
     if let Some((img, launch)) = &h.miniapp {
-        for (name, action) in [
-            ("fc:miniapp", "launch_miniapp"),
-            ("fc:frame", "launch_frame"),
-        ] {
+        for (name, action) in [("fc:miniapp", "launch_miniapp"), ("fc:frame", "launch_frame")] {
             let card = serde_json::json!({
                 "version": "1",
                 "imageUrl": img,
@@ -182,11 +165,7 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
                     "splashBackgroundColor": "#000000"
                 }}
             });
-            let _ = write!(
-                meta,
-                r#"<meta name="{name}" content="{}">"#,
-                Esc(&card.to_string())
-            );
+            let _ = write!(meta, r#"<meta name="{name}" content="{}">"#, Esc(&card.to_string()));
         }
     }
     let header = if h.embed {
@@ -199,16 +178,9 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
     };
     // While the indexer replays history, say so instead of passing old data off as live.
     let head = app.sh.state.read().map(|s| s.head_ts).unwrap_or(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let header = if !h.embed && now > head as u64 + 600 {
-        let at = if head == 0 {
-            "the start".to_string()
-        } else {
-            s(|o| fmt::date_year(o, head as i64))
-        };
+        let at = if head == 0 { "the start".to_string() } else { s(|o| fmt::date_year(o, head as i64)) };
         format!(
             r#"{header}<div class="wrap"><p class="note">Still replaying Base history, now at {at}. Prices and lists here are from that day until the indexer reaches the present.</p></div>"#
         )
@@ -246,23 +218,9 @@ pub fn metrics(st: &State, p: u32) -> Metrics {
     let pool = &st.pools[p as usize];
     let base = &st.tokens[pool.base() as usize];
     let stats = st.stats.get(&p);
-    let w = WINDOWS.map(|(_, secs)| {
-        stats
-            .map(|s| s.window(st.head_ts, secs))
-            .unwrap_or_default()
-    });
-    let price = if pool.price_usd.is_finite() {
-        pool.price_usd
-    } else {
-        base.usd
-    };
-    Metrics {
-        price,
-        native: pool.price_native,
-        liq: st.liq(p),
-        fdv: base.supply * price,
-        w,
-    }
+    let w = WINDOWS.map(|(_, secs)| stats.map(|s| s.window(st.head_ts, secs)).unwrap_or_default());
+    let price = if pool.price_usd.is_finite() { pool.price_usd } else { base.usd };
+    Metrics { price, native: pool.price_native, liq: st.liq(p), fdv: base.supply * price, w }
 }
 
 /// The price in USD, or in the quote token (number, symbol) before that has a USD price.
@@ -270,10 +228,7 @@ pub fn price_parts<'a>(st: &'a State, p: u32, m: &Metrics) -> (String, Option<&'
     if m.price.is_finite() {
         (s(|o| fmt::usd(o, m.price)), None)
     } else {
-        (
-            s(|o| fmt::price(o, m.native)),
-            Some(sym(st, st.pools[p as usize].quote())),
-        )
+        (s(|o| fmt::price(o, m.native)), Some(sym(st, st.pools[p as usize].quote())))
     }
 }
 
@@ -292,11 +247,7 @@ pub fn default_res(st: &State, p: u32, max: usize) -> usize {
 
 pub fn change(m: &Metrics, i: usize) -> f64 {
     let open = m.w[i].open;
-    if open > 0.0 && m.price.is_finite() {
-        m.price / open - 1.0
-    } else {
-        f64::NAN
-    }
+    if open > 0.0 && m.price.is_finite() { m.price / open - 1.0 } else { f64::NAN }
 }
 
 fn dir(x: f64) -> &'static str {
@@ -330,21 +281,9 @@ pub fn fields(st: &State, p: u32) -> Vec<(String, String, &'static str)> {
     for (i, (name, _)) in WINDOWS.iter().enumerate() {
         let c = change(&m, i);
         out.push((format!("c{name}"), s(|o| fmt::pct(o, c)), dir(c)));
-        out.push((
-            format!("v{name}"),
-            s(|o| fmt::usd_compact(o, m.w[i].vol)),
-            "",
-        ));
-        out.push((
-            format!("b{name}"),
-            s(|o| fmt::uint(o, m.w[i].buys as u64)),
-            "",
-        ));
-        out.push((
-            format!("s{name}"),
-            s(|o| fmt::uint(o, m.w[i].sells as u64)),
-            "",
-        ));
+        out.push((format!("v{name}"), s(|o| fmt::usd_compact(o, m.w[i].vol)), ""));
+        out.push((format!("b{name}"), s(|o| fmt::uint(o, m.w[i].buys as u64)), ""));
+        out.push((format!("s{name}"), s(|o| fmt::uint(o, m.w[i].sells as u64)), ""));
     }
     out
 }
@@ -385,11 +324,7 @@ const SEARCH_FORM: &str = r#"<form action="/search" role="search"><input type="s
 fn avatar(st: &State, token: u32, large: bool) -> String {
     let t = &st.tokens[token as usize];
     if t.icon {
-        let (cls, px, lazy) = if large {
-            (" lg", 40, "")
-        } else {
-            ("", 26, r#" loading="lazy""#)
-        };
+        let (cls, px, lazy) = if large { (" lg", 40, "") } else { ("", 26, r#" loading="lazy""#) };
         return format!(
             r#"<img class="av{cls}" src="/i/{}.png" width="{px}" height="{px}" alt=""{lazy} decoding="async">"#,
             hex(&t.addr)
@@ -452,9 +387,7 @@ pub fn list(st: &State, tab: Tab) -> Vec<u32> {
                 Tab::Trending if m.liq >= 10_000.0 => m.w[1].vol,
                 Tab::Top if m.liq >= 10_000.0 => m.w[3].vol,
                 Tab::Gainers if m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0 => change(&m, 3),
-                Tab::New if m.liq >= 5_000.0 && pool.created_ts + 3 * 86_400 > head => {
-                    pool.created_ts as f64
-                }
+                Tab::New if m.liq >= 5_000.0 && pool.created_ts + 3 * 86_400 > head => pool.created_ts as f64,
                 _ => return None,
             };
             (score.is_finite() && score > 0.0).then_some((p, score))
@@ -467,8 +400,7 @@ pub fn list(st: &State, tab: Tab) -> Vec<u32> {
 
 fn table(st: &State, pools: &[u32]) -> String {
     if pools.is_empty() {
-        return r#"<p class="empty">Nothing here yet. The indexer may still be catching up.</p>"#
-            .into();
+        return r#"<p class="empty">Nothing here yet. The indexer may still be catching up.</p>"#.into();
     }
     let mut rows = String::new();
     for (i, &p) in pools.iter().enumerate() {
@@ -486,12 +418,7 @@ fn table(st: &State, pools: &[u32]) -> String {
         for w in 0..4 {
             let c = change(&m, w);
             let hide = if w < 3 { " hide-s" } else { "" };
-            let _ = write!(
-                rows,
-                r#"<td class="{}{hide}">{}</td>"#,
-                dir(c),
-                s(|o| fmt::pct(o, c))
-            );
+            let _ = write!(rows, r#"<td class="{}{hide}">{}</td>"#, dir(c), s(|o| fmt::pct(o, c)));
         }
         let _ = write!(
             rows,
@@ -512,16 +439,8 @@ pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
     let tabs: String = TABS
         .iter()
         .map(|(t, slug, label)| {
-            let href = if *t == Tab::Trending {
-                "/".to_string()
-            } else {
-                format!("/?tab={slug}")
-            };
-            let cur = if *t == tab {
-                r#" aria-current="page""#
-            } else {
-                ""
-            };
+            let href = if *t == Tab::Trending { "/".to_string() } else { format!("/?tab={slug}") };
+            let cur = if *t == tab { r#" aria-current="page""# } else { "" };
             format!(r#"<a href="{href}"{cur}>{label}</a>"#)
         })
         .collect();
@@ -531,10 +450,7 @@ pub fn home(app: &App, st: &State, tab: Tab, pools: &[u32]) -> String {
     );
     let path = match tab {
         Tab::Trending => "/".to_string(),
-        t => format!(
-            "/?tab={}",
-            TABS.iter().find(|x| x.0 == t).map(|x| x.1).unwrap_or("")
-        ),
+        t => format!("/?tab={}", TABS.iter().find(|x| x.0 == t).map(|x| x.1).unwrap_or("")),
     };
     let head = Head {
         title: format!("{SITE}: live prices and charts for every token on Base"),
@@ -582,32 +498,13 @@ pub fn not_found(app: &App) -> String {
 }
 
 /// Candles of a pool for the chart, in USD when the quote token has a price, else native.
-pub fn chart_data(
-    st: &State,
-    store: &Store,
-    p: u32,
-    ri: usize,
-    before: u32,
-    limit: usize,
-) -> Vec<chart::Candle> {
+pub fn chart_data(st: &State, store: &Store, p: u32, ri: usize, before: u32, limit: usize) -> Vec<chart::Candle> {
     let raw = store.candles(p, ri, 0, before, limit);
-    let usd = raw.last().is_some_and(|(_, c)| c.c.is_finite())
-        && st.pools[p as usize].price_usd.is_finite();
+    let usd = raw.last().is_some_and(|(_, c)| c.c.is_finite()) && st.pools[p as usize].price_usd.is_finite();
     raw.iter()
         .map(|(t, c)| {
-            let (o, h, l, cl) = if usd {
-                (c.o, c.h, c.l, c.c)
-            } else {
-                (c.no, c.nh, c.nl, c.nc)
-            };
-            chart::Candle {
-                t: *t as f64,
-                o: o as f64,
-                h: h as f64,
-                l: l as f64,
-                c: cl as f64,
-                v: c.v as f64,
-            }
+            let (o, h, l, cl) = if usd { (c.o, c.h, c.l, c.c) } else { (c.no, c.nh, c.nl, c.nc) };
+            chart::Candle { t: *t as f64, o: o as f64, h: h as f64, l: l as f64, c: cl as f64, v: c.v as f64 }
         })
         .filter(|c| c.o.is_finite() && c.c.is_finite())
         .collect()
@@ -620,11 +517,7 @@ pub fn candles_json(cs: &[chart::Candle]) -> String {
         if i > 0 {
             out.push(',');
         }
-        let _ = write!(
-            out,
-            "[{},{},{},{},{},{}]",
-            c.t, c.o as f32, c.h as f32, c.l as f32, c.c as f32, c.v as f32
-        );
+        let _ = write!(out, "[{},{},{},{},{},{}]", c.t, c.o as f32, c.h as f32, c.l as f32, c.c as f32, c.v as f32);
     }
     out.push(']');
     out
@@ -633,35 +526,19 @@ pub fn candles_json(cs: &[chart::Candle]) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool) -> String {
     let pool = &st.pools[p as usize];
-    let (base, quote) = (
-        &st.tokens[pool.base() as usize],
-        &st.tokens[pool.quote() as usize],
-    );
+    let (base, quote) = (&st.tokens[pool.base() as usize], &st.tokens[pool.quote() as usize]);
     let (bs, qs) = (sym(st, pool.base()), sym(st, pool.quote()));
     let key = pool.key();
     let fs = fields(st, p);
     let f = |id: &str| field(&fs, id);
     let candles = chart_data(st, store, p, ri, u32::MAX, CHART_CANDLES);
-    let svg = s(|o| {
-        chart::render(
-            &candles,
-            &chart::View::latest(candles.len(), 960.0, 440.0, RES[ri] as f64),
-            o,
-        )
-    });
+    let svg = s(|o| chart::render(&candles, &chart::View::latest(candles.len(), 960.0, 440.0, RES[ri] as f64), o));
     let res_nav: String = RES_NAMES
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            let cur = if i == ri {
-                r#" aria-current="true""#
-            } else {
-                ""
-            };
-            format!(
-                r#"<a href="?res={n}" data-res="{}" rel="nofollow"{cur}>{n}</a>"#,
-                RES[i]
-            )
+            let cur = if i == ri { r#" aria-current="true""# } else { "" };
+            format!(r#"<a href="?res={n}" data-res="{}" rel="nofollow"{cur}>{n}</a>"#, RES[i])
         })
         .collect();
     let chart = format!(
@@ -670,18 +547,11 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         wasm = app.wasm_url,
         json = candles_json(&candles),
     );
-    let price_head = format!(
-        r#"<span class="big">{}</span> <span class="chg">{}</span>"#,
-        f("p"),
-        f("c24h")
-    );
+    let price_head = format!(r#"<span class="big">{}</span> <span class="chg">{}</span>"#, f("p"), f("c24h"));
     let url = format!("{}/base/{key}", app.cfg.public_url);
     let m = metrics(st, p);
     let price_text = price_label(st, p, &m);
-    let title = format!(
-        "{bs} {price_text} {} | {bs}/{qs} on Base | {SITE}",
-        s(|o| fmt::pct(o, change(&m, 3)))
-    );
+    let title = format!("{bs} {price_text} {} | {bs}/{qs} on Base | {SITE}", s(|o| fmt::pct(o, change(&m, 3))));
     let desc = format!(
         "{bs} ({}) price {}, 24h volume {}, liquidity {} on {}. Live chart and trades for the {bs}/{qs} pool on Base.",
         if base.name.is_empty() { bs } else { &base.name },
@@ -697,10 +567,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         // Embeds point search engines at the full pair page.
         path: format!("/base/{key}"),
         image: Some(format!("{}/og/base/{key}.png?v={v}", app.cfg.public_url)),
-        miniapp: Some((
-            format!("{}/og/base/{key}.png?s=fc&v={v}", app.cfg.public_url),
-            url.clone(),
-        )),
+        miniapp: Some((format!("{}/og/base/{key}.png?s=fc&v={v}", app.cfg.public_url), url.clone())),
         embed,
     };
 
@@ -714,10 +581,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
 
     let trades = store.trades(p, (u32::MAX, u32::MAX), 50);
     let rows: String = trades.iter().map(|(_, t)| trade_row(st, pool, t)).collect();
-    let last = trades
-        .first()
-        .map(|(k, _)| format!("{}-{}", k.0, k.1))
-        .unwrap_or_else(|| "0-0".into());
+    let last = trades.first().map(|(k, _)| format!("{}-{}", k.0, k.1)).unwrap_or_else(|| "0-0".into());
     let windows: String = WINDOWS
         .iter()
         .map(|(n, _)| {
@@ -733,11 +597,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
     let copy = |label: &str, a: &str, link: &str| {
         format!(
             r#"<p><span>{label}</span><span><a class="mono" href="{EXPLORER}/{link}" rel="nofollow">{short}</a> <button type="button" data-copy="{a}" aria-label="Copy {label} address">Copy</button></span></p>"#,
-            short = if a.len() > 12 {
-                format!("{}…{}", &a[..6], &a[a.len() - 4..])
-            } else {
-                a.to_string()
-            },
+            short = if a.len() > 12 { format!("{}…{}", &a[..6], &a[a.len() - 4..]) } else { a.to_string() },
         )
     };
     let pool_link = if pool.is_address() {
@@ -768,16 +628,8 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         fdv = f("fdv"),
         qs_e = Esc(qs),
         pair_c = copy("Pair", &key, &pool_link),
-        base_c = copy(
-            &format!("{}", Esc(bs)),
-            &hex(&base.addr),
-            &format!("token/{}", hex(&base.addr))
-        ),
-        quote_c = copy(
-            &format!("{}", Esc(qs)),
-            &hex(&quote.addr),
-            &format!("token/{}", hex(&quote.addr))
-        ),
+        base_c = copy(&format!("{}", Esc(bs)), &hex(&base.addr), &format!("token/{}", hex(&base.addr))),
+        quote_c = copy(&format!("{}", Esc(qs)), &hex(&quote.addr), &format!("token/{}", hex(&quote.addr))),
         created = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
         embed_e = Esc(&embed_code),
     );
@@ -788,35 +640,23 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
 /// resolution, and new trade rows. Returns the JSON and the newest trade key.
 pub fn live(st: &State, store: &Store, p: u32, after: (u32, u32)) -> (String, (u32, u32)) {
     let pool = &st.pools[p as usize];
-    let fs: serde_json::Map<String, serde_json::Value> = fields(st, p)
-        .into_iter()
-        .map(|(id, text, cls)| (id, serde_json::json!([text, cls])))
-        .collect();
+    let fs: serde_json::Map<String, serde_json::Value> =
+        fields(st, p).into_iter().map(|(id, text, cls)| (id, serde_json::json!([text, cls]))).collect();
     let mut candles = serde_json::Map::new();
     for (ri, res) in RES.iter().enumerate() {
         if let Some(c) = chart_data(st, store, p, ri, u32::MAX, 1).last() {
-            candles.insert(
-                res.to_string(),
-                serde_json::json!([c.t, c.o, c.h, c.l, c.c, c.v]),
-            );
+            candles.insert(res.to_string(), serde_json::json!([c.t, c.o, c.h, c.l, c.c, c.v]));
         }
     }
-    let trades = if after == (0, 0) {
+    // The newest 50 trades after `after` (a page shows 50), newest first.
+    let trades: Vec<_> = if after == (0, 0) {
         Vec::new()
     } else {
-        store.trades_after(p, after)
+        store.trades(p, (u32::MAX, u32::MAX), 50).into_iter().take_while(|(k, _)| *k > after).collect()
     };
-    let newest = trades.last().map(|(k, _)| *k).unwrap_or(after);
-    let rows: String = trades
-        .iter()
-        .rev()
-        .take(50)
-        .map(|(_, t)| trade_row(st, pool, t))
-        .collect();
-    (
-        serde_json::json!({"f": fs, "c": candles, "t": rows}).to_string(),
-        newest,
-    )
+    let newest = trades.first().map(|(k, _)| *k).unwrap_or(after);
+    let rows: String = trades.iter().map(|(_, t)| trade_row(st, pool, t)).collect();
+    (serde_json::json!({"f": fs, "c": candles, "t": rows}).to_string(), newest)
 }
 
 pub fn sitemap(app: &App, st: &State) -> String {
@@ -833,12 +673,7 @@ pub fn sitemap(app: &App, st: &State) -> String {
     );
     let _ = write!(out, "<url><loc>{}/</loc></url>", app.cfg.public_url);
     for (p, _) in pools.iter().take(20_000) {
-        let _ = write!(
-            out,
-            "<url><loc>{}/base/{}</loc></url>",
-            app.cfg.public_url,
-            st.pools[*p as usize].key()
-        );
+        let _ = write!(out, "<url><loc>{}/base/{}</loc></url>", app.cfg.public_url, st.pools[*p as usize].key());
     }
     out.push_str("</urlset>");
     out
@@ -847,9 +682,7 @@ pub fn sitemap(app: &App, st: &State) -> String {
 pub fn urlencode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
             b => format!("%{b:02X}"),
         })
         .collect()
@@ -867,14 +700,9 @@ mod tests {
 
     #[test]
     fn escapes_and_css() {
-        assert_eq!(
-            format!("{}", Esc(r#"<b>"x"&'</b>"#)),
-            "&lt;b&gt;&quot;x&quot;&amp;&#39;&lt;/b&gt;"
-        );
+        assert_eq!(format!("{}", Esc(r#"<b>"x"&'</b>"#)), "&lt;b&gt;&quot;x&quot;&amp;&#39;&lt;/b&gt;");
         let css = page_css();
-        assert!(
-            css.contains("--up:#0a7a3d") && css.contains("fill:var(--up)") && !css.contains("{up}")
-        );
+        assert!(css.contains("--up:#0a7a3d") && css.contains("fill:var(--up)") && !css.contains("{up}"));
         assert_eq!(urlencode("a b/c"), "a%20b%2Fc");
     }
 }

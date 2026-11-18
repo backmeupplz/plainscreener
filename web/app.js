@@ -51,11 +51,14 @@ async function chart(el) {
   const redraw = () => frame || (frame = requestAnimationFrame(draw))
   const get = (q) => fetch(`/api/candles/${pool}?res=${res}${q}`).then((r) => r.json())
 
-  // Candles that closed while the page sat in a cache: take the latest from the API.
-  async function fill() {
+  // Candles that closed while the page sat in a cache: take the latest from the API,
+  // then the live candle `c` (the API copy may be a few seconds older).
+  async function fill(c) {
     const fresh = await get('')
-    if (!fresh.length) return
-    cs = cs.filter((x) => x[0] < fresh[0][0]).concat(fresh)
+    if (fresh.length) cs = cs.filter((x) => x[0] < fresh[0][0]).concat(fresh)
+    const last = cs[cs.length - 1]
+    if (last && last[0] === c[0]) cs[cs.length - 1] = c
+    else if (!last || c[0] > last[0]) cs.push(c)
     load()
     redraw()
   }
@@ -137,7 +140,7 @@ async function chart(el) {
     const c = u.c[res]
     if (c) {
       const last = cs[cs.length - 1]
-      if (last && c[0] > last[0] + res) fill()
+      if (last && c[0] > last[0] + res) fill(c)
       else if (last && last[0] === c[0]) cs[cs.length - 1] = c
       else if (!last || c[0] > last[0]) cs.push(c)
       load()

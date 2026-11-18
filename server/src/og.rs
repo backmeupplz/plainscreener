@@ -1,9 +1,7 @@
 //! Share images: the same chart as the page, rasterized with resvg.
 
 use crate::model::RES;
-use crate::pages::{
-    Esc, LOGO, PALETTE, change, chart_css, chart_data, default_res, metrics, price_parts,
-};
+use crate::pages::{Esc, LOGO, PALETTE, change, chart_css, chart_data, default_res, metrics, price_parts};
 use crate::state::State;
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -22,11 +20,7 @@ static FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
 });
 
 fn dark(name: &str) -> String {
-    PALETTE
-        .iter()
-        .find(|(n, ..)| *n == name)
-        .map(|(.., d)| d.to_string())
-        .unwrap_or_default()
+    PALETTE.iter().find(|(n, ..)| *n == name).map(|(.., d)| d.to_string()).unwrap_or_default()
 }
 
 fn options() -> usvg::Options<'static> {
@@ -54,15 +48,25 @@ pub fn png(svg: &str) -> Result<Vec<u8>> {
     render(svg)?.encode_png().context("encode png")
 }
 
-/// Redraws an untrusted PNG, JPEG, GIF, WebP or SVG as a `size` px square PNG (cropped
-/// to fill). `None` when it isn't an image, is huge, or draws nothing.
+/// Redraws an untrusted PNG, JPEG, GIF or WebP as a `size` px square PNG (cropped to
+/// fill). `None` when it isn't one of those, is huge, or draws nothing. SVG is refused:
+/// its cost to render has no simple bound.
 pub fn icon_png(bytes: &[u8], size: u32) -> Option<Vec<u8>> {
-    if imagesize::blob_size(bytes).is_ok_and(|d| d.width > 4096 || d.height > 4096) {
+    use imagesize::ImageType::*;
+    let mime = match imagesize::image_type(bytes).ok()? {
+        Png => "image/png",
+        Jpeg => "image/jpeg",
+        Gif => "image/gif",
+        Webp => "image/webp",
+        _ => return None,
+    };
+    let dim = imagesize::blob_size(bytes).ok()?;
+    if dim.width > 4096 || dim.height > 4096 {
         return None;
     }
     let data = base64::engine::general_purpose::STANDARD.encode(bytes);
     let pix = render(&format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{size}" height="{size}"><image xlink:href="data:text/plain;base64,{data}" width="{size}" height="{size}" preserveAspectRatio="xMidYMid slice"/></svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{size}" height="{size}"><image xlink:href="data:{mime};base64,{data}" width="{size}" height="{size}" preserveAspectRatio="xMidYMid slice"/></svg>"#
     ))
     .ok()?;
     if !pix.pixels().iter().any(|p| p.alpha() > 0) {
@@ -85,11 +89,7 @@ fn frame(w: u32, h: u32, body: &str) -> String {
 }
 
 fn logo(x: u32, y: u32, size: u32) -> String {
-    LOGO.replacen(
-        "<svg ",
-        &format!(r#"<svg x="{x}" y="{y}" width="{size}" height="{size}" "#),
-        1,
-    )
+    LOGO.replacen("<svg ", &format!(r#"<svg x="{x}" y="{y}" width="{size}" height="{size}" "#), 1)
 }
 
 /// A pair card: name, price, change, key numbers and the 1 h chart.
@@ -104,13 +104,7 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
     let _ = write!(
         b,
         r#"{logo}<text x="128" y="96" font-size="54" font-weight="600" letter-spacing="-1.6" class="fg">{base}<tspan class="mu">/{quote}</tspan></text><text x="{right}" y="92" font-size="28" text-anchor="end" class="mu">plainscreener.com</text><text x="56" y="196" font-size="72" font-weight="600" letter-spacing="-2.4" class="fg">{price}</text><text x="56" y="250" font-size="30" class="mu">{dex} on Base · 24h <tspan class="{cls}">{change}</tspan></text>"#,
-        logo = match store
-            .icons
-            .get(st.tokens[pool.base() as usize].addr)
-            .ok()
-            .flatten()
-            .filter(|v| v.len() > 4)
-        {
+        logo = match store.icons.get(st.tokens[pool.base() as usize].addr).ok().flatten().filter(|v| v.len() > 4) {
             Some(icon) => format!(
                 r#"<defs><clipPath id="ic"><circle cx="84" cy="72" r="28"/></clipPath></defs><image x="56" y="44" width="56" height="56" clip-path="url(#ic)" xlink:href="data:image/png;base64,{}"/>"#,
                 base64::engine::general_purpose::STANDARD.encode(&icon)
@@ -121,10 +115,8 @@ pub fn pair_card(st: &State, store: &Store, p: u32, w: u32, h: u32) -> String {
         quote = sym(pool.quote()),
         right = w - 56,
         price = match price_parts(st, p, &m) {
-            (n, Some(unit)) => format!(
-                r#"{n}<tspan dx="12" font-size="32" font-weight="400" class="mu">{}</tspan>"#,
-                Esc(unit)
-            ),
+            (n, Some(unit)) =>
+                format!(r#"{n}<tspan dx="12" font-size="32" font-weight="400" class="mu">{}</tspan>"#, Esc(unit)),
             (n, None) => n,
         },
         dex = pool.dex(),
