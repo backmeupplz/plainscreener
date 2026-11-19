@@ -869,8 +869,19 @@ pub fn token(app: &App, st: &State, store: &Store, t: u32) -> String {
         lists::table(st, &pools, None, &format!("/api/list?pairs={}", keys.join(",")), "No pairs on known DEXes yet.");
     let stat = |label: &str, v: String| format!("<div><dt>{label}</dt><dd>{v}</dd></div>");
     let body = format!(
-        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><h1>{name_e}</h1><span class="name">{sym_e} · <a class="mono m" href="{EXPLORER}/token/{addr}" rel="nofollow">{short}</a></span></div></div><div class="px"><div class="pv"><div class="big">{price}</div></div><span class="chg"><span class="{cls}">{ch}</span></span>{buy}</div></div><div class="pair"><section><dl class="card kv kv4">{stats}</dl><h2 class="sect">Pairs</h2>{table}</section><aside><div class="card tok"><div class="ch2"><h2>About {name_e}</h2></div>{links}{desc}</div>{safety}</aside></div></main>"#,
+        r#"<main class="wrap"><div class="head"><div class="id">{av}<div class="meta"><h1>{name_e}</h1><span class="name">{sym_e} · <a class="mono m" href="{EXPLORER}/token/{addr}" rel="nofollow">{short}</a></span></div></div><div class="px"><div class="pv"><div class="big">{price}</div></div><span class="chg"><span class="{cls}">{ch}</span></span>{buy}</div></div><div class="tgrid"><dl class="card kv kv4">{stats}</dl><div class="card tok"><div class="ch2"><h2>About {name_e}</h2>{links}</div>{about}<div class="info"><p><span>Contract</span><span class="addr"><span class="mono">{short}</span><button type="button" class="ic sm" data-copy="{addr}" aria-label="Copy contract address" title="Copy address">{copy}</button><a class="ic sm" href="{EXPLORER}/token/{addr}" rel="nofollow" target="_blank" aria-label="Token on Basescan" title="Basescan">{ext}</a></span></p><p><span>Decimals</span><span>{decimals}</span></p><p><span>Pairs on known DEXes</span><span>{n_pairs}</span></p><p><span>First traded</span><span>block {first}</span></p></div></div>{safety}</div><h2 class="sect">Pairs <span class="m">{n_pairs}</span></h2>{table}</main>"#,
         av = avatar(st, t, true),
+        // Say so rather than leave an empty card.
+        about = if desc.is_empty() {
+            r#"<p class="desc m">No description or links published yet.</p>"#.to_string()
+        } else {
+            desc.clone()
+        },
+        n_pairs = pools.len(),
+        decimals = tok.decimals,
+        first = s(|o| fmt::uint(o, tok.first_block as u64)),
+        copy = icon("copy"),
+        ext = icon("external-link"),
         name_e = Esc(name),
         sym_e = Esc(symbol),
         addr = hex(&tok.addr),

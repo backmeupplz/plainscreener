@@ -181,24 +181,27 @@ pub fn rows(st: &State, pools: &[u32]) -> String {
         let m = metrics(st, p);
         let txns = m.w[3].buys + m.w[3].sells;
         let key = pool.key();
+        let (vol, liq, c24) =
+            (s(|o| fmt::usd_compact(o, m.w[3].vol)), s(|o| fmt::usd_compact(o, m.liq)), change(&m, 3));
+        // Phones get two-line cells instead of the columns they hide: liquidity and volume
+        // under the pair, the 24 h change under the price.
         let _ = write!(
             rows,
-            r#"<tr><td class="n"><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button>{n}</td><td class="l"><a href="/base/{key}">{name}</a></td><td>{price}</td>"#,
+            r#"<tr><td class="n"><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button><span class="hide-s">{n}</span></td><td class="l"><a href="/base/{key}">{name}</a><small class="sm">Liq {liq} · Vol {vol}</small></td><td>{price}<small class="sm {cls}">{pct}</small></td>"#,
             n = i + 1,
             star = crate::pages::icon("star"),
             name = pair_name(st, pool, true),
             price = s(|o| fmt::usd(o, m.price)),
+            cls = dir(c24),
+            pct = s(|o| fmt::pct(o, c24)),
         );
         for w in 0..4 {
             let c = change(&m, w);
-            let hide = if w < 3 { " hide-s" } else { "" };
-            let _ = write!(rows, r#"<td class="{}{hide}">{}</td>"#, dir(c), s(|o| fmt::pct(o, c)));
+            let _ = write!(rows, r#"<td class="{} hide-s">{}</td>"#, dir(c), s(|o| fmt::pct(o, c)));
         }
         let _ = write!(
             rows,
-            r#"<td>{vol}</td><td>{liq}</td><td class="hide-s">{fdv}</td><td class="hide-s">{txns}</td><td class="hide-s m">{age}</td></tr>"#,
-            vol = s(|o| fmt::usd_compact(o, m.w[3].vol)),
-            liq = s(|o| fmt::usd_compact(o, m.liq)),
+            r#"<td class="hide-s">{vol}</td><td class="hide-s">{liq}</td><td class="hide-s">{fdv}</td><td class="hide-s">{txns}</td><td class="hide-s m">{age}</td></tr>"#,
             fdv = s(|o| fmt::usd_compact(o, m.fdv)),
             txns = s(|o| fmt::compact(o, txns as f64)),
             age = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
@@ -213,7 +216,7 @@ pub fn table(st: &State, pools: &[u32], f: Option<&Filter>, src: &str, empty: &s
     let mut head = String::from(r#"<th><span class="sr">Watch</span>#</th><th class="l">Pair</th>"#);
     for (i, (key, label)) in COLS.iter().enumerate() {
         let cls = match i {
-            1..=3 | 7..=9 => " hide-s",
+            1..=9 => " hide-s",
             _ => "",
         };
         let Some(f) = f else {

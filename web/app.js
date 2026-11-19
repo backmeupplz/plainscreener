@@ -17,7 +17,7 @@ const skeleton = (n, cols) =>
 // Rows of a trades table, top traders, and pair lists.
 const SK_TRADES = ['l84', 'l30', 54, 70, 44, [80, 0, 'h'], ['q', 0, 'h']]
 const SK_TRADERS = ['l14', 'l90', [52, 64], [52, 64], [56, 40], [44, 0, 'h']]
-const SK_LIST = ['l20', 'lc+120', 60, [40, 0, 'h'], [40, 0, 'h'], [40, 0, 'h'], 44, 50, 50, [50, 0, 'h'], [36, 0, 'h'], [24, 0, 'h']]
+const SK_LIST = ['l20', 'lc+120', 60, [40, 0, 'h'], [40, 0, 'h'], [40, 0, 'h'], [44, 0, 'h'], [50, 0, 'h'], [50, 0, 'h'], [50, 0, 'h'], [36, 0, 'h'], [24, 0, 'h']]
 
 // Farcaster mini app: the host keeps the app hidden until it says it's ready. This is the
 // mini app SDK's sdk.actions.ready() (one comlink call to the host) without loading the SDK.
