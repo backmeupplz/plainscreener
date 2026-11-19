@@ -235,7 +235,7 @@ img.av{background:var(--raise);object-fit:cover}
 .checks .warn .i{color:var(--down)}
 .checks .warn{background:var(--downbg)}
 .checks .warn>span{color:var(--fg)}
-.fine{margin:0;padding:6px 16px 12px;color:var(--muted);font-size:11px;line-height:1.5}
+.fine{margin:0;padding:6px 16px 12px;color:var(--muted);font-size:12px;line-height:1.5}
 /* about: title links to the token page, link icons beside it, numbers in a strip */
 .hl2{display:flex;align-items:center;gap:4px;min-width:0}
 .hl2 h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -324,7 +324,7 @@ footer{border-top:1px solid var(--line);color:var(--muted);padding:22px 0 34px;f
   .kv.kv4{grid-template-columns:1fr 1fr}
   .tgrid{grid-template-columns:1fr}
   .hide-s,.list .pairname small{display:none}
-  .list .ph{display:block;margin-top:2px;color:var(--muted);font-size:11px}
+  .list .ph{display:block;margin-top:2px;color:var(--muted);font-size:12px}
   .list .ph.u{color:var(--up)}
   .list .ph.d{color:var(--down)}
   .list td{padding-inline:8px}
