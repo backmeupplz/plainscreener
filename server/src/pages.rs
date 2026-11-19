@@ -96,7 +96,7 @@ pub static CSP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         base64::engine::general_purpose::STANDARD.encode(ring::digest::digest(&ring::digest::SHA256, js.as_bytes()))
     };
     format!(
-        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{}' 'sha256-{}'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'",
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'sha256-{}' 'sha256-{}' https://lumen.borodutch.com; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://lumen.borodutch.com; base-uri 'none'; form-action 'self'",
         hash(THEME_JS),
         hash(SPECULATION)
     )
@@ -229,7 +229,7 @@ pub fn layout(app: &App, head: u32, h: &Head, body: &str) -> String {
         )
     };
     format!(
-        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">{meta}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script><style>{css}</style></head><body>{ICONS}{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
+        r##"<!doctype html><html lang="en"{cls}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><meta name="description" content="{desc}"><link rel="canonical" href="{url}">{meta}<link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)"><meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)"><script>{THEME_JS}</script><style>{css}</style><script defer src="https://lumen.borodutch.com/l.js"></script></head><body>{ICONS}{header}{body}{footer}<script type="module" src="{js}"></script><script type="speculationrules">{SPECULATION}</script></body></html>"##,
         cls = if h.embed { r#" class="embed""# } else { "" },
         css = app.css,
         js = app.js_url,
