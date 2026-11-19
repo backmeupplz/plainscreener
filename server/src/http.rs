@@ -47,7 +47,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api", get(api_docs))
         .route("/api/traders/{id}", get(traders))
         .route("/healthz", get(health))
-        .fallback(|Ax(app): A| async move { (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)) })
+        .fallback(|Ax(app): A| async move {
+            let head = read(&app).head_ts;
+            (StatusCode::NOT_FOUND, html(pages::not_found(&app, head), 60))
+        })
         .layer(axum::middleware::from_fn(no_www))
         .with_state(app)
 }
@@ -197,7 +200,7 @@ async fn embed(app: A, Path(id): Path<String>, q: Query<PairQ>) -> Response {
 fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Response {
     let st = read(&app);
     let Some(found) = resolve(&st, &id) else {
-        return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response();
+        return (StatusCode::NOT_FOUND, html(pages::not_found(&app, st.head_ts), 60)).into_response();
     };
     let p = match found {
         Found::Pool(p) => p,
@@ -217,7 +220,7 @@ fn pair_page(Ax(app): A, id: String, Query(q): Query<PairQ>, embed: bool) -> Res
             }
             (None, true) => match pages::best_pool(&st, t) {
                 Some(p) => return Redirect::to(&format!("/embed/base/{}", st.pools[p as usize].key())).into_response(),
-                None => return (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response(),
+                None => return (StatusCode::NOT_FOUND, html(pages::not_found(&app, st.head_ts), 60)).into_response(),
             },
         },
     };
@@ -236,7 +239,7 @@ async fn token(Ax(app): A, Path(addr): Path<String>) -> Response {
     let t = unhex(addr.trim()).and_then(|b| <[u8; 20]>::try_from(b).ok()).and_then(|a| st.token_ix.get(&a).copied());
     match t {
         Some(t) => html(pages::token(&app, &st, &app.sh.store, t), 30),
-        None => (StatusCode::NOT_FOUND, html(pages::not_found(&app), 60)).into_response(),
+        None => (StatusCode::NOT_FOUND, html(pages::not_found(&app, st.head_ts), 60)).into_response(),
     }
 }
 

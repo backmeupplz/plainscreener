@@ -160,7 +160,10 @@ pub struct Head {
     pub embed: bool,
 }
 
-pub fn layout(app: &App, h: &Head, body: &str) -> String {
+/// `head` (the indexed head time) comes from the caller's state guard: taking the state
+/// lock again here deadlocks once the indexer queues for a write in between (std's RwLock
+/// prefers writers), which hung the site on 2026-11-19.
+pub fn layout(app: &App, head: u32, h: &Head, body: &str) -> String {
     let url = format!("{}{}", app.cfg.public_url, h.path);
     let mut meta = String::new();
     let (title, desc) = (Esc(&h.title), Esc(&h.desc));
@@ -209,7 +212,6 @@ pub fn layout(app: &App, h: &Head, body: &str) -> String {
         )
     };
     // While the indexer replays history, say so instead of passing old data off as live.
-    let head = app.sh.state.read().map(|s| s.head_ts).unwrap_or(0);
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let header = if !h.embed && now > head as u64 + 600 {
         let at = if head == 0 { "the start".to_string() } else { s(|o| fmt::date_year(o, head as i64)) };
@@ -638,7 +640,7 @@ pub fn home(app: &App, st: &State, f: &Filter, pools: &[u32]) -> String {
         player: None,
         embed: false,
     };
-    layout(app, &head, &body)
+    layout(app, st.head_ts, &head, &body)
 }
 
 pub fn search(app: &App, st: &State, q: &str, pools: &[u32]) -> String {
@@ -657,7 +659,7 @@ pub fn search(app: &App, st: &State, q: &str, pools: &[u32]) -> String {
         player: None,
         embed: false,
     };
-    layout(app, &head, &body)
+    layout(app, st.head_ts, &head, &body)
 }
 
 /// /api: how to use the public JSON API (see `api`).
@@ -749,10 +751,10 @@ pub fn api_docs(app: &App, st: &State) -> String {
         player: None,
         embed: false,
     };
-    layout(app, &head, &body)
+    layout(app, st.head_ts, &head, &body)
 }
 
-pub fn not_found(app: &App) -> String {
+pub fn not_found(app: &App, head_ts: u32) -> String {
     let head = Head {
         title: format!("Not found | {SITE}"),
         desc: "This pair or token isn't indexed.".into(),
@@ -764,6 +766,7 @@ pub fn not_found(app: &App) -> String {
     };
     layout(
         app,
+        head_ts,
         &head,
         r#"<main class="wrap"><h1>Not found</h1><p class="sub">We don't index a Base pair or token at that address. Try the search box.</p></main>"#,
     )
@@ -911,7 +914,7 @@ pub fn token(app: &App, st: &State, store: &Store, t: u32) -> String {
         player: None,
         embed: false,
     };
-    layout(app, &head, &body)
+    layout(app, st.head_ts, &head, &body)
 }
 
 /// The base token: what it says about itself (see `icons`), its supply, and what this
@@ -1150,7 +1153,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
             r#"<div class="eh">{name}{price_head}<a class="brand" href="{url}" target="_blank" rel="noopener">{SITE}</a></div>{chart}"#,
             name = pair_name(st, pool, false),
         );
-        return layout(app, &head, &body);
+        return layout(app, st.head_ts, &head, &body);
     }
 
     let trades = store.trades(p, (u32::MAX, u32::MAX), TRADES);
@@ -1248,7 +1251,7 @@ pub fn pair(app: &App, st: &State, store: &Store, p: u32, ri: usize, embed: bool
         created = s(|o| fmt::age(o, st.head_ts as i64 - pool.created_ts as i64)),
         embed_e = Esc(&embed_code),
     );
-    layout(app, &head, &body)
+    layout(app, st.head_ts, &head, &body)
 }
 
 /// A live update for a pair page: changed fields, the latest candle of every
