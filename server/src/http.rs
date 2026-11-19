@@ -164,17 +164,16 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
 }
 
 /// Pools for tokens whose symbol starts with or name contains `q`: exact symbol matches
-/// first, then pools from known DEXes, then by liquidity.
+/// first, then the token's standing (real over copies), pools from known DEXes, liquidity.
 pub(crate) fn search_pools(app: &App, st: &State, q: &str) -> Vec<u32> {
     let needle = q.to_lowercase();
     let index = app.search.read().unwrap_or_else(|e| e.into_inner());
-    // Exact symbol matches first, then pools from known DEXes, then by liquidity.
-    let mut hits: Vec<((bool, bool), f64, u32)> = index
+    let mut hits: Vec<_> = index
         .iter()
         .filter(|(sym, name, _)| sym.starts_with(&needle) || name.contains(&needle))
         .filter_map(|(sym, _, t)| {
             let p = pages::best_pool(st, *t)?;
-            Some(((*sym == needle, st.pools[p as usize].trusted()), st.liq(p), p))
+            Some(((*sym == needle, st.standing(*t), st.pools[p as usize].trusted()), st.liq(p), p))
         })
         .collect();
     hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));

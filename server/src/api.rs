@@ -149,19 +149,19 @@ async fn search(Ax(app): A, Query(q): Query<SearchQ>) -> Response {
     let pairs: Vec<Value> = pools.iter().take(20).map(|&p| pair_json(&app, &st, p)).collect();
     // Tokens whose symbol is exactly the query, deepest first: their own page and price.
     let needle = q.to_lowercase();
-    let mut tokens: Vec<(f64, u32)> = app
+    let mut tokens: Vec<((bool, bool), f64, u32)> = app
         .search
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(sym, _, _)| *sym == needle)
-        .filter_map(|(_, _, t)| Some((st.liq(pages::best_pool(&st, *t)?), *t)))
+        .filter_map(|(_, _, t)| Some((st.standing(*t), st.liq(pages::best_pool(&st, *t)?), *t)))
         .collect();
-    tokens.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    tokens.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
     let tokens: Vec<Value> = tokens
         .iter()
         .take(3)
-        .map(|&(_, t)| {
+        .map(|&(_, _, t)| {
             let mut v = token_json(&st, t);
             v["url"] = format!("/base/token/{}", hex(&st.tokens[t as usize].addr)).into();
             v

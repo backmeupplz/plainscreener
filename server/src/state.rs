@@ -150,6 +150,14 @@ impl State {
         if v.is_finite() { v } else { 0.0 }
     }
 
+    /// How much a token with a common symbol looks like the real one: the chain's own WETH and
+    /// stablecoins first, then tokens with a listed icon. Ranking copies by liquidity alone
+    /// puts scams on top, since a fake quote token can price its pool at billions.
+    pub fn standing(&self, t: u32) -> (bool, bool) {
+        let tok = &self.tokens[t as usize];
+        (tok.addr == WETH || STABLES.contains(&tok.addr), tok.icon)
+    }
+
     /// Pool liquidity in USD: twice the quote side. Valuing the base side at the pool's own
     /// price would let one trade at an absurd price inflate it without limit.
     pub fn liq(&self, p: u32) -> f64 {
