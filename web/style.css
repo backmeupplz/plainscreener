@@ -128,7 +128,7 @@ th:first-child,td:first-child,th.l,td.l{text-align:left}
 .list th a{color:inherit}
 .list th a:hover,.list th[aria-sort]{color:var(--fg)}
 .empty{padding:32px;text-align:center;color:var(--muted)}
-.sm{display:none}
+.ph{display:none}
 .pairname{display:flex;align-items:center;gap:10px}
 .pairname b{font-weight:600}
 .pairname .q{color:var(--muted)}
@@ -324,9 +324,9 @@ footer{border-top:1px solid var(--line);color:var(--muted);padding:22px 0 34px;f
   .kv.kv4{grid-template-columns:1fr 1fr}
   .tgrid{grid-template-columns:1fr}
   .hide-s,.list .pairname small{display:none}
-  .list .sm{display:block;margin-top:2px;color:var(--muted);font-size:11px}
-  .list .sm.u{color:var(--up)}
-  .list .sm.d{color:var(--down)}
+  .list .ph{display:block;margin-top:2px;color:var(--muted);font-size:11px}
+  .list .ph.u{color:var(--up)}
+  .list .ph.d{color:var(--down)}
   .list td{padding-inline:8px}
   .list td.n .star{margin:0 -4px 0 -4px}
   .big{font-size:24px}

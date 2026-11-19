@@ -187,7 +187,7 @@ pub fn rows(st: &State, pools: &[u32]) -> String {
         // under the pair, the 24 h change under the price.
         let _ = write!(
             rows,
-            r#"<tr><td class="n"><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button><span class="hide-s">{n}</span></td><td class="l"><a href="/base/{key}">{name}</a><small class="sm">Liq {liq} · Vol {vol}</small></td><td>{price}<small class="sm {cls}">{pct}</small></td>"#,
+            r#"<tr><td class="n"><button type="button" class="ic star" data-star="{key}" aria-pressed="false" aria-label="Add to watchlist" title="Watchlist">{star}</button><span class="hide-s">{n}</span></td><td class="l"><a href="/base/{key}">{name}</a><small class="ph">Liq {liq} · Vol {vol}</small></td><td>{price}<small class="ph {cls}">{pct}</small></td>"#,
             n = i + 1,
             star = crate::pages::icon("star"),
             name = pair_name(st, pool, true),
