@@ -58,7 +58,9 @@ pub enum Event {
     SwapV2 { d0: f64, d1: f64 },
     /// Concentrated-liquidity swap: pool balance deltas (raw), price after, LP fee in pips (v4).
     SwapCl { d0: f64, d1: f64, sqrt_price: f64, fee: u32 },
-    /// v3 Collect: tokens leaving the pool (withdrawn liquidity and fees).
+    /// Tokens entering or leaving a concentrated pool outside swaps and mints: Collect
+    /// (withdrawn liquidity and fees), CollectProtocol (Uniswap/Pancake protocol fees),
+    /// CollectFees (Aerodrome Slipstream fees paid to its gauge), Flash (fees paid in).
     Flow { d0: f64, d1: f64 },
     /// Liquidity added or removed, raw amounts (positive). `moves`: the pool's balances
     /// change by them (v3 Mint); otherwise a Sync or Collect accounts for the tokens.
@@ -89,6 +91,9 @@ pub struct Topics {
     pub pancake_swap: [u8; 32],
     pub v3_mint: [u8; 32],
     pub v3_collect: [u8; 32],
+    pub v3_collect_protocol: [u8; 32],
+    pub slipstream_collect_fees: [u8; 32],
+    pub v3_flash: [u8; 32],
     pub v2_mint: [u8; 32],
     pub v2_burn: [u8; 32],
     pub solidly_burn: [u8; 32],
@@ -111,6 +116,9 @@ pub static T: LazyLock<Topics> = LazyLock::new(|| Topics {
     pancake_swap: keccak("Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)"),
     v3_mint: keccak("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
     v3_collect: keccak("Collect(address,address,int24,int24,uint128,uint128)"),
+    v3_collect_protocol: keccak("CollectProtocol(address,address,uint128,uint128)"),
+    slipstream_collect_fees: keccak("CollectFees(address,uint128,uint128)"),
+    v3_flash: keccak("Flash(address,address,uint256,uint256,uint256,uint256)"),
     // Solidly pools emit the same Mint as v2.
     v2_mint: keccak("Mint(address,uint256,uint256)"),
     v2_burn: keccak("Burn(address,uint256,uint256,address)"),
@@ -136,6 +144,9 @@ impl Topics {
             self.pancake_swap,
             self.v3_mint,
             self.v3_collect,
+            self.v3_collect_protocol,
+            self.slipstream_collect_fees,
+            self.v3_flash,
             self.v2_mint,
             self.v2_burn,
             self.solidly_burn,
@@ -179,6 +190,10 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
         Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: false, moves: false }
     } else if t0 == t.v3_collect {
         Event::Flow { d0: -u256_f64(w(1)?), d1: -u256_f64(w(2)?) }
+    } else if t0 == t.v3_collect_protocol || t0 == t.slipstream_collect_fees {
+        Event::Flow { d0: -u256_f64(w(0)?), d1: -u256_f64(w(1)?) }
+    } else if t0 == t.v3_flash {
+        Event::Flow { d0: u256_f64(w(2)?), d1: u256_f64(w(3)?) }
     } else if log.address == V4_POOL_MANAGER {
         let id = *log.topics.get(1)?;
         let ev = if t0 == t.v4_swap {
@@ -324,6 +339,44 @@ mod tests {
         assert_eq!(u256_f64(&five), 5.0);
         assert_eq!(i256_f64(&five), 5.0);
         assert_eq!(u256_f64(&w("0x0000000000000000000000000000000000000000000000000de0b6b3a7640000")), 1e18);
+    }
+
+    #[test]
+    fn fee_outflows_and_flash() {
+        // Real Base logs: indexed addresses sit in topics, so the amounts are the first data words.
+        let real = |topics: &[&str], data: &str| {
+            let topics = topics.iter().map(|t| w(t)).collect();
+            decode(&RawLog { topics, data: unhex(data).unwrap(), address: [7; 20], ..Default::default() }).unwrap().1
+        };
+        // The Aerodrome WETH/USDC CL pool paying its gauge (block 13909768).
+        let gauge = real(
+            &[
+                "0x205860e66845f2bbc0966bfab80db9bf93fca93862ea2b9fcf6945748352b4a3",
+                "0x000000000000000000000000f33a96b5932d9e9b9a0eda447abd8c9d48d2e0c8",
+            ],
+            "0x00000000000000000000000000000000000000000000000000089e47b0ad50cf00000000000000000000000000000000000000000000000000000000006cb7b5",
+        );
+        assert_eq!(gauge, Event::Flow { d0: -(0x89e47b0ad50cfu64 as f64), d1: -(0x6cb7b5 as f64) });
+        // PancakeSwap v3 VIRTUAL/USDC protocol fees (block 25349435).
+        let protocol = real(
+            &[
+                "0x596b573906218d3411850b26a6b437d6c4522fdb43d2d2386263f86d50b8b151",
+                "0x0000000000000000000000000eb5c70f0cbd990e111227ce4dafc31e036f7964",
+                "0x0000000000000000000000000eb5c70f0cbd990e111227ce4dafc31e036f7964",
+            ],
+            "0x000000000000000000000000000000000000000000000007defd2a58bd5eb06d000000000000000000000000000000000000000000000000000000001ad4fec5",
+        );
+        assert_eq!(protocol, Event::Flow { d0: -(0x7defd2a58bd5eb06du128 as f64), d1: -(0x1ad4fec5 as f64) });
+        // A flash loan of 2.1 USDC returning 0x34f on top (block 16397024): only the fee stays.
+        let flash = real(
+            &[
+                "0xbdbdb71d7860376ba52b25a5028beea23581364a40522f6bcfb86bb1f2dca633",
+                "0x0000000000000000000000006dd5ef26a8be161b63cc42c87a1723da0c03986b",
+                "0x0000000000000000000000006dd5ef26a8be161b63cc42c87a1723da0c03986b",
+            ],
+            "0x0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020474c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000034f",
+        );
+        assert_eq!(flash, Event::Flow { d0: 0.0, d1: 0x34f as f64 });
     }
 
     #[test]
