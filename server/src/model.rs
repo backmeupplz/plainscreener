@@ -24,6 +24,8 @@ pub struct Token {
     /// Most liquid pool, where token links go.
     pub best_pool: u32,
     pub first_block: u32,
+    /// When a thin swap (see `Candle::thin`) last set `usd`; 0 if never.
+    pub thin_ts: u32,
     /// We have an icon for it (in the store, not part of this encoding).
     pub icon: bool,
 }
@@ -355,6 +357,7 @@ impl Token {
             .u32(self.ref_pool)
             .u32(self.best_pool)
             .u32(self.first_block)
+            .u32(self.thin_ts)
             .0
     }
     pub fn decode(b: &[u8]) -> Token {
@@ -369,6 +372,7 @@ impl Token {
             ref_pool: r.u32(),
             best_pool: r.u32(),
             first_block: r.u32(),
+            thin_ts: r.u32(),
             icon: false,
         }
     }
@@ -510,6 +514,7 @@ mod tests {
             ref_pool: 3,
             best_pool: 7,
             first_block: 9,
+            thin_ts: 0,
             icon: false,
         };
         let d = Token::decode(&t.encode());
