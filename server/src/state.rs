@@ -220,6 +220,14 @@ impl State {
         2.0 * self.quote_liq(p)
     }
 
+    /// How a token picks its default pair: a pool of at least $1k quoted in a `deep_quote`
+    /// token first, then by liquidity. `liq` alone would let 0.001 of a junk token with $2k
+    /// behind it rank at $4k and chart that pool's price, which the junk's minter sets.
+    pub fn pair_rank(&self, p: u32) -> (bool, f64) {
+        let liq = self.liq(p);
+        (liq >= 1_000.0 && self.deep_quote(self.pools[p as usize].quote()), liq)
+    }
+
     /// USD volume of a trade of `size` of a pool's quote token. A stablecoin or WETH counts at
     /// its price; any other token at no more than the depth behind its price (its reference
     /// pool's capped quote side). A junk token priced at $1e9 from $5k of real liquidity then
@@ -463,8 +471,9 @@ impl State {
             tok.ref_pool = p;
             self.dirty_tokens.insert(base);
         }
-        // A token links to its most liquid trusted pool, or any pool if it has no trusted one.
-        let rank = |s: &State, q: u32| (s.pools[q as usize].trusted(), s.liq(q));
+        // A token links to its best-ranked (`pair_rank`) trusted pool, or any pool if it has no
+        // trusted one: an unknown contract reports its own balances.
+        let rank = |s: &State, q: u32| (s.pools[q as usize].trusted(), s.pair_rank(q));
         for t in [base, quote] {
             let best = self.tokens[t as usize].best_pool;
             if best != p && (best == NONE || rank(self, p) > rank(self, best)) {
@@ -875,6 +884,64 @@ mod tests {
         s.apply(&swap(yq, 100e18, 0.0, 0.0, 2e18), &store);
         let vq = s.stats[&3].window(s.head_ts, 86_400).vol;
         assert!((vq - 100.0).abs() < 1e-6, "{vq}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn junk_quote_token_cannot_be_a_tokens_default_pair() {
+        use crate::pages::{best_pool, own_pool};
+        let dir = std::env::temp_dir().join(format!("ps-test-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let (usdc, junk, late) = (STABLES[0], [8u8; 20], [9u8; 20]);
+        s.add_token(usdc, meta("USDC", 6), 1);
+        s.add_token(junk, meta("BTCB", 18), 1); // seen before LATE, so it quotes LATE/BTCB
+        s.add_token(late, meta("LATE", 18), 1);
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let created = |pool: Addr, t0: Addr, t1: Addr| {
+            let mut data = pad(&pool).to_vec();
+            data.extend(word(1.0));
+            log(10, uniswap, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+        };
+        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
+            let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
+            log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
+        };
+        let (thin, real, bad) = ([2u8; 20], [3u8; 20], [4u8; 20]);
+        // BTCB/USDC: $2k of real USDC, one tiny trade prices BTCB at $1e9.
+        s.apply(&created(thin, usdc, junk), &store);
+        s.apply(&sync(thin, 2_000e6, 2e12), &store);
+        s.apply(&swap(thin, 1_000e6, 0.0, 0.0, 1e12), &store);
+        // LATE/BTCB with 0.001 BTCB ranks at BTCB's whole $2k, $4k of liquidity, and trades first.
+        s.apply(&created(bad, late, junk), &store);
+        s.apply(&sync(bad, 1e18, 1e15), &store);
+        s.apply(&swap(bad, 0.0, 1e14, 1e18, 0.0), &store);
+        let (l, b) = (s.token_ix[&late], s.pool_ix[&pad(&bad)]);
+        assert_eq!(best_pool(&s, l), Some(b), "the only pool LATE has");
+        // LATE/USDC: $1.5k of USDC, $3k of liquidity, less than the junk pool's $4k.
+        s.apply(&created(real, usdc, late), &store);
+        s.apply(&sync(real, 1_500e6, 1_500e18), &store);
+        let r = s.pool_ix[&pad(&real)];
+        assert!((s.liq(b) - 4_000.0).abs() < 1e-6 && (s.liq(r) - 3_000.0).abs() < 1e-6, "{} {}", s.liq(b), s.liq(r));
+        // The real pool takes over as the stored best pair at its next trade…
+        s.apply(&swap(real, 1e6, 0.0, 0.0, 1e18), &store);
+        let checks = |s: &State| {
+            assert_eq!(s.tokens[l as usize].best_pool, r);
+            assert_eq!((own_pool(s, l), best_pool(s, l)), (Some(r), Some(r)));
+        };
+        checks(&s);
+        // …and keeps it when the junk pool trades again.
+        s.apply(&swap(bad, 0.0, 1e14, 1e18, 0.0), &store);
+        checks(&s);
+        // Under $1k the real pool no longer outranks the junk one.
+        s.apply(&sync(real, 400e6, 400e18), &store);
+        s.apply(&swap(real, 1e6, 0.0, 0.0, 1e18), &store);
+        s.apply(&swap(bad, 0.0, 1e14, 1e18, 0.0), &store);
+        assert_eq!(s.tokens[l as usize].best_pool, b);
+        assert_eq!((own_pool(&s, l), best_pool(&s, l)), (Some(b), Some(b)));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }

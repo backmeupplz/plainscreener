@@ -1320,10 +1320,15 @@ pub fn best_pool(st: &State, token: u32) -> Option<u32> {
     })
 }
 
-/// A token's deepest pool on a known DEX where it is the base (at least $1k deep).
+/// A token's best-ranked (`State::pair_rank`) pool on a known DEX where it is the base (at
+/// least $1k deep).
 pub fn own_pool(st: &State, token: u32) -> Option<u32> {
     let ps = st.base_pools.get(&token)?;
-    ps.iter().map(|&p| (st.liq(p), p)).filter(|(l, _)| *l >= 1_000.0).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, p)| p)
+    ps.iter()
+        .map(|&p| (st.pair_rank(p), p))
+        .filter(|((_, l), _)| *l >= 1_000.0)
+        .max_by(|(a, _), (b, _)| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)))
+        .map(|(_, p)| p)
 }
 
 #[cfg(test)]
