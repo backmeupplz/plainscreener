@@ -67,9 +67,9 @@ pub enum Event {
     Modify { tick_lower: i32, tick_upper: i32, liquidity: f64 },
 }
 
-fn keccak(s: &str) -> [u8; 32] {
+pub fn keccak(s: impl AsRef<[u8]>) -> [u8; 32] {
     let mut k = Keccak::v256();
-    k.update(s.as_bytes());
+    k.update(s.as_ref());
     let mut out = [0; 32];
     k.finalize(&mut out);
     out

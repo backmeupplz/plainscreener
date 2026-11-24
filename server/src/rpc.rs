@@ -4,15 +4,20 @@ use crate::abi::{self, Addr, RawLog, T, V4_POOL_MANAGER, hex, unhex};
 use crate::state::Meta;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 const MULTICALL3: &str = "0xca11bde05977b3631167028862be2a173976ca11";
 const DECIMALS: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 const SYMBOL: [u8; 4] = [0x95, 0xd8, 0x9b, 0x41];
 const NAME: [u8; 4] = [0x06, 0xfd, 0xde, 0x03];
 const TOTAL_SUPPLY: [u8; 4] = [0x18, 0x16, 0x0d, 0xdd];
+/// A block without logs whose bloom allows our events is trusted this many blocks deep (~5 s).
+const DEPTH: u32 = 25;
+/// Polls (every 500 ms) for such a block's logs before failing, so the indexer retries.
+const MAX_POLLS: u32 = if cfg!(test) { 4 } else { 40 };
 
 #[derive(Clone)]
 pub struct Rpc {
@@ -32,6 +37,10 @@ impl Rpc {
 
     /// Sends several calls in one request; results come back in order.
     async fn batch(&self, calls: Vec<(&str, Value)>) -> Result<Vec<Value>> {
+        // The node answers an empty batch with an error object, not an empty list.
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
         let body: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -58,7 +67,33 @@ impl Rpc {
 
     /// Our logs in `[from, to]`, ordered, with block timestamps and transaction senders.
     pub async fn logs(&self, from: u32, to: u32) -> Result<Vec<RawLog>> {
-        let res = self.raw_logs(from, to).await?;
+        let headers = self.headers(from, to).await?;
+        // The caller saves the range as done, so a block without logs must not just be one
+        // whose receipts the node hasn't stored yet. Trust it when its bloom rules our events
+        // out, per filter; a bloom also matches by chance, so trust it anyway once the node's
+        // head is `DEPTH` blocks past it (by depth, so no clock can make a fresh block look old).
+        let mut res = self.raw_logs(from, to).await?;
+        for poll in 0.. {
+            let have: HashSet<(u32, usize)> =
+                res.iter().filter_map(|l| Some((num(&l["blockNumber"])?, filter_of(l)))).collect();
+            let missing: Vec<u32> = (from..=to)
+                .zip(&headers)
+                .filter(|&(b, (_, bloom))| (0..2).any(|f| bloom[f] && !have.contains(&(b, f))))
+                .map(|(b, _)| b)
+                .collect();
+            let Some(&newest) = missing.last() else { break };
+            if self.block_number().await? >= newest.saturating_add(DEPTH) {
+                if poll > 0 {
+                    eprintln!("indexer: no logs in blocks {missing:?} although their blooms allow them");
+                }
+                break;
+            }
+            if poll == MAX_POLLS {
+                bail!("blocks {missing:?}: no logs yet, although their blooms allow them");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            res = self.raw_logs(from, to).await?;
+        }
         let mut logs: Vec<RawLog> = res.iter().filter_map(parse_log).collect();
         logs.sort_by_key(|l| (l.block, l.index));
         let mut hashes: Vec<[u8; 32]> = logs.iter().map(|l| l.tx).collect();
@@ -71,19 +106,32 @@ impl Rpc {
                 senders.insert(*h, addr20(&tx["from"]).unwrap_or_default());
             }
         }
-        let mut blocks: Vec<u32> = logs.iter().map(|l| l.block).collect();
-        blocks.dedup();
-        let calls = blocks.iter().map(|b| ("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))).collect();
-        let times: HashMap<u32, u32> = blocks
-            .iter()
-            .copied()
-            .zip(self.batch(calls).await?.iter().map(|b| num(&b["timestamp"]).unwrap_or(0)))
-            .collect();
         for l in &mut logs {
             l.from = senders.get(&l.tx).copied().unwrap_or_default();
-            l.ts = times.get(&l.block).copied().context("block timestamp")?;
+            l.ts = l
+                .block
+                .checked_sub(from)
+                .and_then(|i| headers.get(i as usize))
+                .map(|h| h.0)
+                .context("block timestamp")?;
         }
         Ok(logs)
+    }
+
+    /// Timestamp of each block in `[from, to]`, and which of our filters its logs bloom allows.
+    /// A block the node can't show is an error: its logs can't be vouched for.
+    async fn headers(&self, from: u32, to: u32) -> Result<Vec<(u32, [bool; 2])>> {
+        let blocks: Vec<u32> = (from..=to).collect();
+        let mut out = Vec::with_capacity(blocks.len());
+        for chunk in blocks.chunks(200) {
+            let calls = chunk.iter().map(|b| ("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))).collect();
+            for (b, h) in chunk.iter().zip(self.batch(calls).await?) {
+                let ts = num(&h["timestamp"]).context(format!("block {b}: no timestamp"))?;
+                let bloom = h["logsBloom"].as_str().and_then(unhex).filter(|b| b.len() == 256);
+                out.push((ts, bloom_matches(&bloom.context(format!("block {b}: no logs bloom"))?)));
+            }
+        }
+        Ok(out)
     }
 
     /// Every raw log of our filters in `[from, to]`. The node refuses a range with too many
@@ -230,6 +278,31 @@ fn hint_end(e: &anyhow::Error) -> Option<u32> {
     rpc_message(e)?.rsplit_once('-')?.1.trim().parse().ok()
 }
 
+/// Which of our two `get_logs` filters a 2048-bit logs bloom may hold an event of: any log
+/// with a topic of `T.any_address()`, and a v4 topic from the pool manager. False positives
+/// happen, false negatives don't.
+fn bloom_matches(bloom: &[u8]) -> [bool; 2] {
+    let has = |item: &[u8]| bloom_has(bloom, item);
+    [T.any_address().iter().any(|t| has(t)), has(&V4_POOL_MANAGER) && T.v4().iter().any(|t| has(t))]
+}
+
+/// Which `get_logs` filter returned a log: 1 for a v4 event of the pool manager, else 0.
+fn filter_of(l: &Value) -> usize {
+    let topic = l["topics"][0].as_str().and_then(unhex);
+    usize::from(
+        addr20(&l["address"]) == Some(V4_POOL_MANAGER) && topic.is_some_and(|t| T.v4().iter().any(|v| v[..] == t[..])),
+    )
+}
+
+/// Whether the bloom has the three bits of `item` (an address or a topic) set.
+fn bloom_has(bloom: &[u8], item: &[u8]) -> bool {
+    let h = abi::keccak(item);
+    (0..3).all(|i| {
+        let bit = (usize::from(h[2 * i]) << 8 | usize::from(h[2 * i + 1])) & 2047;
+        bloom.get(255 - bit / 8).is_some_and(|byte| byte & 1 << (bit % 8) != 0)
+    })
+}
+
 fn num(v: &Value) -> Option<u32> {
     u32::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok()
 }
@@ -356,38 +429,150 @@ mod tests {
         assert_eq!(text(b"WETH\0\0\0\0", 10), "WETH");
     }
 
-    /// A fake node: one log per block for each filter, refusing ranges over `limit`
-    /// blocks the way reth does, with a hint built by `hint(from, limit)`.
-    async fn fake_node(limit: u32, hint: fn(u32, u32) -> String) -> (Rpc, Arc<AtomicUsize>) {
+    /// A fake node answering each call with `reply(call, n)` (`n`: requests before this one)
+    /// and an empty batch with an error object, like reth. Also returns the request count.
+    async fn fake<F>(reply: F) -> (Rpc, Arc<AtomicUsize>)
+    where
+        F: Fn(&Value, usize) -> Value + Clone + Send + Sync + 'static,
+    {
         let calls = Arc::new(AtomicUsize::new(0));
         let n = calls.clone();
         let app = axum::Router::new().route(
             "/",
             axum::routing::post(move |axum::Json(reqs): axum::Json<Vec<Value>>| async move {
-                n.fetch_add(1, Ordering::Relaxed);
-                let out: Vec<Value> = reqs
-                    .iter()
-                    .map(|r| {
-                        let f = &r["params"][0];
-                        let (a, b) = (num(&f["fromBlock"]).unwrap(), num(&f["toBlock"]).unwrap());
-                        if b - a + 1 > limit {
-                            let message = format!("query exceeds max results 20000, {}", hint(a, limit));
-                            return json!({"jsonrpc": "2.0", "id": r["id"], "error": {"code": -32602, "message": message}});
-                        }
-                        let logs: Vec<Value> = (a..=b)
-                            .map(|blk| json!({"blockNumber": format!("0x{blk:x}"), "logIndex": "0x0", "address": hex(&[1; 20]),
-                                "topics": [], "data": "0x", "transactionHash": hex(&[2; 32])}))
-                            .collect();
-                        json!({"jsonrpc": "2.0", "id": r["id"], "result": logs})
-                    })
-                    .collect();
-                axum::Json(out)
+                let n = n.fetch_add(1, Ordering::Relaxed);
+                if reqs.is_empty() {
+                    return axum::Json(
+                        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid request"}}),
+                    );
+                }
+                let out = reqs.iter().map(|r| {
+                    let mut o = reply(r, n);
+                    o["jsonrpc"] = json!("2.0");
+                    o["id"] = r["id"].clone();
+                    o
+                });
+                axum::Json(Value::Array(out.collect()))
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
         (Rpc::new(&url), calls)
+    }
+
+    /// A log at `block` as the getLogs filter `f` (`f["address"]` set: the v4 one) returns it.
+    fn log_at(block: u32, f: &Value) -> Value {
+        let (address, topic) = if f["address"].is_null() { ([1; 20], T.v2_sync) } else { (V4_POOL_MANAGER, T.v4_swap) };
+        json!({"blockNumber": format!("0x{block:x}"), "logIndex": "0x0", "address": hex(&address),
+            "topics": [hex(&topic)], "data": "0x", "transactionHash": hex(&[2; 32])})
+    }
+
+    /// A fake node: one log per block for each filter, refusing ranges over `limit`
+    /// blocks the way reth does, with a hint built by `hint(from, limit)`.
+    async fn fake_node(limit: u32, hint: fn(u32, u32) -> String) -> (Rpc, Arc<AtomicUsize>) {
+        fake(move |r, _| {
+            let f = &r["params"][0];
+            let (a, b) = (num(&f["fromBlock"]).unwrap(), num(&f["toBlock"]).unwrap());
+            if b - a + 1 > limit {
+                let message = format!("query exceeds max results 20000, {}", hint(a, limit));
+                return json!({"error": {"code": -32602, "message": message}});
+            }
+            json!({"result": (a..=b).map(|blk| log_at(blk, f)).collect::<Vec<_>>()})
+        })
+        .await
+    }
+
+    /// A fake node that, for the first `lag_for` requests, has no logs for the last block of
+    /// a range from the filters in `lag`, then one log per block and filter. `bloom(b)` gives
+    /// block `b`'s bloom byte (`None`: the node doesn't have it); `head(n)` its head.
+    async fn lagging_node(
+        lag_for: usize,
+        lag: [bool; 2],
+        bloom: fn(u32) -> Option<&'static str>,
+        head: fn(usize) -> u32,
+    ) -> (Rpc, Arc<AtomicUsize>) {
+        fake(move |r, n| {
+            let p = &r["params"][0];
+            match r["method"].as_str().unwrap() {
+                "eth_getLogs" => {
+                    let (a, b) = (num(&p["fromBlock"]).unwrap(), num(&p["toBlock"]).unwrap());
+                    let b =
+                        if n < lag_for && lag[usize::from(!p["address"].is_null())] { b.wrapping_sub(1) } else { b };
+                    json!({"result": (a..=b).map(|blk| log_at(blk, p)).collect::<Vec<_>>()})
+                }
+                "eth_getBlockByNumber" => match bloom(num(p).unwrap()) {
+                    Some(x) => json!({"result": {"timestamp": "0x10", "logsBloom": format!("0x{}", x.repeat(256))}}),
+                    None => json!({"result": null}),
+                },
+                "eth_blockNumber" => json!({"result": format!("0x{:x}", head(n))}),
+                "eth_getTransactionByHash" => json!({"result": {"from": hex(&[3; 20])}}),
+                m => panic!("unexpected {m}"),
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn blocks_without_logs_are_trusted_only_when_bloom_or_depth_allow() {
+        let blocks = |logs: &[RawLog]| logs.iter().map(|l| l.block).collect::<Vec<_>>();
+        let (both, any, v4) = ([true, true], [true, false], [false, true]);
+        // An empty batch is no request at all (the node would answer it with an error).
+        let (rpc, calls) = lagging_node(0, both, |_| None, |_| 0).await;
+        assert!(rpc.batch(vec![]).await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        // Nothing in the bloom: an empty block is real, no retry.
+        let (rpc, calls) = lagging_node(usize::MAX, both, |_| Some("00"), |_| 5).await;
+        assert!(rpc.logs(5, 5).await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "one header batch, one getLogs");
+
+        // The newest block's bloom allows our events but it has none yet: wait for them, even
+        // though the rest of the range came back, and even when only one filter lags.
+        for lag in [both, any, v4] {
+            let (rpc, _) = lagging_node(4, lag, |b| Some(if b == 6 { "ff" } else { "00" }), |_| 6).await;
+            let logs = rpc.logs(5, 6).await.unwrap();
+            assert_eq!(blocks(&logs), [5, 5, 6, 6], "lag {lag:?}");
+            assert!(logs.iter().all(|l| l.ts == 16 && l.from == [3; 20]));
+        }
+
+        // A lagging block whose bloom rules us out doesn't hold the range up.
+        let (rpc, calls) = lagging_node(usize::MAX, both, |b| Some(if b == 6 { "00" } else { "ff" }), |_| 6).await;
+        assert_eq!(blocks(&rpc.logs(5, 6).await.unwrap()), [5, 5]);
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "headers, getLogs, senders");
+
+        // Still none once the node is `DEPTH` blocks past it: a chance match, trusted.
+        let (rpc, calls) = lagging_node(usize::MAX, both, |_| Some("ff"), |n| 5 + 10 * n as u32).await;
+        assert!(rpc.logs(5, 5).await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 5, "headers, getLogs, head 25, getLogs, head 45");
+        let (rpc, calls) = lagging_node(usize::MAX, both, |_| Some("ff"), |_| 5 + DEPTH).await;
+        assert!(rpc.logs(5, 5).await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // A stalled node doesn't hold the indexer forever, nor gets the block saved.
+        let (rpc, _) = lagging_node(usize::MAX, both, |_| Some("ff"), |_| 5).await;
+        assert!(rpc.logs(5, 5).await.unwrap_err().to_string().contains("no logs yet"));
+
+        // A block the node can't show can't be vouched for.
+        let (rpc, _) = lagging_node(usize::MAX, both, |b| (b == 5).then_some("00"), |_| 99).await;
+        assert!(rpc.logs(5, 6).await.is_err());
+    }
+
+    #[test]
+    fn blooms_of_real_blocks() {
+        let bloom = |s: &str| unhex(s).unwrap();
+        // Base block 61794474: v2 Sync and Swap logs among 12.
+        let b = bloom(
+            "0x00200000000020100800000884001000000000000000000000340000000000000100040001000000004000100002100000100a00000000000002000008600000048000000040000080000008000000200020000000081400001000080800000000c00020000400000000000000000000000000000000000000000010000040000000000800000000000000004000000000000000002000088000004000040010020000040000000000000000000080000000000000000000010000004000004000000102000100000000000000000000000000000000001000000600000000200010000020000000000000000000000400000000200820000000810000000008",
+        );
+        assert!(bloom_has(&b, &T.v2_sync) && bloom_has(&b, &T.v2_swap) && bloom_matches(&b)[0]);
+        // Base block 61797382: a v4 Swap from the pool manager, no other event of ours.
+        let b = bloom(
+            "0x00000000000000000000000000001000001200200084000000000000000000000020812000000000000080000000100000808000040000000400000210080000410004000000000008000408000000000002000000080020000000000000008000800000020800200000000402004804040000800000000000000032008000040010000004004000208000000000000000000000000000004000000401044000004000000000000000000008000000000004004200008000000000000000400004020402000000200000c00000000000000800080000000200280002000020000000000000000000004000000000000000000400000000000000000000021040",
+        );
+        assert!(bloom_has(&b, &V4_POOL_MANAGER) && bloom_has(&b, &T.v4_swap));
+        assert_eq!(bloom_matches(&b), [false, true]);
+        assert_eq!(bloom_matches(&[0; 256]), [false, false]);
     }
 
     #[tokio::test]
