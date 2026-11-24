@@ -204,7 +204,7 @@ impl State {
                 pool.bal0 = r0 / s0;
                 pool.bal1 = r1 / s1;
             }
-            Event::SwapV2 { d0, d1 } => self.trade(p, log, ts, d0 / s0, d1 / s1, store),
+            Event::SwapV2 { d0, d1 } => self.trade(p, log, ts, d0 / s0, d1 / s1, 1.0, store),
             Event::SwapCl { d0, d1, sqrt_price, fee } => {
                 let (d0, d1) = (d0 / s0, d1 / s1);
                 // LP fees stay in the pool until withdrawn; v4 withdrawals don't report
@@ -213,7 +213,7 @@ impl State {
                 pool.bal0 += if d0 > 0.0 { d0 * keep } else { d0 };
                 pool.bal1 += if d1 > 0.0 { d1 * keep } else { d1 };
                 pool.sqrt_price = sqrt_price;
-                self.trade(p, log, ts, d0, d1, store)
+                self.trade(p, log, ts, d0, d1, keep, store)
             }
             Event::Flow { d0, d1 } => {
                 pool.bal0 += d0 / s0;
@@ -315,8 +315,10 @@ impl State {
 
     /// Records a swap given the pool's balance deltas in whole tokens. The price is what
     /// was actually exchanged: a concentrated-liquidity pool's spot price after a swap
-    /// through an empty range sits at the protocol limit, which nobody traded at.
-    fn trade(&mut self, p: u32, log: &RawLog, ts: u32, d0: f64, d1: f64, store: &Store) {
+    /// through an empty range sits at the protocol limit, which nobody traded at. `keep` is
+    /// the share of tokens paid in that the pool's balances counted (v4 leaves out fees).
+    #[allow(clippy::too_many_arguments)]
+    fn trade(&mut self, p: u32, log: &RawLog, ts: u32, d0: f64, d1: f64, keep: f64, store: &Store) {
         let pool = &self.pools[p as usize];
         let (db, dq) = if pool.quote0 { (d1, d0) } else { (d0, d1) };
         if db == 0.0 || dq == 0.0 {
@@ -331,6 +333,30 @@ impl State {
         let usd = native * qusd;
         let vol = dq.abs() * qusd;
         let buy = db < 0.0;
+        let trade = Trade {
+            ts,
+            tx: log.tx,
+            maker: log.from,
+            buy,
+            base: db.abs(),
+            quote: dq.abs(),
+            usd: vol as f32,
+            price_usd: usd as f32,
+            price_native: native as f32,
+            kind: TradeKind::Swap,
+        };
+        self.trades.push((trade_key(p, log.block, log.index), trade.encode()));
+        self.touched.insert(p);
+        // A launch can seed a pool with the base token alone and have its creator buy the
+        // cheapest part of it, far below where anyone else can trade. So a pool's first USD
+        // price comes from a trade that meets quote tokens already in the pool; one before
+        // it is listed but sets no price, candle or volume. (Balances are already past this
+        // trade, which added `dq`, or only `dq * keep` when paid in.)
+        let before = pool.bal_quote() - if dq > 0.0 { dq * keep } else { dq };
+        if !pool.price_usd.is_finite() && usd.is_finite() && before <= dq.abs() * 1e-3 {
+            self.pools[p as usize].last_ts = ts;
+            return;
+        }
         let (prev_usd, prev_native) = (pool.price_usd, pool.price_native);
 
         for (ri, res) in RES.iter().enumerate() {
@@ -363,19 +389,6 @@ impl State {
         }
         let open = if prev_usd.is_finite() { prev_usd } else { usd };
         self.stats.entry(p).or_insert_with(Stats::new).add(ts, open, vol, buy);
-        let trade = Trade {
-            ts,
-            tx: log.tx,
-            maker: log.from,
-            buy,
-            base: db.abs(),
-            quote: dq.abs(),
-            usd: vol as f32,
-            price_usd: usd as f32,
-            price_native: native as f32,
-            kind: TradeKind::Swap,
-        };
-        self.trades.push((trade_key(p, log.block, log.index), trade.encode()));
 
         let pool = &mut self.pools[p as usize];
         pool.price_native = native;
@@ -406,7 +419,6 @@ impl State {
                 self.dirty_tokens.insert(t);
             }
         }
-        self.touched.insert(p);
     }
 
     /// Writes everything changed since the last flush, with the next block to index.
@@ -585,6 +597,110 @@ mod tests {
         s.apply(&sync(pool_f, 10_000e18, 10_000e6), &store);
         s.apply(&swap(pool_f, 0.0, 1e6, 1e18, 0.0), &store); // 1 LATE for 1 USDC
         assert!((s.tokens[l as usize].usd - 1.0).abs() < 1e-9, "{}", s.tokens[l as usize].usd);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two's complement of `word(x)`, for negative int256 amounts.
+    fn neg(x: f64) -> Vec<u8> {
+        let mut w = word(x);
+        let mut carry = true;
+        for b in w.iter_mut().rev() {
+            (*b, carry) = (!*b).overflowing_add(carry as u8);
+        }
+        w
+    }
+
+    /// A launch seeds the pool with the token alone and its creator buys a quarter of the
+    /// supply at a dust price in the same transaction (seen on Base as v4 launches showing
+    /// +13M%). That trade is listed, but the pool's price, candles and changes start at the
+    /// next one, also after a restart.
+    #[test]
+    fn creator_buy_into_token_only_pool_sets_no_baseline() {
+        let dir = std::env::temp_dir().join(format!("ps-test-launch-{}", std::process::id()));
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let meme = [9u8; 20]; // token0, WETH token1
+        s.add_token(WETH, meta("WETH", 18), 1);
+        s.add_token(meme, meta("MEME", 18), 1);
+        s.tokens[0].usd = 3000.0;
+        let factory = hex20("33128a8fc17869897dce68ed026d694621f6fdfd");
+        let pool = [2u8; 20];
+        let at = |block: u32, topics: Vec<[u8; 32]>, data: Vec<u8>| log(block, pool, topics, data);
+        let mut created = log(10, factory, vec![T.v3_pool_created, pad(&meme), pad(&WETH), [0; 32]], word(200.0));
+        created.data.extend(pad(&pool));
+        s.apply(&created, &store);
+        let p = s.pool_ix[&pad(&pool)];
+        // 2B MEME and no WETH, then the creator buys 500M MEME for 0.1 WETH ($6e-7 each).
+        s.apply(
+            &at(10, vec![T.v3_mint, [0; 32], [0; 32], [0; 32]], [word(0.0), word(1.0), word(2e27), word(0.0)].concat()),
+            &store,
+        );
+        let swap = |block: u32, meme_out: f64, weth_in: f64| {
+            at(
+                block,
+                vec![T.v3_swap, [0; 32], [0; 32]],
+                [neg(meme_out), word(weth_in), word(1.0), word(1.0), word(0.0)].concat(),
+            )
+        };
+        s.apply(&swap(10, 5e26, 1e17), &store);
+        assert!(s.pools[p as usize].price_usd.is_nan(), "no price from the creator's buy");
+        assert!(!s.stats.contains_key(&p) && !s.candles.contains_key(&(p, 0)), "nor candles or volume");
+        // A minute later the market trades at $0.09: 10 MEME for 0.0003 WETH.
+        s.apply(&swap(80, 1e19, 3e14), &store);
+        assert!((s.pools[p as usize].price_usd - 0.09).abs() < 1e-9, "{}", s.pools[p as usize].price_usd);
+        let checks = |s: &State| {
+            let m = crate::pages::metrics(s, p);
+            for w in 0..4 {
+                assert!(crate::pages::change(&m, w).abs() < 1e-6, "window {w}: {}", crate::pages::change(&m, w));
+            }
+        };
+        checks(&s);
+        s.flush(&store, 81).unwrap();
+        assert_eq!(store.trades(p, (u32::MAX, 0), 10).len(), 2, "the creator's buy is still listed");
+        let candles = store.candles(p, 0, 0, u32::MAX, 10);
+        assert_eq!(candles.len(), 1);
+        assert!((candles[0].1.o as f64 - 0.09).abs() < 1e-6 && (candles[0].1.l as f64 - 0.09).abs() < 1e-6);
+        checks(&State::load(&store).unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same launch on v4 with ETH as token0 and a 50% launch fee, restarted between the
+    /// creator's buy and the next one. Fees paid in aren't in v4 balances, so the next buy,
+    /// 20 times the ETH the pool held, still counts as meeting it.
+    #[test]
+    fn v4_launch_with_high_fee() {
+        let dir = std::env::temp_dir().join(format!("ps-test-v4-launch-{}", std::process::id()));
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let meme = [9u8; 20];
+        s.add_token(WETH, meta("WETH", 18), 1);
+        s.add_token(meme, meta("MEME", 18), 1);
+        s.tokens[0].usd = 3000.0;
+        let id = [5u8; 32];
+        let pm = |block: u32, topic: [u8; 32], data: Vec<Vec<u8>>| {
+            log(block, abi::V4_POOL_MANAGER, vec![topic, id, [0; 32], pad(&meme)], data.concat())
+        };
+        // Starts at price 1 (tick 0) with MEME only in ticks -200..-100: ~2B MEME, no ETH.
+        s.apply(&pm(10, T.v4_initialize, vec![word(500_000.0), word(1.0), word(0.0), word(Q96), word(0.0)]), &store);
+        s.apply(&pm(10, T.v4_modify, vec![neg(200.0), neg(100.0), word(4e29), word(0.0)]), &store);
+        let p = s.pool_ix[&id];
+        assert!(s.pools[p as usize].quote0 && s.pools[p as usize].bal0 == 0.0);
+        // v4 reports the swapper's deltas: pays ETH (negative), gets MEME.
+        let buy = |block: u32, eth: f64, meme: f64| {
+            pm(block, T.v4_swap, vec![neg(eth), word(meme), word(Q96), word(1.0), word(0.0), word(500_000.0)])
+        };
+        s.apply(&buy(10, 1e17, 5e26), &store); // the creator: 500M MEME for 0.1 ETH
+        assert!(s.pools[p as usize].price_usd.is_nan());
+        s.flush(&store, 11).unwrap();
+        let mut s = State::load(&store).unwrap();
+        s.apply(&buy(80, 1e18, 1e18 / 3e-5), &store); // 1 ETH at $0.09
+        assert!((s.pools[p as usize].price_usd - 0.09).abs() < 1e-9, "{}", s.pools[p as usize].price_usd);
+        let m = crate::pages::metrics(&s, p);
+        for w in 0..4 {
+            assert!(crate::pages::change(&m, w).abs() < 1e-6, "window {w}: {}", crate::pages::change(&m, w));
+        }
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
