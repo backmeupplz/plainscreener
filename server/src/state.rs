@@ -389,6 +389,7 @@ impl State {
             liquidity: if kind == Kind::V4 { 0.0 } else { f64::NAN },
             stable: (kind == Kind::Solidly).then_some(stable),
             spot: f64::NAN,
+            thin_ts: 0,
         };
         if sqrt > 0.0 {
             pool.price_native = self.cl_price(&pool, sqrt);
@@ -520,6 +521,10 @@ impl State {
         // The next move is measured from here. After a thin trade that is the price it recorded,
         // so whatever gap it left to the real spot price counts against the next trade too.
         pool.spot = if thin || !spot_now.is_finite() { native } else { spot_now };
+        if thin {
+            pool.thin_ts = ts;
+        }
+        let pool_thin = pool.thin_ts;
         let trusted = pool.trusted();
         // The heaviest pool (`ref_weight`) sets the price, judged by liquidity now (a drained or
         // rugged reference pool loses its claim at once).
@@ -534,9 +539,9 @@ impl State {
             let tok = &mut self.tokens[base as usize];
             tok.usd = usd;
             tok.ref_pool = p;
-            if thin {
-                tok.thin_ts = ts;
-            }
+            // A pool pumped thin while it wasn't the token's pricing pool brings that along
+            // when it takes over.
+            tok.thin_ts = tok.thin_ts.max(pool_thin);
             self.dirty_tokens.insert(base);
         }
         // A token links to its best-ranked (`pair_rank`) trusted pool, or any pool if it has no
@@ -586,12 +591,13 @@ impl State {
             return (true, to);
         }
         // A pair's USD price also moves with its quote token's. If that moved since this pool
-        // last traded and a thin swap set the quote's price meanwhile (in whichever pool), the
-        // move isn't backed either.
+        // last traded and a pool with a thin swap since then set the quote's price, the move
+        // isn't backed either. WETH and stablecoins are priced from deep pools.
         let q = &self.tokens[pool.quote() as usize];
         let then = pool.price_usd / pool.price_native;
         let moved = then.is_finite() && then > 0.0 && (q.usd / then).max(then / q.usd) > SPOT_SLACK;
-        (moved && q.thin_ts >= pool.last_ts && q.thin_ts > 0, to)
+        let anchor = q.addr == WETH || STABLES.contains(&q.addr);
+        (moved && !anchor && q.thin_ts >= pool.last_ts && q.thin_ts > 0, to)
     }
 
     /// Writes everything changed since the last flush, with the next block to index.
@@ -1787,8 +1793,10 @@ mod tests {
     #[test]
     fn thin_move_of_the_quote_token_counts_for_its_pairs() {
         // Block b is at 300 + b seconds past an hour.
-        for fresh_ref in [false, true] {
-            let (store, mut s, dir) = fresh(if fresh_ref { "hop-ref" } else { "hop" });
+        // 0: X's pricing pool is pumped; 1: then a fresh, deeper pool takes over X's price
+        // cleanly; 2: a side pool is pumped (it can't set X's price), then deepened to take over.
+        for case in 0..3 {
+            let (store, mut s, dir) = fresh(&format!("hop{case}"));
             let (usdc, x, j) = (STABLES[0], [10u8; 20], [12u8; 20]);
             let (xp, jxp, xp2) = ([2u8; 20], [3u8; 20], [5u8; 20]);
             let st = &store;
@@ -1803,14 +1811,25 @@ mod tests {
             wash_at(&mut s, st, jxp, 6_000.0, 13);
             assert_eq!(m_thin(&s, 1), 0);
             assert!(change(&s, 1) > 0.2, "{}", change(&s, 1));
-            // 9 s later X's owner pulls X/USDC down to $1.2k, pumps X 100× there (thin) and
-            // puts $480k back.
-            let (r0, r1) = reserves(&s, xp);
-            s.apply(&at(v2_sync(xp, r0 / 200.0 * 1e6, r1 / 200.0 * 1e18), 22), st);
-            xy_at(&mut s, st, xp, 10_890.0, 0.0, 22);
-            let (r0, r1) = reserves(&s, xp);
-            s.apply(&at(v2_sync(xp, r0 * 40.0 * 1e6, r1 * 40.0 * 1e18), 22), st);
-            if fresh_ref {
+            // 9 s later X's owner pulls an X/USDC pool down to $1.2k, pumps X 100× there (thin)
+            // and puts $480k back (in case 2 a side pool, deepened to outweigh X/USDC).
+            let pumped = if case == 2 { xp2 } else { xp };
+            if case == 2 {
+                let (r0, r1) = reserves(&s, xp);
+                v2_pool(&mut s, st, xp2, usdc, x, r0 / 200.0, r1 / 200.0);
+            } else {
+                let (r0, r1) = reserves(&s, xp);
+                s.apply(&at(v2_sync(xp, r0 / 200.0 * 1e6, r1 / 200.0 * 1e18), 22), st);
+            }
+            xy_at(&mut s, st, pumped, 10_890.0, 0.0, 22);
+            xy_at(&mut s, st, pumped, 0.001, 0.0, 23);
+            let (r0, r1) = reserves(&s, pumped);
+            let k = if case == 2 { 80.0 } else { 40.0 };
+            s.apply(&at(v2_sync(pumped, r0 * k * 1e6, r1 * k * 1e18), 23), st);
+            if case == 2 {
+                xy_at(&mut s, st, xp2, 1.0, 0.0, 30);
+                assert_eq!(s.tokens[1].ref_pool, s.pool_ix[&pad(&xp2)]);
+            } else if case == 1 {
                 // A fresh, deeper X/USDC pool at the new price takes over X's price cleanly.
                 let (r0, r1) = reserves(&s, xp);
                 v2_pool(&mut s, st, xp2, usdc, x, r0 * 2.0, r1 * 2.0);
@@ -1823,7 +1842,7 @@ mod tests {
             // Two hours later, 5 s past the hour, J/X wash-trades flat in X: J "up 100×" in USD.
             wash_at(&mut s, st, jxp, 6_000.0, 3_300 + 7_200 + 5);
             assert!(change(&s, 1) > 50.0, "{}", change(&s, 1));
-            assert_eq!(gated_and_ranked(&s, 1), (true, false), "fresh ref pool: {fresh_ref}");
+            assert_eq!(gated_and_ranked(&s, 1), (true, false), "case {case}");
             drop(store);
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -1868,7 +1887,7 @@ mod tests {
         let p = &s.pools[0];
         assert_eq!(Pool::decode(&p.encode()).stable, Some(true));
         // A record stored before these fields: liquidity and curve unknown.
-        let old = &p.encode()[..p.encode().len() - 17];
+        let old = &p.encode()[..p.encode().len() - 21];
         let d = Pool::decode(old);
         assert!(d.liquidity.is_nan() && d.stable.is_none());
         let c = Candle { thin: 2, ..Default::default() };

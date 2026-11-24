@@ -60,6 +60,8 @@ pub struct Pool {
     /// Spot price (quote per base) where the last recorded trade left the pool; NaN when
     /// unknown. Moves from here are checked for depth (see `State::thin`).
     pub spot: f64,
+    /// When a thin swap (see `Candle::thin`) last traded here; 0 if never.
+    pub thin_ts: u32,
 }
 
 impl Pool {
@@ -403,6 +405,7 @@ impl Pool {
                 Some(true) => 2,
             })
             .f64(self.spot)
+            .u32(self.thin_ts)
             .0
     }
     pub fn decode(b: &[u8]) -> Pool {
@@ -429,6 +432,7 @@ impl Pool {
                 b => Some(b == 2),
             },
             spot: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
+            thin_ts: r.u32(),
         }
     }
 }
