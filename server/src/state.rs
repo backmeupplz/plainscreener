@@ -10,8 +10,17 @@ use std::collections::{HashMap, HashSet};
 pub const NONE: u32 = u32::MAX;
 /// Quote-side liquidity a pool needs before its trades may set a token's USD price.
 const MIN_REF_LIQ: f64 = 1_000.0;
-/// Real depth behind a quote token's price before its pairs' moves rank on Gainers and Losers.
+/// Real depth behind a quote token's price before its pairs' moves rank on Gainers and Losers
+/// and its pairs count in full for a token's price (see `ref_weight`).
 const DEEP_QUOTE: f64 = 100_000.0;
+/// How many times less a pool quoted in a token that isn't a `deep_quote` counts for a price.
+// ponytail: a margin, not a proof, and every balance here can be borrowed for one transaction.
+// Taking a price from a pool of depth D quoted in a deep token takes over 4×D behind a token
+// someone controls (over D once $100k clears DEEP_QUOTE); taking one from a pool of depth D
+// quoted in a shallower token takes a deep-quoted pool over D/4, plus a dip of that token's
+// own pool under the bar when it sits just above it. Retune, or ramp the divisor with that
+// pool's depth, if prod shows abuse either way.
+const UNPROVEN_DIV: f64 = 4.0;
 /// Pricing pools followed when capping a pool's liquidity (see `quote_liq`).
 const MAX_HOPS: usize = 8;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
@@ -170,6 +179,21 @@ impl State {
         0.0
     }
 
+    /// A pool's weight in the contest for its base token's price: its quote-side depth, divided
+    /// by `UNPROVEN_DIV` unless the quote token is a `deep_quote`. Whoever makes a token can
+    /// make its pricing pool look any way they like, so its capped depth proves little: $2k
+    /// parked behind a junk token, out of anyone else's reach, let a pool holding dust of it
+    /// outbid a small token's $1.5k USDC pool and price it at $100,000. Zeroing such pools
+    /// instead would hand the price of a token traded mostly against a small token to any $1k
+    /// USDC pool.
+    fn ref_weight(&self, p: u32) -> f64 {
+        let Some(pool) = self.pools.get(p as usize) else {
+            return 0.0;
+        };
+        let liq = self.quote_liq(p);
+        if self.deep_quote(pool.quote()) { liq } else { liq / UNPROVEN_DIV }
+    }
+
     /// How much a token with a common symbol looks like the real one: the chain's own WETH and
     /// stablecoins first, then tokens with a listed icon. Ranking copies by liquidity alone
     /// puts scams on top, since a fake quote token can price its pool at billions.
@@ -178,9 +202,9 @@ impl State {
         (tok.addr == WETH || STABLES.contains(&tok.addr), tok.icon)
     }
 
-    /// Whether pairs quoted in `t` may rank on Gainers and Losers: WETH, a stablecoin, or a token
-    /// with at least $100k of real depth behind its price (its reference pool's capped quote
-    /// side, half its liquidity). Whoever mints a junk quote token sets both its USD price and its pairs' prices in
+    /// Whether pairs quoted in `t` may rank on Gainers and Losers and count in full for a price:
+    /// WETH, a stablecoin, or a token with at least $100k of real depth behind its price (its
+    /// reference pool's capped quote side, half its liquidity). Whoever mints a junk quote token sets both its USD price and its pairs' prices in
     /// it for free (one tiny trade in its own pool, or overpaying with freshly minted tokens), so
     /// no formula over those two prices can tell a real move from a fake one.
     // ponytail: the depth is parked, not spent (in a v3/v4 pool it can even sit out of range), so
@@ -424,15 +448,15 @@ impl State {
         pool.price_usd = usd;
         pool.last_ts = ts;
         let trusted = pool.trusted();
-        // The deepest pool sets the price, judged by liquidity now (a drained or rugged
-        // reference pool loses its claim at once).
+        // The heaviest pool (`ref_weight`) sets the price, judged by liquidity now (a drained or
+        // rugged reference pool loses its claim at once).
         let qliq = self.quote_liq(p);
         let tok = &self.tokens[base as usize];
         if trusted
             && !STABLES.contains(&tok.addr)
             && usd.is_finite()
             && qliq >= MIN_REF_LIQ
-            && (tok.ref_pool == p || !tok.usd.is_finite() || qliq > self.quote_liq(tok.ref_pool))
+            && (tok.ref_pool == p || !tok.usd.is_finite() || self.ref_weight(p) > self.ref_weight(tok.ref_pool))
         {
             let tok = &mut self.tokens[base as usize];
             tok.usd = usd;
@@ -967,6 +991,132 @@ mod tests {
         s.flush(&store, 12).unwrap();
         let s = State::load(&store).unwrap();
         check(&s);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn junk_quote_token_cannot_price_a_small_token() {
+        let dir = std::env::temp_dir().join(format!("ps-test-dust-{}", std::process::id()));
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let (usdc, junk, late) = (STABLES[0], [8u8; 20], [9u8; 20]);
+        s.add_token(usdc, meta("USDC", 6), 1);
+        s.add_token(junk, meta("BTCB", 18), 1); // seen before LATE, so it quotes LATE/BTCB
+        s.add_token(late, meta("LATE", 18), 1);
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let created = |pool: Addr, t0: Addr, t1: Addr| {
+            let mut data = pad(&pool).to_vec();
+            data.extend(word(1.0));
+            log(10, uniswap, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+        };
+        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
+            let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
+            log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
+        };
+        let (thin, real, bad) = ([2u8; 20], [3u8; 20], [4u8; 20]);
+        // BTCB/USDC: $2k of real USDC against 0.000002 BTCB, so BTCB is $1e9.
+        s.apply(&created(thin, usdc, junk), &store);
+        s.apply(&sync(thin, 2_000e6, 2e12), &store);
+        s.apply(&swap(thin, 1_000e6, 0.0, 0.0, 1e12), &store);
+        assert!((s.tokens[1].usd - 1e9).abs() < 1.0, "{}", s.tokens[1].usd);
+        // LATE/USDC: 1.5k LATE against $1.5k. LATE = $1.
+        s.apply(&created(real, usdc, late), &store);
+        s.apply(&sync(real, 1_500e6, 1_500e18), &store);
+        s.apply(&swap(real, 1e6, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[2].usd - 1.0).abs() < 1e-9, "{}", s.tokens[2].usd);
+        // LATE/BTCB with 0.001 BTCB counts as BTCB's whole $2k, more than LATE's $1.5k pool,
+        // but BTCB is no established quote token, so it weighs $500.
+        s.apply(&created(bad, late, junk), &store);
+        let (r, b) = (s.pool_ix[&pad(&real)], s.pool_ix[&pad(&bad)]);
+        s.apply(&sync(bad, 1e18, 1e15), &store);
+        assert!(s.liq(b) > s.liq(r));
+        s.apply(&swap(bad, 0.0, 1e14, 1e18, 0.0), &store); // 1 LATE for 0.0001 BTCB = "$100k"
+        assert!((s.tokens[2].usd - 1.0).abs() < 1e-9, "junk pool ignored: {}", s.tokens[2].usd);
+        assert_eq!(s.tokens[2].ref_pool, r);
+        // A price such a pool set before this fix gives way at the real pool's next trade,
+        // and the junk pool can't take it back.
+        (s.tokens[2].usd, s.tokens[2].ref_pool) = (1e5, b);
+        s.apply(&swap(real, 1e6, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[2].usd - 1.0).abs() < 1e-9, "{}", s.tokens[2].usd);
+        s.apply(&swap(bad, 0.0, 1e14, 1e18, 0.0), &store);
+        assert!((s.tokens[2].usd - 1.0).abs() < 1e-9, "{}", s.tokens[2].usd);
+
+        // An established quote token still prices its pairs: Q at $1 from 1M Q against $1M,
+        // and Y/Q holding 3k Q counts in full to beat a $1.2k Y/USDC pool.
+        let (q, y, qusdc, yusdc, yq) = ([10u8; 20], [11u8; 20], [5u8; 20], [6u8; 20], [7u8; 20]);
+        s.add_token(q, meta("Q", 18), 1);
+        s.add_token(y, meta("Y", 18), 1);
+        s.apply(&created(qusdc, usdc, q), &store);
+        s.apply(&sync(qusdc, 1_000_000e6, 1_000_000e18), &store);
+        s.apply(&swap(qusdc, 1e6, 0.0, 0.0, 1e18), &store);
+        s.apply(&created(yusdc, usdc, y), &store);
+        s.apply(&sync(yusdc, 1_200e6, 600e18), &store);
+        s.apply(&swap(yusdc, 2e6, 0.0, 0.0, 1e18), &store); // Y = $2
+        assert!((s.tokens[4].usd - 2.0).abs() < 1e-9, "{}", s.tokens[4].usd);
+        s.apply(&created(yq, q, y), &store);
+        s.apply(&sync(yq, 3_000e18, 1_200e18), &store);
+        s.apply(&swap(yq, 2.5e18, 0.0, 0.0, 1e18), &store); // Y = 2.5 Q = $2.50
+        assert!((s.tokens[4].usd - 2.5).abs() < 1e-9, "Q pool takes the price: {}", s.tokens[4].usd);
+        // Once Q's own pool is drained to $4k a side, Y/Q weighs $750: Y/USDC ($1.2k) takes the
+        // price back at its next trade and Y/Q can't retake it.
+        s.apply(&sync(qusdc, 4_000e6, 4_000e18), &store);
+        s.apply(&swap(yusdc, 2e6, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[4].usd - 2.0).abs() < 1e-9, "{}", s.tokens[4].usd);
+        s.apply(&swap(yq, 3e18, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[4].usd - 2.0).abs() < 1e-9, "{}", s.tokens[4].usd);
+
+        // Behind a quote token just under the bar ($99k behind S), Z/S counts for a quarter:
+        // 4k S can't take Z's price from a $1.2k USDC pool, 8k S can.
+        let (sm, z, susdc, zusdc, zs) = ([20u8; 20], [21u8; 20], [12u8; 20], [13u8; 20], [14u8; 20]);
+        s.add_token(sm, meta("S", 18), 1);
+        s.add_token(z, meta("Z", 18), 1);
+        s.apply(&created(susdc, usdc, sm), &store);
+        s.apply(&sync(susdc, 99_000e6, 99_000e18), &store);
+        s.apply(&swap(susdc, 1e6, 0.0, 0.0, 1e18), &store);
+        s.apply(&created(zusdc, usdc, z), &store);
+        s.apply(&sync(zusdc, 1_200e6, 600e18), &store);
+        s.apply(&swap(zusdc, 2e6, 0.0, 0.0, 1e18), &store);
+        s.apply(&created(zs, sm, z), &store);
+        s.apply(&sync(zs, 4_000e18, 1_000e18), &store);
+        s.apply(&swap(zs, 2.5e18, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[6].usd - 2.0).abs() < 1e-9, "{}", s.tokens[6].usd);
+        s.apply(&sync(zs, 8_000e18, 2_000e18), &store);
+        s.apply(&swap(zs, 2.5e18, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[6].usd - 2.5).abs() < 1e-9, "{}", s.tokens[6].usd);
+
+        // A token whose only pool is quoted in S is still priced and keeps moving with it…
+        let (w, ws, wusdc) = ([22u8; 20], [15u8; 20], [16u8; 20]);
+        s.add_token(w, meta("W", 18), 1);
+        s.apply(&created(ws, sm, w), &store);
+        s.apply(&sync(ws, 30_000e18, 30_000e18), &store);
+        s.apply(&swap(ws, 1e18, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[7].usd - 1.0).abs() < 1e-9, "{}", s.tokens[7].usd);
+        s.apply(&swap(ws, 1.2e18, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[7].usd - 1.2).abs() < 1e-9, "{}", s.tokens[7].usd);
+        // …which a $1.1k USDC pool can't take: W/S still weighs $7.5k.
+        s.apply(&created(wusdc, usdc, w), &store);
+        s.apply(&sync(wusdc, 1_100e6, 0.011e18), &store);
+        s.apply(&swap(wusdc, 1_000e6, 0.0, 0.0, 0.01e18), &store); // "$100k"
+        assert!((s.tokens[7].usd - 1.2).abs() < 1e-9, "{}", s.tokens[7].usd);
+
+        // A WETH pair counts in full even while WETH's own pool is under the bar: V/WETH with
+        // 0.5 WETH ($1.5k) beats a $1.2k V/USDC pool.
+        let (v, wethusdc, vusdc, vweth) = ([23u8; 20], [17u8; 20], [18u8; 20], [19u8; 20]);
+        s.add_token(WETH, meta("WETH", 18), 1);
+        s.add_token(v, meta("V", 18), 1);
+        s.apply(&created(wethusdc, WETH, usdc), &store);
+        s.apply(&sync(wethusdc, 3e18, 9_000e6), &store);
+        s.apply(&swap(wethusdc, 0.0, 3_000e6, 1e18, 0.0), &store); // WETH = $3000
+        assert!((s.tokens[8].usd - 3000.0).abs() < 1e-6, "{}", s.tokens[8].usd);
+        s.apply(&created(vusdc, usdc, v), &store);
+        s.apply(&sync(vusdc, 1_200e6, 600e18), &store);
+        s.apply(&swap(vusdc, 2e6, 0.0, 0.0, 1e18), &store);
+        s.apply(&created(vweth, WETH, v), &store);
+        s.apply(&sync(vweth, 0.5e18, 600e18), &store);
+        s.apply(&swap(vweth, 0.001e18, 0.0, 0.0, 1.2e18), &store); // V = $2.50
+        assert!((s.tokens[9].usd - 2.5).abs() < 1e-9, "{}", s.tokens[9].usd);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
