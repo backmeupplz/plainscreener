@@ -49,6 +49,9 @@ const VOL: [(u64, &str); 5] =
     [(0, "Any"), (10_000, "$10K+"), (100_000, "$100K+"), (1_000_000, "$1M+"), (10_000_000, "$10M+")];
 const TXNS: [(u64, &str); 4] = [(0, "Any"), (100, "100+"), (1_000, "1K+"), (10_000, "10K+")];
 const AGE: [(u64, &str); 6] = [(0, "Any"), (1, "1h"), (6, "6h"), (24, "24h"), (72, "3d"), (168, "7d")];
+/// 24 h volume beyond this many times the liquidity is fake prices, not trading: real pairs
+/// peak around 100x (a USDT/USDC pool). ponytail: fixed bound, tune if busy pairs vanish.
+const MAX_TURNOVER: f64 = 1_000.0;
 
 /// A list as the URL describes it.
 #[derive(Deserialize, Default, Clone, PartialEq, Eq, Hash)]
@@ -122,7 +125,12 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
             let pool = &st.pools[p as usize];
             let age_h = head.saturating_sub(pool.created_ts) as u64 / 3600;
             let txns = (m.w[3].buys + m.w[3].sells) as u64;
-            if m.liq < f.liq as f64 || m.w[3].vol < f.vol as f64 || txns < f.txns || (f.age > 0 && age_h >= f.age) {
+            if m.liq < f.liq as f64
+                || m.w[3].vol < f.vol as f64
+                || m.w[3].vol > MAX_TURNOVER * m.liq
+                || txns < f.txns
+                || (f.age > 0 && age_h >= f.age)
+            {
                 return None;
             }
             let score = match tab {

@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 pub const NONE: u32 = u32::MAX;
 /// Quote-side liquidity a pool needs before its trades may set a token's USD price.
 const MIN_REF_LIQ: f64 = 1_000.0;
+/// Pricing pools followed when capping a pool's liquidity (see `quote_liq`).
+const MAX_HOPS: usize = 8;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
 pub const STABLES: [Addr; 4] = [
@@ -141,13 +143,29 @@ impl State {
         (class, token)
     }
 
-    /// USD value of a pool's quote-side balance (0 when unknown).
-    fn quote_liq(&self, p: u32) -> f64 {
-        let Some(pool) = self.pools.get(p as usize) else {
-            return 0.0;
-        };
-        let v = pool.bal_quote() * self.tokens[pool.quote() as usize].usd;
-        if v.is_finite() { v } else { 0.0 }
+    /// USD value of a pool's quote-side balance (0 when unknown), at most what the quote
+    /// token's own pricing pool holds: those tokens can't be sold for more than that. Without
+    /// the cap, fake tokens priced each other up hop by hop (a $56 pool became $>999T five
+    /// pairs later). Real chains reach a stablecoin or WETH in a few hops; anyone can make a
+    /// long one, so past `MAX_HOPS` it counts as nothing.
+    fn quote_liq(&self, mut p: u32) -> f64 {
+        let mut v = f64::INFINITY;
+        for _ in 0..MAX_HOPS {
+            let Some(pool) = self.pools.get(p as usize) else {
+                return 0.0;
+            };
+            let q = &self.tokens[pool.quote() as usize];
+            let here = pool.bal_quote() * q.usd;
+            if !here.is_finite() {
+                return 0.0;
+            }
+            v = v.min(here);
+            if q.addr == WETH || q.ref_pool == NONE {
+                return v;
+            }
+            p = q.ref_pool;
+        }
+        0.0
     }
 
     /// How much a token with a common symbol looks like the real one: the chain's own WETH and
@@ -545,6 +563,28 @@ mod tests {
         s.apply(&sync(pool_b, 0.0, 0.0), &store);
         s.apply(&swap(pool_c, 10e18, 0.0, 0.0, 0.0002e18), &store);
         assert!((s.tokens[2].usd - 0.06).abs() < 1e-9, "{}", s.tokens[2].usd);
+
+        // A pool holding a trillion MEME is worth no more than MEME's own market ($3k of WETH).
+        let (fake_tok, pool_d) = ([6u8; 20], [8u8; 20]);
+        s.add_token(fake_tok, meta("FAKE", 18), 1);
+        s.apply(&created(pool_d, fake_tok, meme), &store);
+        s.apply(&sync(pool_d, 1e18, 1e12 * 1e18), &store);
+        let d = s.pool_ix[&pad(&pool_d)];
+        assert!((s.liq(d) - 6_000.0).abs() < 1.0, "capped: {}", s.liq(d));
+
+        // A token whose price came from such a pool (stored before the cap) takes a real
+        // price back at the next trade in a deeper USDC pool.
+        let (late, pool_e, pool_f) = ([12u8; 20], [10u8; 20], [11u8; 20]);
+        s.add_token(late, meta("LATE", 18), 1);
+        s.apply(&created(pool_e, late, meme), &store);
+        s.apply(&sync(pool_e, 1e18, 1000e18), &store);
+        let (l, e) = (s.token_ix[&late], s.pool_ix[&pad(&pool_e)]);
+        s.tokens[2].usd = 1e20; // MEME inflated: pool_e claims $1e23 of it
+        (s.tokens[l as usize].usd, s.tokens[l as usize].ref_pool) = (1e23, e);
+        s.apply(&created(pool_f, late, usdc), &store);
+        s.apply(&sync(pool_f, 10_000e18, 10_000e6), &store);
+        s.apply(&swap(pool_f, 0.0, 1e6, 1e18, 0.0), &store); // 1 LATE for 1 USDC
+        assert!((s.tokens[l as usize].usd - 1.0).abs() < 1e-9, "{}", s.tokens[l as usize].usd);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
