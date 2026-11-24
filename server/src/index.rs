@@ -79,17 +79,27 @@ where
     loop {
         while queue.len() < ahead && next < to {
             let end = (next + chunk).min(to);
-            queue.push_back((end, tokio::spawn(fetch(next, end - 1))));
+            queue.push_back((end, Fetch(tokio::spawn(fetch(next, end - 1)))));
             next = end;
         }
-        let Some((end, task)) = queue.pop_front() else {
+        let Some((end, mut task)) = queue.pop_front() else {
             return Ok(to);
         };
-        let logs = task.await??;
+        let logs = (&mut task.0).await??;
         let n = logs.len();
         let touched = process(rpc, sh, logs, end).await?;
         let _ = sh.live.send(Arc::new(touched));
         progress.tick(end, n, sh);
+    }
+}
+
+/// A spawned fetch, aborted when dropped: when a catch-up fails, the fetches queued behind
+/// it must not keep running (and holding their logs) while the next attempt starts more.
+struct Fetch<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for Fetch<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

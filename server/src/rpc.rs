@@ -58,21 +58,8 @@ impl Rpc {
 
     /// Our logs in `[from, to]`, ordered, with block timestamps and transaction senders.
     pub async fn logs(&self, from: u32, to: u32) -> Result<Vec<RawLog>> {
-        let range = |f: Value| {
-            let mut f = f;
-            f["fromBlock"] = json!(format!("0x{from:x}"));
-            f["toBlock"] = json!(format!("0x{to:x}"));
-            f
-        };
-        let topics = |ts: Vec<[u8; 32]>| ts.iter().map(|t| hex(t)).collect::<Vec<_>>();
-        let res = self
-            .batch(vec![
-                ("eth_getLogs", json!([range(json!({"topics": [topics(T.any_address())]}))])),
-                ("eth_getLogs", json!([range(json!({"address": hex(&V4_POOL_MANAGER), "topics": [topics(T.v4())]}))])),
-            ])
-            .await?;
-        let mut logs: Vec<RawLog> =
-            res.iter().flat_map(|r| r.as_array().cloned().unwrap_or_default()).filter_map(|l| parse_log(&l)).collect();
+        let res = self.raw_logs(from, to).await?;
+        let mut logs: Vec<RawLog> = res.iter().filter_map(parse_log).collect();
         logs.sort_by_key(|l| (l.block, l.index));
         let mut hashes: Vec<[u8; 32]> = logs.iter().map(|l| l.tx).collect();
         hashes.sort();
@@ -97,6 +84,56 @@ impl Rpc {
             l.ts = times.get(&l.block).copied().context("block timestamp")?;
         }
         Ok(logs)
+    }
+
+    /// Every raw log of our filters in `[from, to]`. The node refuses a range with too many
+    /// results ("query exceeds max results 20000, retry with the range A-B"), so on an error
+    /// retry up to the end it suggests (or half the range) and grow the step back after.
+    /// Never returns part of the range: the caller stores `to` as done.
+    async fn raw_logs(&self, from: u32, to: u32) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let (mut at, mut step) = (from, to.saturating_sub(from) + 1);
+        while at <= to {
+            let end = to.min(at.saturating_add(step - 1));
+            match self.get_logs(at, end).await {
+                Ok(logs) => {
+                    out.extend(logs);
+                    step = step.saturating_mul(2);
+                    at = end + 1;
+                }
+                Err(e) if too_many(&e) && end > at => {
+                    // The hint must shrink the range, or a bad one could loop forever.
+                    let cut = hint_end(&e).filter(|&b| b >= at && b < end).unwrap_or(at + (end - at) / 2);
+                    step = cut - at + 1;
+                }
+                Err(e) => return Err(e.context(format!("eth_getLogs {at}..={end}"))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// One request with both getLogs filters over `[from, to]`.
+    async fn get_logs(&self, from: u32, to: u32) -> Result<Vec<Value>> {
+        let range = |f: Value| {
+            let mut f = f;
+            f["fromBlock"] = json!(format!("0x{from:x}"));
+            f["toBlock"] = json!(format!("0x{to:x}"));
+            f
+        };
+        let topics = |ts: Vec<[u8; 32]>| ts.iter().map(|t| hex(t)).collect::<Vec<_>>();
+        let res = self
+            .batch(vec![
+                ("eth_getLogs", json!([range(json!({"topics": [topics(T.any_address())]}))])),
+                ("eth_getLogs", json!([range(json!({"address": hex(&V4_POOL_MANAGER), "topics": [topics(T.v4())]}))])),
+            ])
+            .await?;
+        // A missing or odd result would read as "no logs" and skip those blocks for good.
+        let mut out = Vec::new();
+        for r in res {
+            let Value::Array(a) = r else { bail!("eth_getLogs {from}..={to}: no log list in the reply") };
+            out.extend(a);
+        }
+        Ok(out)
     }
 
     /// Decimals, symbol, name and total supply of each token, via Multicall3.
@@ -174,6 +211,24 @@ impl std::fmt::Display for RpcError {
 }
 
 impl std::error::Error for RpcError {}
+
+/// The node's message when it refuses a call.
+fn rpc_message(e: &anyhow::Error) -> Option<&str> {
+    e.downcast_ref::<RpcError>()?.0["message"].as_str()
+}
+
+/// Whether the node refused a getLogs call for its size ("query exceeds max results",
+/// "block range too large", ...), so a smaller range can succeed. Other node errors
+/// (pruned history, a block past the head) wouldn't, so they fail at once.
+fn too_many(e: &anyhow::Error) -> bool {
+    let msg = rpc_message(e).unwrap_or_default().to_lowercase();
+    ["result", "too large", "exceed"].iter().any(|w| msg.contains(w))
+}
+
+/// The last block of the range a node suggests after refusing a getLogs call.
+fn hint_end(e: &anyhow::Error) -> Option<u32> {
+    rpc_message(e)?.rsplit_once('-')?.1.trim().parse().ok()
+}
 
 fn num(v: &Value) -> Option<u32> {
     u32::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok()
@@ -263,6 +318,8 @@ fn text(d: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn aggregate3_round_trip_shape() {
@@ -297,5 +354,70 @@ mod tests {
         assert_eq!(text(d[0].as_ref().unwrap(), 10), "HI");
         assert!(d[1].is_none());
         assert_eq!(text(b"WETH\0\0\0\0", 10), "WETH");
+    }
+
+    /// A fake node: one log per block for each filter, refusing ranges over `limit`
+    /// blocks the way reth does, with a hint built by `hint(from, limit)`.
+    async fn fake_node(limit: u32, hint: fn(u32, u32) -> String) -> (Rpc, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let n = calls.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(reqs): axum::Json<Vec<Value>>| async move {
+                n.fetch_add(1, Ordering::Relaxed);
+                let out: Vec<Value> = reqs
+                    .iter()
+                    .map(|r| {
+                        let f = &r["params"][0];
+                        let (a, b) = (num(&f["fromBlock"]).unwrap(), num(&f["toBlock"]).unwrap());
+                        if b - a + 1 > limit {
+                            let message = format!("query exceeds max results 20000, {}", hint(a, limit));
+                            return json!({"jsonrpc": "2.0", "id": r["id"], "error": {"code": -32602, "message": message}});
+                        }
+                        let logs: Vec<Value> = (a..=b)
+                            .map(|blk| json!({"blockNumber": format!("0x{blk:x}"), "logIndex": "0x0", "address": hex(&[1; 20]),
+                                "topics": [], "data": "0x", "transactionHash": hex(&[2; 32])}))
+                            .collect();
+                        json!({"jsonrpc": "2.0", "id": r["id"], "result": logs})
+                    })
+                    .collect();
+                axum::Json(out)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (Rpc::new(&url), calls)
+    }
+
+    #[tokio::test]
+    async fn get_logs_splits_dense_ranges() {
+        let hints: [fn(u32, u32) -> String; 4] = [
+            |a, l| format!("retry with the range {a}-{}", a + l - 1), // usable
+            |a, l| format!("retry with the range {a}-{}", a + l),     // still one too many
+            |a, _| format!("retry with the range {a}-{}", a.saturating_sub(5)), // before the start
+            |_, _| String::new(),                                     // no hint
+        ];
+        for (i, hint) in hints.into_iter().enumerate() {
+            let (rpc, calls) = fake_node(37, hint).await;
+            let logs = rpc.raw_logs(1_000, 1_499).await.unwrap();
+            let blocks: Vec<u32> = logs.iter().filter_map(|l| num(&l["blockNumber"])).collect();
+            // Each block once from each filter, nothing skipped or repeated.
+            let want: Vec<u32> = (1_000..1_500).flat_map(|b| [b, b]).collect();
+            let mut got = blocks.clone();
+            got.sort();
+            assert_eq!(got, want, "hint {i}");
+            assert!(calls.load(Ordering::Relaxed) < 100, "hint {i}: {} calls", calls.load(Ordering::Relaxed));
+        }
+        // A single block over the limit can't be split: an error, not a hang.
+        let (rpc, _) = fake_node(0, |_, _| String::new()).await;
+        assert!(rpc.raw_logs(5, 9).await.is_err());
+
+        let refusal = |m: &str| anyhow::Error::new(RpcError(json!({"code": -32602, "message": m})));
+        let reth = refusal("query exceeds max results 20000, retry with the range 61258906-61259315");
+        assert!(too_many(&reth));
+        assert_eq!(hint_end(&reth), Some(61259315));
+        assert!(!too_many(&refusal("pruned history unavailable: requested 0, earliest available 60000000")));
+        assert!(!too_many(&anyhow::anyhow!("connection refused")));
     }
 }
