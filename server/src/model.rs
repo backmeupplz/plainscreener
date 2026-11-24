@@ -54,6 +54,10 @@ pub struct Pool {
     /// Concentrated-liquidity pools: liquidity in range at the current price, from the last
     /// swap plus positions changed since. NaN when unknown (stored before we tracked it).
     pub liquidity: f64,
+    /// Concentrated-liquidity pools: the current tick, as the last swap (or v4 Initialize)
+    /// reported it. NaN when unknown. At a tick boundary it depends on the direction the price
+    /// came from, so it can't be derived from √price.
+    pub tick: f64,
     /// Solidly pools: the stable curve (true) or x·y (false). None when unknown (stored
     /// before we tracked it) and for other kinds.
     pub stable: Option<bool>,
@@ -80,7 +84,11 @@ impl Pool {
     /// Adds `l` to the in-range liquidity if a position over ticks `lower..upper` holds the
     /// current price (liquidity not known yet stays unknown).
     pub fn shift_liquidity(&mut self, lower: i32, upper: i32, l: f64) {
-        let tick = (2.0 * (self.sqrt_price / 2f64.powi(96)).ln() / 1.0001f64.ln()).floor();
+        let tick = if self.tick.is_finite() {
+            self.tick
+        } else {
+            (2.0 * (self.sqrt_price / 2f64.powi(96)).ln() / 1.0001f64.ln()).floor()
+        };
         if self.liquidity.is_finite() && self.sqrt_price > 0.0 && (lower as f64..upper as f64).contains(&tick) {
             self.liquidity = (self.liquidity + l).max(0.0);
         }
@@ -406,6 +414,7 @@ impl Pool {
             })
             .f64(self.spot)
             .u32(self.thin_ts)
+            .f64(self.tick)
             .0
     }
     pub fn decode(b: &[u8]) -> Pool {
@@ -433,6 +442,7 @@ impl Pool {
             },
             spot: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
             thin_ts: r.u32(),
+            tick: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
         }
     }
 }

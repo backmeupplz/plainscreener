@@ -235,6 +235,32 @@ impl Rpc {
         })
     }
 
+    /// Whether each Solidly pool is on the stable curve, via Multicall3. A pool whose
+    /// `stable()` fails isn't a stable pool; one breaking the whole call is split out as in
+    /// `meta_batch`.
+    pub fn stable<'a>(&'a self, pools: &'a [Addr]) -> Pin<Box<dyn Future<Output = Result<Vec<bool>>> + Send + 'a>> {
+        Box::pin(async move {
+            let sel = abi::keccak("stable()");
+            let calls: Vec<(Addr, [u8; 4])> = pools.iter().map(|p| (*p, [sel[0], sel[1], sel[2], sel[3]])).collect();
+            let data = hex(&encode_aggregate3(&calls));
+            let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
+                Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
+                Err(e) if e.is::<RpcError>() && pools.len() > 1 => {
+                    let (a, b) = pools.split_at(pools.len() / 2);
+                    let mut out = self.stable(a).await?;
+                    out.extend(self.stable(b).await?);
+                    return Ok(out);
+                }
+                Err(e) if e.is::<RpcError>() => vec![None],
+                Err(e) => return Err(e),
+            };
+            if ret.len() != pools.len() {
+                bail!("multicall returned {} results for {} calls", ret.len(), pools.len());
+            }
+            Ok(ret.iter().map(|r| r.as_deref().is_some_and(|d| d.len() == 32 && d[31] == 1)).collect())
+        })
+    }
+
     /// String getters (`sels`) of one token; `None` where the call reverts or is empty.
     pub async fn strings(&self, token: Addr, sels: &[[u8; 4]]) -> Result<Vec<Option<String>>> {
         let calls: Vec<(Addr, [u8; 4])> = sels.iter().map(|s| (token, *s)).collect();

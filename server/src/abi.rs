@@ -51,15 +51,25 @@ pub struct RawLog {
 #[derive(Debug, PartialEq)]
 pub enum Event {
     /// `origin` is the factory (v2/v3/Solidly) or the hooks contract (v4); it names the DEX.
-    /// `stable`: a Solidly pool on the stable curve (x³y + y³x), not x·y.
-    Created { kind: Kind, pool: Id, token0: Addr, token1: Addr, fee: u32, sqrt_price: f64, origin: Addr, stable: bool },
+    /// `stable`: a Solidly pool on the stable curve (x³y + y³x), not x·y. `tick`: v4's at `sqrt_price`.
+    Created {
+        kind: Kind,
+        pool: Id,
+        token0: Addr,
+        token1: Addr,
+        fee: u32,
+        sqrt_price: f64,
+        tick: i32,
+        origin: Addr,
+        stable: bool,
+    },
     /// v2/Solidly reserves after a change, raw token units.
     Sync { r0: f64, r1: f64 },
     /// v2/Solidly swap, raw units: pool balance deltas.
     SwapV2 { d0: f64, d1: f64 },
     /// Concentrated-liquidity swap: pool balance deltas (raw), price after, LP fee in pips (v4).
-    /// `liquidity`: the pool's in-range liquidity after the swap.
-    SwapCl { d0: f64, d1: f64, sqrt_price: f64, liquidity: f64, fee: u32 },
+    /// `liquidity` and `tick`: the pool's in-range liquidity and current tick after the swap.
+    SwapCl { d0: f64, d1: f64, sqrt_price: f64, liquidity: f64, tick: i32, fee: u32 },
     /// v3 Collect: tokens leaving the pool (withdrawn liquidity and fees).
     Flow { d0: f64, d1: f64 },
     /// Liquidity added or removed, raw amounts (positive). `moves`: the pool's balances
@@ -173,7 +183,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
         Event::SwapV2 { d0: u256_f64(w(0)?) - u256_f64(w(2)?), d1: u256_f64(w(1)?) - u256_f64(w(3)?) }
     } else if t0 == t.v3_swap || t0 == t.pancake_swap {
         let (d0, d1, sqrt_price, liquidity) = (i256_f64(w(0)?), i256_f64(w(1)?), u256_f64(w(2)?), u256_f64(w(3)?));
-        Event::SwapCl { d0, d1, sqrt_price, liquidity, fee: 0 }
+        Event::SwapCl { d0, d1, sqrt_price, liquidity, tick: i256_i32(w(4)?), fee: 0 }
     } else if t0 == t.v3_mint || t0 == t.v3_burn {
         let mint = t0 == t.v3_mint;
         let ticks = (i256_i32(log.topics.get(2)?), i256_i32(log.topics.get(3)?));
@@ -196,6 +206,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
                 d1: -i256_f64(w(1)?),
                 sqrt_price: u256_f64(w(2)?),
                 liquidity: u256_f64(w(3)?),
+                tick: i256_i32(w(4)?),
                 fee: u256_f64(w(5)?) as u32,
             }
         } else if t0 == t.v4_modify {
@@ -209,6 +220,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
                 token1: eth_as_weth(c1),
                 fee: u256_f64(w(0)?) as u32,
                 sqrt_price: u256_f64(w(3)?),
+                tick: i256_i32(w(4)?),
                 origin: addr(w(2)?),
                 stable: false,
             };
@@ -226,7 +238,10 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
 fn created(log: &RawLog, kind: Kind, pool: Id, fee: u32, stable: bool) -> Option<(Id, Event)> {
     let token0 = addr(log.topics.get(1)?);
     let token1 = addr(log.topics.get(2)?);
-    Some((pool, Event::Created { kind, pool, token0, token1, fee, sqrt_price: 0.0, origin: log.address, stable }))
+    Some((
+        pool,
+        Event::Created { kind, pool, token0, token1, fee, sqrt_price: 0.0, tick: 0, origin: log.address, stable },
+    ))
 }
 
 /// v4 uses address(0) for native ETH; we price and display it as WETH.
@@ -350,7 +365,7 @@ mod tests {
         let log = RawLog { topics: vec![T.v3_swap, [0; 32], [0; 32]], data, address: [7; 20], ..Default::default() };
         let (id, ev) = decode(&log).unwrap();
         assert_eq!(id, pad(&[7; 20]));
-        assert_eq!(ev, Event::SwapCl { d0: -100.0, d1: 50.0, sqrt_price: 50.0, liquidity: 0.0, fee: 0 });
+        assert_eq!(ev, Event::SwapCl { d0: -100.0, d1: 50.0, sqrt_price: 50.0, liquidity: 0.0, tick: 0, fee: 0 });
         let fake_v4 = RawLog { topics: vec![T.v4_swap, [1; 32]], data: vec![0; 192], ..Default::default() };
         assert!(decode(&fake_v4).is_none(), "v4 events only from the PoolManager");
     }
