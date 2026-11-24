@@ -155,12 +155,15 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
 }
 
 /// Re-sorts `pools` by the column `f` names, if any. Missing values go last, and so does a
-/// price change in a quote token with no real depth behind it (see `State::deep_quote`).
+/// price, FDV or price change in a quote token with no real depth behind it (see
+/// `State::deep_quote`): whoever mints that token sets its USD price, and so all three.
 pub fn sort(st: &State, f: &Filter, pools: &mut [u32]) {
     let Some(col) = f.sort.as_deref().filter(|c| COLS.iter().any(|(k, _)| k == c)) else { return };
     let asc = f.dir.as_deref() == Some("asc");
     let value = |p: u32| -> f64 {
-        if matches!(col, "c5m" | "c1h" | "c6h" | "c24h") && !st.deep_quote(st.pools[p as usize].quote()) {
+        if matches!(col, "price" | "c5m" | "c1h" | "c6h" | "c24h" | "fdv")
+            && !st.deep_quote(st.pools[p as usize].quote())
+        {
             return f64::NAN;
         }
         let m = metrics(st, p);
