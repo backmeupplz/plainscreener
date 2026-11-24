@@ -157,6 +157,12 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
 /// Re-sorts `pools` by the column `f` names, if any. Missing values go last, and so does a
 /// price, FDV or price change in a quote token with no real depth behind it (see
 /// `State::deep_quote`): whoever mints that token sets its USD price, and so all three.
+/// A junk *base* in a deep quote token's pool is not gated: an overpaying trade, or its sole
+/// LP seeding the pool lopsided, sets its price (and so its FDV and change) to anything, and
+/// it can top those sorts. Nothing in the pool's own prices tells that from a real price; only
+/// a depth floor would, and Gainers' ($25k liquidity, $10k 24 h volume) would demote most of
+/// New (its own floor is $5k) while that LP clears it with ~$12.5k of quote it gets back, plus
+/// trading in its own pool.
 pub fn sort(st: &State, f: &Filter, pools: &mut [u32]) {
     let Some(col) = f.sort.as_deref().filter(|c| COLS.iter().any(|(k, _)| k == c)) else { return };
     let asc = f.dir.as_deref() == Some("asc");

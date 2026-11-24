@@ -950,7 +950,7 @@ mod tests {
                 assert_eq!((sorted(head), sorted(tail)), (vec![0, 1, 4, 6, 8], vec![2, 3, 5, 7]), "{col} {pools:?}");
             }
             // J/USDC and J2/Q still top a price sort: J and J2 are their base, priced through a real
-            // stablecoin or Q pool, however thin. Only the quote token is gated here.
+            // stablecoin or Q pool, however thin. Only the quote token is gated here (see `lists::sort`).
             let f = Filter { sort: Some("price".into()), ..Default::default() };
             let mut pools: Vec<u32> = (0..9).collect();
             crate::lists::sort(s, &f, &mut pools);
