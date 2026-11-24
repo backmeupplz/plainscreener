@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 pub const NONE: u32 = u32::MAX;
 /// Quote-side liquidity a pool needs before its trades may set a token's USD price.
 const MIN_REF_LIQ: f64 = 1_000.0;
+/// Real depth behind a quote token's price before its pairs' moves rank on Gainers and Losers.
+const DEEP_QUOTE: f64 = 100_000.0;
 /// Pricing pools followed when capping a pool's liquidity (see `quote_liq`).
 const MAX_HOPS: usize = 8;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
@@ -174,6 +176,18 @@ impl State {
     pub fn standing(&self, t: u32) -> (bool, bool) {
         let tok = &self.tokens[t as usize];
         (tok.addr == WETH || STABLES.contains(&tok.addr), tok.icon)
+    }
+
+    /// Whether pairs quoted in `t` may rank on Gainers and Losers: WETH, a stablecoin, or a token
+    /// with at least $100k of real depth behind its price (its reference pool's capped quote
+    /// side, half its liquidity). Whoever mints a junk quote token sets both its USD price and its pairs' prices in
+    /// it for free (one tiny trade in its own pool, or overpaying with freshly minted tokens), so
+    /// no formula over those two prices can tell a real move from a fake one.
+    // ponytail: the depth is parked, not spent (in a v3/v4 pool it can even sit out of range), so
+    // an owner who parks $100k behind a junk token still can. Measuring depth near the current
+    // price would close that.
+    pub fn deep_quote(&self, t: u32) -> bool {
+        self.standing(t).0 || self.quote_liq(self.tokens[t as usize].ref_pool) >= DEEP_QUOTE
     }
 
     /// Pool liquidity in USD: twice the quote side. Valuing the base side at the pool's own
@@ -837,6 +851,101 @@ mod tests {
         s.apply(&swap(yq, 100e18, 0.0, 0.0, 2e18), &store);
         let vq = s.stats[&3].window(s.head_ts, 86_400).vol;
         assert!((vq - 100.0).abs() < 1e-6, "{vq}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn junk_quote_token_cannot_top_gainers_or_losers() {
+        use crate::lists::{Filter, ranked};
+        let dir = std::env::temp_dir().join(format!("ps-test-gainers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let usdc = STABLES[0];
+        let (j, q, j2) = ([8u8; 20], [9u8; 20], [14u8; 20]);
+        let (x, y, v, w, u, z) = ([10u8; 20], [11u8; 20], [12u8; 20], [13u8; 20], [15u8; 20], [18u8; 20]);
+        s.add_token(usdc, meta("USDC", 6), 1);
+        // J and J2 (junk) and Q (deep) are seen first, so they quote their pairs.
+        for t in [j, q, j2, x, y, v, w, u, z] {
+            s.add_token(t, meta("T", 18), 1);
+        }
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let created = |pool: Addr, t0: Addr, t1: Addr| {
+            let mut data = pad(&pool).to_vec();
+            data.extend(word(1.0));
+            log(10, uniswap, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+        };
+        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
+            let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
+            log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
+        };
+        // Pools in creation order: J/USDC 0, Q/USDC 1, X/J 2, Y/J 3, W/Q 4, V/J 5, J2/Q 6, U/J2 7, Z/USDC 8.
+        let (jusdc, qusdc, xj, yj, wq, vj) = ([2u8; 20], [3u8; 20], [4u8; 20], [5u8; 20], [6u8; 20], [7u8; 20]);
+        let (j2q, uj2, zusdc) = ([16u8; 20], [17u8; 20], [19u8; 20]);
+        // J/USDC holds $12.6k of real USDC, J trades at $0.0125. Q/USDC holds $300k, Q at $1.
+        s.apply(&created(jusdc, usdc, j), &store);
+        s.apply(&sync(jusdc, 12_600e6, 1_000_000e18), &store);
+        s.apply(&swap(jusdc, 1e6, 0.0, 0.0, 80e18), &store);
+        s.apply(&created(qusdc, usdc, q), &store);
+        s.apply(&sync(qusdc, 300_000e6, 300_000e18), &store);
+        s.apply(&swap(qusdc, 1e6, 0.0, 0.0, 1e18), &store);
+        assert_eq!((s.tokens[1].usd, s.tokens[2].usd), (0.0125, 1.0));
+        // X/J and Y/J: 2M J each, $25.2k of capped liquidity, $12.5k of volume at 1 J.
+        // W/Q: 20k Q, $40k of liquidity, $20k of volume at 1 Q.
+        for (pool, quote, base, n) in [(xj, j, x, 1e6), (yj, j, y, 1e6), (wq, q, w, 2e4)] {
+            s.apply(&created(pool, quote, base), &store);
+            s.apply(&swap(pool, 0.0, n * 1e18, n * 1e18, 0.0), &store);
+            s.apply(&sync(pool, 2.0 * n * 1e18, n * 1e18), &store);
+        }
+        // J's minter overpays in X/J with freshly minted J: X is "up 1e15×" in J and in USD.
+        s.apply(&swap(xj, 1e33, 0.0, 0.0, 1e18), &store);
+        // W really rises 50% against Q.
+        s.apply(&swap(wq, 1.5e18, 0.0, 0.0, 1e18), &store);
+        // The ticket's attack: one tiny J/USDC trade prices J at $1e9, and Y/J trades flat.
+        s.apply(&swap(jusdc, 1_000e6, 0.0, 0.0, 1e12), &store);
+        assert!((s.tokens[1].usd - 1e9).abs() < 1.0, "{}", s.tokens[1].usd);
+        s.apply(&swap(yj, 0.0, 1e18, 1e18, 0.0), &store);
+        // V/J opens at J's pumped price.
+        s.apply(&created(vj, j, v), &store);
+        s.apply(&sync(vj, 2_000_000e18, 1_000_000e18), &store);
+        s.apply(&swap(vj, 0.0, 1e18, 1e18, 0.0), &store);
+        // J2 is priced through the deep Q, but only $12.6k of Q backs it; the same pump on U/J2.
+        s.apply(&created(j2q, q, j2), &store);
+        s.apply(&sync(j2q, 12_600e18, 1_000_000e18), &store);
+        s.apply(&swap(j2q, 1e18, 0.0, 0.0, 80e18), &store);
+        s.apply(&created(uj2, j2, u), &store);
+        s.apply(&swap(uj2, 0.0, 1e24, 1e24, 0.0), &store);
+        s.apply(&sync(uj2, 2e24, 1e24), &store);
+        s.apply(&swap(j2q, 1_000e18, 0.0, 0.0, 1e12), &store);
+        s.apply(&swap(uj2, 0.0, 1e18, 1e18, 0.0), &store);
+        // Z/USDC: 20k Z sold at $1 ($20k of volume, $80k of liquidity), then Z really falls 50%.
+        s.apply(&created(zusdc, usdc, z), &store);
+        s.apply(&swap(zusdc, 0.0, 2e22, 2e10, 0.0), &store);
+        s.apply(&sync(zusdc, 4e10, 2e22), &store);
+        s.apply(&swap(zusdc, 0.0, 2e18, 1e6, 0.0), &store);
+        let list = |s: &State, tab: &str| ranked(s, &Filter { tab: Some(tab.into()), ..Default::default() });
+        let ch = |s: &State, p: u32| crate::pages::change(&crate::pages::metrics(s, p), 3);
+        let check = |s: &State| {
+            for p in [2, 3, 4, 5, 7, 8] {
+                let m = crate::pages::metrics(s, p);
+                assert!(m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0, "pool {p} passes the list gates");
+            }
+            assert!(ch(s, 2) > 1e14 && ch(s, 3) > 1e10 && ch(s, 7) > 1e10, "{} {} {}", ch(s, 2), ch(s, 3), ch(s, 7));
+            assert_eq!(list(s, "gainers"), vec![4], "only W/Q's real 50% ranks");
+            assert_eq!(list(s, "losers"), vec![8], "only Z/USDC's real 50% fall ranks");
+        };
+        check(&s);
+        // J falls back to $0.0125: V/J is "down 100%".
+        s.apply(&swap(jusdc, 0.0, 80e18, 1e6, 0.0), &store);
+        s.apply(&swap(vj, 0.0, 1e18, 1e18, 0.0), &store);
+        assert!(ch(&s, 5) < -0.99, "{}", ch(&s, 5));
+        check(&s);
+        // Stats rebuilt from stored candles rank the same.
+        s.flush(&store, 12).unwrap();
+        let s = State::load(&store).unwrap();
+        check(&s);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
