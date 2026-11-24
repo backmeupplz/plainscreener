@@ -935,6 +935,19 @@ mod tests {
             assert!(ch(s, 2) > 1e14 && ch(s, 3) > 1e10 && ch(s, 7) > 1e10, "{} {} {}", ch(s, 2), ch(s, 3), ch(s, 7));
             assert_eq!(list(s, "gainers"), vec![4], "only W/Q's real 50% ranks");
             assert_eq!(list(s, "losers"), vec![8], "only Z/USDC's real 50% fall ranks");
+            // Sorting any list by change ranks pairs quoted in J or J2 last, either way.
+            for (col, dir) in [("c24h", None), ("c5m", Some("asc"))] {
+                let f = Filter { sort: Some(col.into()), dir: dir.map(Into::into), ..Default::default() };
+                let mut pools: Vec<u32> = (0..9).collect();
+                crate::lists::sort(s, &f, &mut pools);
+                let (head, tail) = pools.split_at(5);
+                let sorted = |p: &[u32]| {
+                    let mut p = p.to_vec();
+                    p.sort();
+                    p
+                };
+                assert_eq!((sorted(head), sorted(tail)), (vec![0, 1, 4, 6, 8], vec![2, 3, 5, 7]), "{col} {pools:?}");
+            }
         };
         check(&s);
         // J falls back to $0.0125: V/J is "down 100%".
