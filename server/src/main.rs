@@ -15,7 +15,7 @@ mod sqd;
 mod state;
 mod store;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use state::State;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -38,6 +38,8 @@ pub struct Config {
     pub listen: String,
     pub public_url: String,
     pub index: bool,
+    /// Fetch icons, profiles and safety checks (off in a side-by-side rebuild).
+    pub offchain: bool,
 }
 
 impl Config {
@@ -51,6 +53,7 @@ impl Config {
             listen: var("LISTEN", "0.0.0.0:8080"),
             public_url: var("PUBLIC_URL", "https://plainscreener.com").trim_end_matches('/').to_string(),
             index: var("INDEX", "1") != "0",
+            offchain: var("OFFCHAIN", "1") != "0",
         }
     }
 }
@@ -89,6 +92,18 @@ fn hash(bytes: &[u8]) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = Arc::new(Config::from_env());
+    match &std::env::args().skip(1).collect::<Vec<_>>()[..] {
+        [] => {}
+        // Before a rebuilt store replaces the old one.
+        [cmd, from] if cmd == "copy-offchain" => {
+            // An empty FROM is a mistyped path (or one Docker just created), not a store.
+            anyhow::ensure!(std::fs::read_dir(from).with_context(|| from.clone())?.next().is_some(), "{from} is empty");
+            let n = Store::open(&cfg.data_dir)?.copy_offchain(&Store::open(from)?)?;
+            eprintln!("copied {n} icons, profiles and safety checks from {from}");
+            return Ok(());
+        }
+        _ => anyhow::bail!("usage: plainscreener [copy-offchain FROM]"),
+    }
     let store = Store::open(&cfg.data_dir)?;
     let started = std::time::Instant::now();
     let state = State::load(&store)?;
@@ -111,8 +126,10 @@ async fn main() -> Result<()> {
         tokio::spawn(index::run(cfg.clone(), sh.clone()));
     }
     tokio::spawn(http::search_index(app.clone()));
-    tokio::spawn(icons::run(app.clone()));
-    tokio::spawn(safety::run(app.clone()));
+    if cfg.offchain {
+        tokio::spawn(icons::run(app.clone()));
+        tokio::spawn(safety::run(app.clone()));
+    }
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     eprintln!("listening on {}", cfg.listen);
     // No graceful drain: live streams never end on their own. Every indexed batch is

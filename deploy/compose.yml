@@ -20,6 +20,63 @@ services:
     mem_limit: 24g
     stop_grace_period: 60s
 
+  # A full reindex into a fresh directory while `app` keeps serving, for when a fix changes
+  # stored data (prices, candles, trades). The first backfill took about 5 days; its
+  # `block N: … blocks/s` log lines give the pace. Run every command from /opt/plainscreener.
+  # Start it once every data-affecting fix is merged and deployed (it keeps the image it
+  # started with):
+  #   docker compose -f deploy/compose.yml --profile rebuild up -d rebuild
+  # Another data-affecting fix landing mid-rebuild means starting over: indexing resumes
+  # from the saved cursor, so blocks already done keep the old behaviour. Once it deploys:
+  #   docker compose -f deploy/compose.yml --profile rebuild rm -sf rebuild &&
+  #     rm -rf /mnt/chain/plainscreener-rebuild &&
+  #     docker compose -f deploy/compose.yml --profile rebuild up -d rebuild
+  # Each instance holds about 12 GB at full size next to the node's ~25 GB of a 62 GB host;
+  # watch `docker stats` and the node's lag while it runs. It doesn't fetch icons, profiles or
+  # safety checks (OFFCHAIN=0); the swap copies them over from the old store. The live,
+  # rebuild and -old stores all sit on /mnt/chain (the live one was 246G with 2.0T free on
+  # 2026-11-24), so check `df -h /mnt/chain` before starting.
+  # It is ready when its /healthz says `status live`:
+  #   curl -s $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' plainscreener-rebuild-1):8080/healthz
+  # Then swap, with the deploy timer stopped (and any deploy in flight finished) so nothing
+  # starts `app` mid-swap (the site is down for a few minutes):
+  #   systemctl stop plainscreener-update.timer &&
+  #     systemctl start plainscreener-update.service &&  # oneshot: returns once a run in flight ends
+  #     docker compose -f deploy/compose.yml --profile rebuild stop rebuild app &&
+  #     docker compose -f deploy/compose.yml --profile rebuild run --rm --no-deps -v /mnt/chain/plainscreener:/old \
+  #       rebuild plainscreener copy-offchain /old &&
+  #     mv -T /mnt/chain/plainscreener /mnt/chain/plainscreener-old &&
+  #     mv -T /mnt/chain/plainscreener-rebuild /mnt/chain/plainscreener &&
+  #     docker compose -f deploy/compose.yml --profile rebuild rm -f rebuild &&
+  #     docker compose -f deploy/compose.yml up -d app &&
+  #     systemctl start plainscreener-update.timer
+  # If it fails before the first mv, start the site again:
+  #   docker compose -f deploy/compose.yml up -d app && systemctl start plainscreener-update.timer
+  # If it fails later, or the swapped-in store looks wrong, put the old store back:
+  #   systemctl stop plainscreener-update.timer &&
+  #     # wait out a deploy in flight without starting one (a fresh run could start `app` mid-move):
+  #     while [ "$(systemctl show -p ActiveState --value plainscreener-update.service)" = activating ]; do sleep 5; done &&
+  #     docker compose -f deploy/compose.yml stop app &&
+  #     { [ -d /mnt/chain/plainscreener-rebuild ] || mv -T /mnt/chain/plainscreener /mnt/chain/plainscreener-rebuild; } &&
+  #     mv -T /mnt/chain/plainscreener-old /mnt/chain/plainscreener && docker compose -f deploy/compose.yml up -d app &&
+  #     systemctl start plainscreener-update.timer
+  # Remove plainscreener-old once the site checks out.
+  rebuild:
+    profiles: [rebuild]
+    image: plainscreener:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RPC_URL: http://execution:8545
+      DATA_DIR: /data
+      OFFCHAIN: "0"
+    volumes:
+      - /mnt/chain/plainscreener-rebuild:/data
+    networks: [node]
+    cpus: 4
+    mem_limit: 14g
+    stop_grace_period: 60s
+
   tunnel:
     image: cloudflare/cloudflared:2026.11.1
     command: tunnel --no-autoupdate run

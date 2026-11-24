@@ -590,6 +590,52 @@ mod tests {
     }
 
     #[test]
+    fn junk_quote_token_cannot_take_over_a_price() {
+        let dir = std::env::temp_dir().join(format!("ps-test-junk-{}", std::process::id()));
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let (usdc, junk, eurc) = (STABLES[0], [8u8; 20], [9u8; 20]);
+        s.add_token(usdc, meta("USDC", 6), 1);
+        s.add_token(junk, meta("BTCB", 18), 1); // seen before EURC, so it quotes EURC/BTCB
+        s.add_token(eurc, meta("EURC", 6), 1);
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let created = |pool: Addr, t0: Addr, t1: Addr| {
+            let mut data = pad(&pool).to_vec();
+            data.extend(word(1.0));
+            log(10, uniswap, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+        };
+        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
+            let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
+            log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
+        };
+        let (deep, thin, bad) = ([2u8; 20], [3u8; 20], [4u8; 20]);
+        // EURC/USDC: 1M EURC against $1.1M. EURC = $1.10.
+        s.apply(&created(deep, usdc, eurc), &store);
+        s.apply(&sync(deep, 1_100_000e6, 1_000_000e6), &store);
+        s.apply(&swap(deep, 110e6, 0.0, 0.0, 100e6), &store);
+        assert!((s.tokens[2].usd - 1.1).abs() < 1e-9, "{}", s.tokens[2].usd);
+        // BTCB/USDC holds $2k of real USDC; one trade prices BTCB at $1e9.
+        s.apply(&created(thin, usdc, junk), &store);
+        s.apply(&sync(thin, 2_000e6, 1_000_000e18), &store);
+        s.apply(&swap(thin, 1_000e6, 0.0, 0.0, 1e12), &store);
+        assert!((s.tokens[1].usd - 1e9).abs() < 1.0, "{}", s.tokens[1].usd);
+        // EURC/BTCB: 21 EURC against 717 BTCB, "worth" $717B at BTCB's price, $2k really.
+        s.apply(&created(bad, eurc, junk), &store);
+        s.apply(&sync(bad, 21e6, 717e18), &store);
+        assert!((s.liq(2) - 4_000.0).abs() < 1e-6, "valued by BTCB's real depth: {}", s.liq(2));
+        s.apply(&swap(bad, 1e6, 0.0, 0.0, 34e18), &store); // 1 EURC for 34 BTCB = "$34B"
+        assert!((s.tokens[2].usd - 1.1).abs() < 1e-9, "junk pool ignored: {}", s.tokens[2].usd);
+        assert_eq!(s.tokens[2].ref_pool, 0);
+        // A price the junk pool set before this fix gives way at the deep pool's next trade.
+        (s.tokens[2].usd, s.tokens[2].ref_pool) = (34e9, 2);
+        s.apply(&swap(deep, 110e6, 0.0, 0.0, 100e6), &store);
+        assert!((s.tokens[2].usd - 1.1).abs() < 1e-9, "{}", s.tokens[2].usd);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn v4_amounts() {
         // Full-range-ish position in range: both tokens.
         let (a0, a1) = amounts(1.0, -1000, 1000, 1e6);

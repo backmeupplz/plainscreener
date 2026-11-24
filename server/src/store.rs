@@ -130,4 +130,41 @@ impl Store {
             .map(|(k, v)| ((be32(&k[4..8]), be32(&k[8..12])), Trade::decode(&v)))
             .collect()
     }
+
+    /// Copies the data fetched from outside the chain (icons, profiles, safety checks)
+    /// from another store, which a reindex would otherwise lose or fetch all over again.
+    pub fn copy_offchain(&self, from: &Store) -> Result<usize> {
+        let mut n = 0;
+        for (src, dst) in [(&from.icons, &self.icons), (&from.profiles, &self.profiles), (&from.safety, &self.safety)] {
+            for g in src.range::<&[u8], _>(..) {
+                let (k, v) = g.into_inner()?;
+                dst.insert(k, v)?;
+                n += 1;
+            }
+        }
+        self.db.persist(fjall::PersistMode::SyncAll)?;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_offchain_carries_icons_profiles_and_safety() {
+        let dir = |n: &str| std::env::temp_dir().join(format!("ps-test-copy-{n}-{}", std::process::id()));
+        let (old, new) =
+            (Store::open(dir("old").to_str().unwrap()).unwrap(), Store::open(dir("new").to_str().unwrap()).unwrap());
+        old.icons.insert([1u8; 20], b"png").unwrap();
+        old.profiles.insert([2u8; 20], b"{}").unwrap();
+        old.safety.insert([3u8; 20], b"{}").unwrap();
+        old.tokens.insert([4u8; 20], b"chain data").unwrap();
+        assert_eq!(new.copy_offchain(&old).unwrap(), 3);
+        assert_eq!(&*new.icons.get([1u8; 20]).unwrap().unwrap(), b"png");
+        assert!(new.profiles.get([2u8; 20]).unwrap().is_some() && new.safety.get([3u8; 20]).unwrap().is_some());
+        assert!(new.tokens.get([4u8; 20]).unwrap().is_none());
+        drop((old, new));
+        let _ = (std::fs::remove_dir_all(dir("old")), std::fs::remove_dir_all(dir("new")));
+    }
 }
