@@ -620,10 +620,8 @@ pub fn home(app: &App, st: &State, f: &Filter, pools: &[u32]) -> String {
     } else {
         "Nothing matches. Try other filters, or wait: the indexer may still be catching up."
     };
-    let src = match f.tab() {
-        Tab::Watch => "/api/list?tab=watch".to_string(),
-        _ => format!("/api/list?{}", f.query(&[])),
-    };
+    // The watchlist's src carries the sort too; app.js appends the starred pairs.
+    let src = format!("/api/list?{}", f.query(&[]));
     let body = format!(
         r#"<section class="hero"><div class="wrap"><h1>Every token on Base, live.</h1><p>Prices, charts and trades for every Uniswap, Aerodrome and PancakeSwap pool, straight from the chain. Free and open source.</p>{SEARCH_FORM}<div class="links"><a href="/api">Free API</a> · <a href="{REPO}">Source code</a></div></div></section><main class="wrap">{}{}</main>"#,
         lists::controls(f),

@@ -261,7 +261,7 @@ stars()
 const list = $('[data-list]')
 if (list) {
   const watch = list.dataset.list.includes('tab=watch')
-  const src = () => (watch ? (watched().length ? `/api/list?pairs=${watched().join(',')}` : '') : list.dataset.list)
+  const src = () => (watch ? (watched().length ? `${list.dataset.list}&pairs=${watched().join(',')}` : '') : list.dataset.list)
   let last = ''
   const refresh = async () => {
     const u = src()
