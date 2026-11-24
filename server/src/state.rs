@@ -182,6 +182,21 @@ impl State {
         2.0 * self.quote_liq(p)
     }
 
+    /// USD volume of a trade of `size` of a pool's quote token. A stablecoin or WETH counts at
+    /// its price; any other token at no more than the depth behind its price (its reference
+    /// pool's capped quote side). A junk token priced at $1e9 from $5k of real liquidity then
+    /// adds at most $5k of volume per trade, the same as trading with that $5k, not
+    /// `amount × $1e9`. Only volume (candles and 24 h stats, which rank the lists) is capped:
+    /// a trade's own value stays price × amount, matching the price shown and wallet PnL.
+    fn quote_value(&self, p: u32, size: f64) -> f64 {
+        let quote = &self.tokens[self.pools[p as usize].quote() as usize];
+        let v = size * quote.usd;
+        if !v.is_finite() || quote.addr == WETH || STABLES.contains(&quote.addr) {
+            return v;
+        }
+        v.min(self.quote_liq(quote.ref_pool).max(0.0))
+    }
+
     pub fn apply(&mut self, log: &RawLog, store: &Store) {
         let Some((id, ev)) = abi::decode(log) else {
             return;
@@ -331,7 +346,7 @@ impl State {
         }
         let qusd = self.tokens[quote as usize].usd;
         let usd = native * qusd;
-        let vol = dq.abs() * qusd;
+        let vol = self.quote_value(p, dq.abs());
         let buy = db < 0.0;
         let trade = Trade {
             ts,
@@ -340,7 +355,7 @@ impl State {
             buy,
             base: db.abs(),
             quote: dq.abs(),
-            usd: vol as f32,
+            usd: (dq.abs() * qusd) as f32,
             price_usd: usd as f32,
             price_native: native as f32,
             kind: TradeKind::Swap,
@@ -747,6 +762,81 @@ mod tests {
         (s.tokens[2].usd, s.tokens[2].ref_pool) = (34e9, 2);
         s.apply(&swap(deep, 110e6, 0.0, 0.0, 100e6), &store);
         assert!((s.tokens[2].usd - 1.1).abs() < 1e-9, "{}", s.tokens[2].usd);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn junk_quote_token_cannot_inflate_volume() {
+        let dir = std::env::temp_dir().join(format!("ps-test-vol-{}", std::process::id()));
+        let store = Store::open(dir.to_str().unwrap()).unwrap();
+        let mut s = State::default();
+        let (usdc, j, x) = (STABLES[0], [8u8; 20], [9u8; 20]);
+        s.add_token(usdc, meta("USDC", 6), 1);
+        s.add_token(j, meta("J", 18), 1); // seen before X, so it quotes X/J
+        s.add_token(x, meta("X", 18), 1);
+        let uniswap = hex20("8909dc15e40173ff4699343b6eb8132c65e18ec6");
+        let created = |pool: Addr, t0: Addr, t1: Addr| {
+            let mut data = pad(&pool).to_vec();
+            data.extend(word(1.0));
+            log(10, uniswap, vec![T.v2_pair_created, pad(&t0), pad(&t1)], data)
+        };
+        let sync = |pool: Addr, r0: f64, r1: f64| log(11, pool, vec![T.v2_sync], [word(r0), word(r1)].concat());
+        let swap = |pool: Addr, a0in: f64, a1in: f64, a0out: f64, a1out: f64| {
+            let data = [word(a0in), word(a1in), word(a0out), word(a1out)].concat();
+            log(11, pool, vec![T.v2_swap, [0; 32], [0; 32]], data)
+        };
+        let (jusdc, xj) = ([2u8; 20], [3u8; 20]);
+        // J/USDC holds $5k of real USDC; one tiny trade prices J at $1e9.
+        s.apply(&created(jusdc, usdc, j), &store);
+        s.apply(&sync(jusdc, 5_000e6, 1_000_000e18), &store);
+        s.apply(&swap(jusdc, 1_000e6, 0.0, 0.0, 1e12), &store);
+        assert!((s.tokens[1].usd - 1e9).abs() < 1.0, "{}", s.tokens[1].usd);
+        // X/J with 0.00001 J passes the $10k list gate.
+        s.apply(&created(xj, j, x), &store);
+        s.apply(&sync(xj, 1e13, 1_000_000e18), &store);
+        assert!((s.liq(1) - 10_000.0).abs() < 1e-6, "{}", s.liq(1));
+        // A first trade meeting the J already in the pool sets its price (a first trade into a
+        // pool holding no J would set none) and adds its $1.
+        s.apply(&swap(xj, 1e9, 0.0, 0.0, 1e18), &store);
+        let v0 = s.stats[&1].window(s.head_ts, 86_400).vol;
+        assert!((v0 - 1.0).abs() < 1e-6, "{v0}");
+        let vol = |s: &State| s.stats[&1].window(s.head_ts, 86_400).vol - v0;
+        // Selling 1 J ("$1e9") counts for no more than the $5k behind J's price…
+        s.apply(&sync(xj, 1e18 + 1e13, 500_000e18), &store);
+        s.apply(&swap(xj, 1e18, 0.0, 0.0, 500_000e18), &store);
+        let v1 = vol(&s);
+        assert!(v1 > 4_999.0 && v1 <= 5_000.0, "{v1}");
+        // The trade itself still shows price × amount, matching its price and wallet PnL.
+        s.flush(&store, 12).unwrap();
+        let sell = &store.trades(1, (u32::MAX, 0), 1)[0].1;
+        assert_eq!((sell.quote, sell.usd), (1.0, 1e9));
+        // …and neither does buying the whole J side back out.
+        s.apply(&sync(xj, 1e6, 1_000_000e18), &store);
+        s.apply(&swap(xj, 0.0, 500_000e18, 1e18 + 1e13 - 1e6, 0.0), &store);
+        let v2 = vol(&s) - v1;
+        assert!(v2 > 4_999.0 && v2 <= 5_000.0 + 1e-6, "{v2}");
+        // A pool whose tracked quote balance drifted to 0 still records its trades.
+        s.apply(&sync(xj, 0.0, 1_000_000e18), &store);
+        s.apply(&swap(xj, 1e9, 0.0, 0.0, 1e18), &store);
+        let v3 = vol(&s) - v1 - v2;
+        assert!((v3 - 1.0).abs() < 1e-6, "{v3}");
+
+        // A real quote token keeps its full volume, even in a pool holding more of it than
+        // its own reference pool has behind it: Q at $1 from $8k of USDC, Y/Q with 40k Q.
+        let (q, y, qusdc, yq) = ([10u8; 20], [11u8; 20], [4u8; 20], [5u8; 20]);
+        s.add_token(q, meta("Q", 18), 1);
+        s.add_token(y, meta("Y", 18), 1);
+        s.apply(&created(qusdc, usdc, q), &store);
+        s.apply(&sync(qusdc, 8_000e6, 8_000e18), &store);
+        s.apply(&swap(qusdc, 1e6, 0.0, 0.0, 1e18), &store);
+        assert!((s.tokens[3].usd - 1.0).abs() < 1e-9, "{}", s.tokens[3].usd);
+        assert_eq!(s.stats[&2].window(s.head_ts, 86_400).vol, 1.0, "USDC-quoted volume as traded");
+        s.apply(&created(yq, q, y), &store);
+        s.apply(&sync(yq, 40_100e18, 1_000e18), &store);
+        s.apply(&swap(yq, 100e18, 0.0, 0.0, 2e18), &store);
+        let vq = s.stats[&3].window(s.head_ts, 86_400).vol;
+        assert!((vq - 100.0).abs() < 1e-6, "{vq}");
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
