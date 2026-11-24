@@ -51,18 +51,21 @@ pub struct RawLog {
 #[derive(Debug, PartialEq)]
 pub enum Event {
     /// `origin` is the factory (v2/v3/Solidly) or the hooks contract (v4); it names the DEX.
-    Created { kind: Kind, pool: Id, token0: Addr, token1: Addr, fee: u32, sqrt_price: f64, origin: Addr },
+    /// `stable`: a Solidly pool on the stable curve (x³y + y³x), not x·y.
+    Created { kind: Kind, pool: Id, token0: Addr, token1: Addr, fee: u32, sqrt_price: f64, origin: Addr, stable: bool },
     /// v2/Solidly reserves after a change, raw token units.
     Sync { r0: f64, r1: f64 },
     /// v2/Solidly swap, raw units: pool balance deltas.
     SwapV2 { d0: f64, d1: f64 },
     /// Concentrated-liquidity swap: pool balance deltas (raw), price after, LP fee in pips (v4).
-    SwapCl { d0: f64, d1: f64, sqrt_price: f64, fee: u32 },
+    /// `liquidity`: the pool's in-range liquidity after the swap.
+    SwapCl { d0: f64, d1: f64, sqrt_price: f64, liquidity: f64, fee: u32 },
     /// v3 Collect: tokens leaving the pool (withdrawn liquidity and fees).
     Flow { d0: f64, d1: f64 },
     /// Liquidity added or removed, raw amounts (positive). `moves`: the pool's balances
     /// change by them (v3 Mint); otherwise a Sync or Collect accounts for the tokens.
-    Liquidity { d0: f64, d1: f64, add: bool, moves: bool },
+    /// `range`: a v3 position's ticks and liquidity change (negative when burnt).
+    Liquidity { d0: f64, d1: f64, add: bool, moves: bool, range: Option<(i32, i32, f64)> },
     /// v4 liquidity change; token amounts depend on the current price.
     Modify { tick_lower: i32, tick_upper: i32, liquidity: f64 },
 }
@@ -157,26 +160,31 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
     let ev = if t0 == t.v2_pair_created || t0 == t.solidly_pool_created {
         let kind = if t0 == t.v2_pair_created { Kind::V2 } else { Kind::Solidly };
         let pool = pad(&addr(w(0)?));
-        return created(log, kind, pool, 0, 0.0);
+        let stable = kind == Kind::Solidly && log.topics.get(3).is_some_and(|t| t[31] == 1);
+        return created(log, kind, pool, 0, stable);
     } else if t0 == t.v3_pool_created {
         let fee = u256_f64(log.topics.get(3)?) as u32;
-        return created(log, Kind::V3, pad(&addr(w(1)?)), fee, 0.0);
+        return created(log, Kind::V3, pad(&addr(w(1)?)), fee, false);
     } else if t0 == t.slipstream_pool_created {
-        return created(log, Kind::V3, pad(&addr(w(0)?)), 0, 0.0);
+        return created(log, Kind::V3, pad(&addr(w(0)?)), 0, false);
     } else if t0 == t.v2_sync || t0 == t.solidly_sync {
         Event::Sync { r0: u256_f64(w(0)?), r1: u256_f64(w(1)?) }
     } else if t0 == t.v2_swap || t0 == t.solidly_swap {
         Event::SwapV2 { d0: u256_f64(w(0)?) - u256_f64(w(2)?), d1: u256_f64(w(1)?) - u256_f64(w(3)?) }
     } else if t0 == t.v3_swap || t0 == t.pancake_swap {
-        Event::SwapCl { d0: i256_f64(w(0)?), d1: i256_f64(w(1)?), sqrt_price: u256_f64(w(2)?), fee: 0 }
-    } else if t0 == t.v3_mint {
-        Event::Liquidity { d0: u256_f64(w(2)?), d1: u256_f64(w(3)?), add: true, moves: true }
-    } else if t0 == t.v3_burn {
-        Event::Liquidity { d0: u256_f64(w(1)?), d1: u256_f64(w(2)?), add: false, moves: false }
+        let (d0, d1, sqrt_price, liquidity) = (i256_f64(w(0)?), i256_f64(w(1)?), u256_f64(w(2)?), u256_f64(w(3)?));
+        Event::SwapCl { d0, d1, sqrt_price, liquidity, fee: 0 }
+    } else if t0 == t.v3_mint || t0 == t.v3_burn {
+        let mint = t0 == t.v3_mint;
+        let ticks = (i256_i32(log.topics.get(2)?), i256_i32(log.topics.get(3)?));
+        let (liq, d0, d1) = if mint { (w(1)?, w(2)?, w(3)?) } else { (w(0)?, w(1)?, w(2)?) };
+        let liq = u256_f64(liq) * if mint { 1.0 } else { -1.0 };
+        let range = Some((ticks.0, ticks.1, liq));
+        Event::Liquidity { d0: u256_f64(d0), d1: u256_f64(d1), add: mint, moves: mint, range }
     } else if t0 == t.v2_mint || t0 == t.v2_burn {
-        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: t0 == t.v2_mint, moves: false }
+        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: t0 == t.v2_mint, moves: false, range: None }
     } else if t0 == t.solidly_burn {
-        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: false, moves: false }
+        Event::Liquidity { d0: u256_f64(w(0)?), d1: u256_f64(w(1)?), add: false, moves: false, range: None }
     } else if t0 == t.v3_collect {
         Event::Flow { d0: -u256_f64(w(1)?), d1: -u256_f64(w(2)?) }
     } else if log.address == V4_POOL_MANAGER {
@@ -187,6 +195,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
                 d0: -i256_f64(w(0)?),
                 d1: -i256_f64(w(1)?),
                 sqrt_price: u256_f64(w(2)?),
+                liquidity: u256_f64(w(3)?),
                 fee: u256_f64(w(5)?) as u32,
             }
         } else if t0 == t.v4_modify {
@@ -201,6 +210,7 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
                 fee: u256_f64(w(0)?) as u32,
                 sqrt_price: u256_f64(w(3)?),
                 origin: addr(w(2)?),
+                stable: false,
             };
             return Some((id, ev));
         } else {
@@ -213,10 +223,10 @@ pub fn decode(log: &RawLog) -> Option<(Id, Event)> {
     Some((own, ev))
 }
 
-fn created(log: &RawLog, kind: Kind, pool: Id, fee: u32, sqrt_price: f64) -> Option<(Id, Event)> {
+fn created(log: &RawLog, kind: Kind, pool: Id, fee: u32, stable: bool) -> Option<(Id, Event)> {
     let token0 = addr(log.topics.get(1)?);
     let token1 = addr(log.topics.get(2)?);
-    Some((pool, Event::Created { kind, pool, token0, token1, fee, sqrt_price, origin: log.address }))
+    Some((pool, Event::Created { kind, pool, token0, token1, fee, sqrt_price: 0.0, origin: log.address, stable }))
 }
 
 /// v4 uses address(0) for native ETH; we price and display it as WETH.
@@ -253,7 +263,7 @@ pub fn i256_f64(w: &[u8; 32]) -> f64 {
     -(u256_f64(&inv) + 1.0)
 }
 
-fn i256_i32(w: &[u8; 32]) -> i32 {
+pub fn i256_i32(w: &[u8; 32]) -> i32 {
     i32::from_be_bytes(w[28..].try_into().unwrap_or_default())
 }
 
@@ -340,7 +350,7 @@ mod tests {
         let log = RawLog { topics: vec![T.v3_swap, [0; 32], [0; 32]], data, address: [7; 20], ..Default::default() };
         let (id, ev) = decode(&log).unwrap();
         assert_eq!(id, pad(&[7; 20]));
-        assert_eq!(ev, Event::SwapCl { d0: -100.0, d1: 50.0, sqrt_price: 50.0, fee: 0 });
+        assert_eq!(ev, Event::SwapCl { d0: -100.0, d1: 50.0, sqrt_price: 50.0, liquidity: 0.0, fee: 0 });
         let fake_v4 = RawLog { topics: vec![T.v4_swap, [1; 32]], data: vec![0; 192], ..Default::default() };
         assert!(decode(&fake_v4).is_none(), "v4 events only from the PoolManager");
     }
