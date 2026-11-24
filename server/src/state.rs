@@ -216,13 +216,14 @@ impl State {
         if !matches!(pool.kind, Kind::V3 | Kind::V4) || !pool.liquidity.is_finite() || pool.sqrt_price <= 0.0 {
             return bal;
         }
+        bal.min(self.at_price(pool, pool.liquidity))
+    }
+
+    /// Quote tokens an x·y pool with liquidity `l` at a concentrated-liquidity pool's price holds.
+    fn at_price(&self, pool: &Pool, l: f64) -> f64 {
         let sp = pool.sqrt_price / Q96;
-        let virt = if pool.quote0 {
-            pool.liquidity / sp / self.scale(pool.token0)
-        } else {
-            pool.liquidity * sp / self.scale(pool.token1)
-        };
-        bal.min(virt.max(0.0))
+        let virt = if pool.quote0 { l / sp / self.scale(pool.token0) } else { l * sp / self.scale(pool.token1) };
+        virt.max(0.0)
     }
 
     /// Quote per base at a concentrated-liquidity pool's √price (X96), in whole tokens; NaN
@@ -608,10 +609,17 @@ impl State {
             self.quote_value(p, dq.abs()) / rel
         } else {
             // A few wei through dust into a big position just past the price would otherwise
-            // read as that position's depth, one tick at a time. Scaling the capped depth by the
-            // drop in liquidity undercounts it, never over.
-            let l = pool.liquidity;
-            self.quote_liq(p) * if liq_before < l { liq_before / l } else { 1.0 }
+            // read as that position's depth, one tick at a time.
+            // ponytail: only this swap's liquidity before counts, so a step entered by a swap that
+            // exchanged nothing, or rolled from one one-tick position into the next, still passes;
+            // that is the one-tick ceiling in `near_quote`.
+            let l = liq_before.min(pool.liquidity);
+            let v = if l.is_finite() {
+                self.at_price(pool, l) * self.tokens[pool.quote() as usize].usd
+            } else {
+                f64::INFINITY
+            };
+            self.quote_liq(p).min(v)
         };
         // Overpaying moves x·y reserves further than the curve would, which would read as
         // depth; an x·y pool is never deeper than its quote reserve before the trade.
@@ -2025,6 +2033,22 @@ mod tests {
             drop(store);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn deep_pool_crossing_into_more_liquidity_is_not_thin() {
+        // A $200k full-range USDC/J pool (L = 1e17); an LP adds L = 1e18 just below the price.
+        // A $33 swap moves 1.5 ticks into it: the depth is the pool's, not a tenth of it.
+        let (store, mut s, dir) = fresh("deep-cross");
+        let jp = v3_pool(&mut s, &store);
+        let t = (2.0 * (1e6f64).ln() / 1.0001f64.ln()).floor();
+        let lp = vec![word(0.0), word(1e18), word(0.0), word(1.2e21)];
+        s.apply(&v3_log(12, jp, T.v3_mint, Some((t - 24.0, t - 1.0)), lp), &store);
+        assert!((s.pools[0].liquidity - 1e17).abs() < 1.0);
+        s.apply(&v3_swap(13, jp, 33e6, -33e18, 1e6 * 1.0001f64.powf(-0.75), 1.1e18), &store);
+        assert_eq!(m_thin(&s, 0), 0);
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

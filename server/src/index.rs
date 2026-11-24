@@ -120,7 +120,9 @@ async fn backfill_stable(rpc: &Rpc, sh: &Shared) -> Result<()> {
         let stable = rpc.stable(&addrs).await?;
         let mut s = sh.state.write().map_err(|_| anyhow!("state lock poisoned"))?;
         for (&(p, _), st) in chunk.iter().zip(stable) {
-            s.set_stable(p, st);
+            if let Some(st) = st {
+                s.set_stable(p, st);
+            }
         }
     }
     if !todo.is_empty() {
