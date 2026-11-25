@@ -253,13 +253,17 @@ impl Stats {
         Box::new(Stats { m: [Bucket::default(); 60], h: [Bucket::default(); 24] })
     }
 
-    /// Adds a trade. `open` is the price before it (start of a new bucket).
-    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool, thin: bool, maker: u64) {
+    /// Adds a trade. `open` is the price before it (start of a new bucket), or with `reopen`, the
+    /// bucket's open whether it's new or not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool, thin: bool, maker: u64, reopen: bool) {
         for (ring, len) in [(&mut self.m[..], 60), (&mut self.h[..], 3600)] {
             let t = ts - ts % len;
             let b = &mut ring[(t / len) as usize % ring.len()];
             if b.t != t {
                 *b = Bucket { t, open: open as f32, ..Default::default() };
+            } else if reopen {
+                b.open = open as f32;
             }
             b.bump(vol, buy, thin, maker);
         }
@@ -574,9 +578,9 @@ mod tests {
     fn stats_windows() {
         let mut s = Stats::new();
         let now = 1_800_001_800; // half past an hour
-        s.add(now - 7200, 1.0, 100.0, true, true, 1); // two hours ago
-        s.add(now - 120, 2.0, 50.0, false, false, 2); // two minutes ago
-        s.add(now, 3.0, 25.0, true, false, 2);
+        s.add(now - 7200, 1.0, 100.0, true, true, 1, false); // two hours ago
+        s.add(now - 120, 2.0, 50.0, false, false, 2, false); // two minutes ago
+        s.add(now, 3.0, 25.0, true, false, 2, false);
         let w5 = s.window(now, 300);
         assert_eq!((w5.vol, w5.buys, w5.sells, w5.open), (75.0, 1, 1, 2.0));
         let w24 = s.window(now, 86_400);
