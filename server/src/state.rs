@@ -459,9 +459,10 @@ impl State {
         let pool = &self.pools[p as usize];
         let (db, dq) = if pool.quote0 { (d1, d0) } else { (d0, d1) };
         if db == 0.0 || dq == 0.0 {
-            // A swap that exchanged nothing still moved a concentrated pool's price. A pool
-            // stored before we kept `spot` takes it from before this move, so the next trade
-            // measures the move from there (`thin`). (Stable Solidly `spot` is curve-adjusted.)
+            // A swap that exchanged nothing still moved a concentrated pool's price. A priced pool
+            // with no `spot` yet (stored before we kept it, or a v4 pool priced at creation that
+            // hasn't traded) takes it from before this move, so the next trade measures the move
+            // from there (`thin`). (Stable Solidly `spot` is curve-adjusted.)
             if matches!(pool.kind, Kind::V3 | Kind::V4)
                 && pool.spot.is_nan()
                 && pool.price_native.is_finite()
