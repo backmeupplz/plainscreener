@@ -257,8 +257,11 @@ impl Rpc {
                 Err(e) if e.is::<RpcError>() => return Ok(vec![None]),
                 Err(e) => return Err(e),
             };
+            // A malformed answer (`null`, `0x`) would fail the same way on every retry: leave
+            // these pools unknown (x·y) rather than hold the indexer up; the next start retries.
             if ret.len() != pools.len() {
-                bail!("multicall returned {} results for {} calls", ret.len(), pools.len());
+                eprintln!("stable(): multicall returned {} results for {} calls", ret.len(), pools.len());
+                return Ok(vec![None; pools.len()]);
             }
             Ok(ret.iter().map(|r| Some(r.as_deref().is_some_and(|d| d.len() == 32 && d[31] == 1))).collect())
         })
@@ -585,6 +588,14 @@ mod tests {
         // A block the node can't show can't be vouched for.
         let (rpc, _) = lagging_node(usize::MAX, both, |b| (b == 5).then_some("00"), |_| 99).await;
         assert!(rpc.logs(5, 6).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_stable_answer_leaves_pools_unknown() {
+        for result in [json!(null), json!("0x")] {
+            let (rpc, _) = fake(move |_, _| json!({"result": result.clone()})).await;
+            assert_eq!(rpc.stable(&[[1; 20], [2; 20]]).await.unwrap(), [None, None]);
+        }
     }
 
     #[test]

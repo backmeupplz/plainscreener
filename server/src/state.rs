@@ -459,6 +459,16 @@ impl State {
         let pool = &self.pools[p as usize];
         let (db, dq) = if pool.quote0 { (d1, d0) } else { (d0, d1) };
         if db == 0.0 || dq == 0.0 {
+            // A swap that exchanged nothing still moved a concentrated pool's price. A pool
+            // stored before we kept `spot` takes it from before this move, so the next trade
+            // measures the move from there (`thin`). (Stable Solidly `spot` is curve-adjusted.)
+            if matches!(pool.kind, Kind::V3 | Kind::V4)
+                && pool.spot.is_nan()
+                && pool.price_native.is_finite()
+                && spot.0.is_finite()
+            {
+                self.pools[p as usize].spot = spot.0;
+            }
             return;
         }
         let (base, quote) = (pool.base(), pool.quote());
@@ -1716,27 +1726,36 @@ mod tests {
 
     #[test]
     fn cl_swap_through_an_empty_range_counts_as_unbacked() {
-        let (store, mut s, dir) = fresh("cl-empty");
-        let jp = v3_drained(&mut s, &store, 0.0);
-        // A swap through the empty range exchanges nothing but moves J to $1e6. The owner adds
-        // $20k at the new price and wash-trades $10k there.
-        s.apply(&v3_swap(12, jp, 0.0, 0.0, 1e3, 0.0), &store);
-        s.apply(
-            &v3_log(
-                13,
-                jp,
-                T.v3_mint,
-                Some((100_000.0, 200_000.0)),
-                vec![word(0.0), word(2e13), word(20_000e6), word(20e18)],
-            ),
-            &store,
-        );
-        s.apply(&v3_swap(14, jp, 5_000e6, -5e15, 1e3, 2e13), &store);
-        s.apply(&v3_swap(15, jp, -5_000e6, 5e15, 1e3, 2e13), &store);
-        assert!(change(&s, 0) > 1e5, "{}", change(&s, 0));
-        assert_eq!(gated_and_ranked(&s, 0), (true, false));
-        drop(store);
-        let _ = std::fs::remove_dir_all(dir);
+        for old in [false, true] {
+            let (store, mut s, dir) = fresh(if old { "cl-empty-old" } else { "cl-empty" });
+            let jp = v3_drained(&mut s, &store, 0.0);
+            if old {
+                // A record stored before we kept `spot`, liquidity and tick.
+                let b = s.pools[0].encode();
+                s.pools[0] = Pool::decode(&b[..b.len() - 29]);
+                (s.pools[0].liquidity, s.pools[0].tick) = (f64::NAN, f64::NAN);
+                assert!(s.pools[0].spot.is_nan());
+            }
+            // A swap through the empty range exchanges nothing but moves J to $1e6. The owner
+            // adds $20k at the new price and wash-trades $10k there.
+            s.apply(&v3_swap(12, jp, 0.0, 0.0, 1e3, 0.0), &store);
+            s.apply(
+                &v3_log(
+                    13,
+                    jp,
+                    T.v3_mint,
+                    Some((100_000.0, 200_000.0)),
+                    vec![word(0.0), word(2e13), word(20_000e6), word(20e18)],
+                ),
+                &store,
+            );
+            s.apply(&v3_swap(14, jp, 5_000e6, -5e15, 1e3, 2e13), &store);
+            s.apply(&v3_swap(15, jp, -5_000e6, 5e15, 1e3, 2e13), &store);
+            assert!(change(&s, 0) > 1e5, "old {old}: {}", change(&s, 0));
+            assert_eq!(gated_and_ranked(&s, 0), (true, false), "old {old}");
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
