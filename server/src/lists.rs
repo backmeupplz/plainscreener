@@ -136,10 +136,20 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
             let score = match tab {
                 Tab::Trending if m.liq >= 10_000.0 => m.w[w].vol,
                 Tab::Top if m.liq >= 10_000.0 => m.w[3].vol,
+                // A move made through little depth (see `Candle::thin`) doesn't rank, nor a USD
+                // price its quote token has since left behind (`State::usd_current`).
                 Tab::Gainers | Tab::Losers
-                    if m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0 && st.deep_quote(pool.quote()) =>
+                    if m.liq >= 25_000.0
+                        && m.w[3].vol >= 10_000.0
+                        && m.w[w].thin == 0
+                        && st.deep_quote(pool.quote())
+                        && st.usd_current(p) =>
                 {
-                    if tab == Tab::Gainers { change(&m, w) } else { -change(&m, w) }
+                    if tab == Tab::Gainers {
+                        change(&m, w)
+                    } else {
+                        -change(&m, w)
+                    }
                 }
                 Tab::New if m.liq >= 5_000.0 && pool.created_ts + 3 * 86_400 > head => pool.created_ts as f64,
                 _ => return None,

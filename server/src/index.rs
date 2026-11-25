@@ -2,7 +2,7 @@
 //! (it keeps ~1.3M), then the node block by block. Every source produces `RawLog`s that
 //! go through the same `process` step.
 
-use crate::abi::{Addr, RawLog};
+use crate::abi::{Addr, Kind, RawLog};
 use crate::rpc::Rpc;
 use crate::sqd::Sqd;
 use crate::{Config, Shared};
@@ -19,6 +19,10 @@ const CATCH_UP: u32 = 1_000;
 
 pub async fn run(cfg: Arc<Config>, sh: Shared) {
     let (rpc, sqd) = (Rpc::new(&cfg.rpc_url), Sqd::new(&cfg.sqd_url));
+    while let Err(e) = backfill_stable(&rpc, &sh).await {
+        eprintln!("indexer: {e:#}");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
     let mut cursor = None;
     loop {
         if let Err(e) = step(&cfg, &sh, &rpc, &sqd, &mut cursor).await {
@@ -101,6 +105,30 @@ impl<T> Drop for Fetch<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Solidly pools stored before we kept their curve learn it from the chain, before any log is
+/// applied (pools found since take it from their creation event).
+async fn backfill_stable(rpc: &Rpc, sh: &Shared) -> Result<()> {
+    let todo: Vec<(u32, Addr)> = {
+        let s = sh.state.read().map_err(|_| anyhow!("state lock poisoned"))?;
+        let unknown = s.pools.iter().enumerate().filter(|(_, p)| p.kind == Kind::Solidly && p.stable.is_none());
+        unknown.map(|(i, p)| (i as u32, p.id[12..].try_into().unwrap_or_default())).collect()
+    };
+    for chunk in todo.chunks(500) {
+        let addrs: Vec<Addr> = chunk.iter().map(|(_, a)| *a).collect();
+        let stable = rpc.stable(&addrs).await?;
+        let mut s = sh.state.write().map_err(|_| anyhow!("state lock poisoned"))?;
+        for (&(p, _), st) in chunk.iter().zip(stable) {
+            if let Some(st) = st {
+                s.set_stable(p, st);
+            }
+        }
+    }
+    if !todo.is_empty() {
+        eprintln!("learnt the curve of {} Solidly pools", todo.len());
+    }
+    Ok(())
 }
 
 /// Applies a batch of logs in order and persists the result with the next block to index.

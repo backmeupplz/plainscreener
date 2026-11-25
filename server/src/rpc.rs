@@ -19,6 +19,9 @@ const DEPTH: u32 = 25;
 /// Polls (every 500 ms) for such a block's logs before failing, so the indexer retries.
 const MAX_POLLS: u32 = if cfg!(test) { 4 } else { 40 };
 
+/// A future that calls itself (splitting a batch), so it has to be boxed.
+type Recursive<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
 #[derive(Clone)]
 pub struct Rpc {
     url: String,
@@ -196,7 +199,7 @@ impl Rpc {
     /// One multicall. When the node rejects the whole call (a token burning all the gas),
     /// split it until the culprit is alone. Network errors propagate so the batch retries:
     /// guessing decimals would corrupt every price of that token for good.
-    fn meta_batch<'a>(&'a self, tokens: &'a [Addr]) -> Pin<Box<dyn Future<Output = Result<Vec<Meta>>> + Send + 'a>> {
+    fn meta_batch<'a>(&'a self, tokens: &'a [Addr]) -> Recursive<'a, Vec<Meta>> {
         Box::pin(async move {
             let calls: Vec<(Addr, [u8; 4])> =
                 tokens.iter().flat_map(|t| [DECIMALS, SYMBOL, NAME, TOTAL_SUPPLY].map(|sel| (*t, sel))).collect();
@@ -232,6 +235,35 @@ impl Rpc {
                     }
                 })
                 .collect())
+        })
+    }
+
+    /// Whether each Solidly pool is on the stable curve, via Multicall3. A pool whose
+    /// `stable()` reverts isn't a stable pool; one breaking the whole call is split out as in
+    /// `meta_batch`, and left unknown (`None`).
+    pub fn stable<'a>(&'a self, pools: &'a [Addr]) -> Recursive<'a, Vec<Option<bool>>> {
+        Box::pin(async move {
+            let sel = abi::keccak("stable()");
+            let calls: Vec<(Addr, [u8; 4])> = pools.iter().map(|p| (*p, [sel[0], sel[1], sel[2], sel[3]])).collect();
+            let data = hex(&encode_aggregate3(&calls));
+            let ret = match self.call("eth_call", json!([{"to": MULTICALL3, "data": data}, "latest"])).await {
+                Ok(v) => decode_aggregate3(&unhex(v.as_str().unwrap_or_default()).unwrap_or_default()),
+                Err(e) if e.is::<RpcError>() && pools.len() > 1 => {
+                    let (a, b) = pools.split_at(pools.len() / 2);
+                    let mut out = self.stable(a).await?;
+                    out.extend(self.stable(b).await?);
+                    return Ok(out);
+                }
+                Err(e) if e.is::<RpcError>() => return Ok(vec![None]),
+                Err(e) => return Err(e),
+            };
+            // A malformed answer (`null`, `0x`) would fail the same way on every retry: leave
+            // these pools unknown (x·y) rather than hold the indexer up; the next start retries.
+            if ret.len() != pools.len() {
+                eprintln!("stable(): multicall returned {} results for {} calls", ret.len(), pools.len());
+                return Ok(vec![None; pools.len()]);
+            }
+            Ok(ret.iter().map(|r| Some(r.as_deref().is_some_and(|d| d.len() == 32 && d[31] == 1))).collect())
         })
     }
 
@@ -556,6 +588,14 @@ mod tests {
         // A block the node can't show can't be vouched for.
         let (rpc, _) = lagging_node(usize::MAX, both, |b| (b == 5).then_some("00"), |_| 99).await;
         assert!(rpc.logs(5, 6).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_stable_answer_leaves_pools_unknown() {
+        for result in [json!(null), json!("0x")] {
+            let (rpc, _) = fake(move |_, _| json!({"result": result.clone()})).await;
+            assert_eq!(rpc.stable(&[[1; 20], [2; 20]]).await.unwrap(), [None, None]);
+        }
     }
 
     #[test]

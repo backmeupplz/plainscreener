@@ -24,8 +24,14 @@ pub struct Token {
     /// Most liquid pool, where token links go.
     pub best_pool: u32,
     pub first_block: u32,
+    /// When a thin swap (see `Candle::thin`) last set `usd`; 0 if never.
+    pub thin_ts: u32,
     /// We have an icon for it (in the store, not part of this encoding).
     pub icon: bool,
+    /// `usd` before the block `usd_block` first changed it (in memory only; see
+    /// `State::block_usd`).
+    pub usd_was: f64,
+    pub usd_block: u32,
 }
 
 pub struct Pool {
@@ -49,6 +55,25 @@ pub struct Pool {
     pub price_native: f64,
     pub price_usd: f64,
     pub last_ts: u32,
+    /// Concentrated-liquidity pools: liquidity in range at the current price, from the last
+    /// swap plus positions changed since. NaN when unknown (stored before we tracked it).
+    pub liquidity: f64,
+    /// Concentrated-liquidity pools: the current tick, as the last swap (or v4 Initialize)
+    /// reported it. NaN when unknown. At a tick boundary it depends on the direction the price
+    /// came from, so it can't be derived from √price.
+    pub tick: f64,
+    /// Solidly pools: the stable curve (true) or x·y (false). None when unknown (stored
+    /// before we tracked it) and for other kinds.
+    pub stable: Option<bool>,
+    /// Spot price (quote per base) where the last recorded trade left the pool, or its price
+    /// after a thin trade; NaN when unknown. Moves from here before the next trade add to
+    /// `drift` (see `State::thin`).
+    pub spot: f64,
+    /// When a thin swap (see `Candle::thin`) last traded here; 0 if never.
+    pub thin_ts: u32,
+    /// How far the spot price has moved without a trade (a bare Sync, a swap that exchanged
+    /// nothing) since the last thin trade, as a ratio; 1 when none. See `State::thin`.
+    pub drift: f64,
 }
 
 impl Pool {
@@ -63,6 +88,18 @@ impl Pool {
     }
     pub fn bal_quote(&self) -> f64 {
         if self.quote0 { self.bal0 } else { self.bal1 }.max(0.0)
+    }
+    /// Adds `l` to the in-range liquidity if a position over ticks `lower..upper` holds the
+    /// current price (liquidity not known yet stays unknown).
+    pub fn shift_liquidity(&mut self, lower: i32, upper: i32, l: f64) {
+        let tick = if self.tick.is_finite() {
+            self.tick
+        } else {
+            (2.0 * (self.sqrt_price / 2f64.powi(96)).ln() / 1.0001f64.ln()).floor()
+        };
+        if self.liquidity.is_finite() && self.sqrt_price > 0.0 && (lower as f64..upper as f64).contains(&tick) {
+            self.liquidity = (self.liquidity + l).max(0.0);
+        }
     }
     pub fn is_address(&self) -> bool {
         self.kind != Kind::V4
@@ -118,6 +155,8 @@ pub struct Candle {
     pub v: f32,
     pub buys: u32,
     pub sells: u32,
+    /// Swaps that moved the price with little depth behind it (see `State::trade`).
+    pub thin: u32,
 }
 
 impl Candle {
@@ -125,7 +164,7 @@ impl Candle {
         let (u, n) = (usd as f32, native as f32);
         Candle { o: u, h: u, l: u, c: u, no: n, nh: n, nl: n, nc: n, ..Default::default() }
     }
-    pub fn add(&mut self, usd: f64, native: f64, vol: f64, buy: bool) {
+    pub fn add(&mut self, usd: f64, native: f64, vol: f64, buy: bool, thin: bool) {
         let (u, n) = (usd as f32, native as f32);
         self.h = self.h.max(u);
         self.l = self.l.min(u);
@@ -136,7 +175,12 @@ impl Candle {
         if vol.is_finite() {
             self.v += vol as f32;
         }
-        if buy { self.buys += 1 } else { self.sells += 1 }
+        if buy {
+            self.buys += 1
+        } else {
+            self.sells += 1
+        }
+        self.thin += thin as u32;
     }
 }
 
@@ -176,6 +220,7 @@ pub struct Bucket {
     pub vol: f32,
     pub buys: u32,
     pub sells: u32,
+    pub thin: u32,
 }
 
 /// Totals over a window ending now.
@@ -184,6 +229,8 @@ pub struct Window {
     pub vol: f64,
     pub buys: u32,
     pub sells: u32,
+    /// Thin swaps (see `Candle::thin`).
+    pub thin: u32,
     /// Price at the start of the window, if anything traded in it.
     pub open: f64,
 }
@@ -194,14 +241,14 @@ impl Stats {
     }
 
     /// Adds a trade. `open` is the price before it (start of a new bucket).
-    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool) {
+    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool, thin: bool) {
         for (ring, len) in [(&mut self.m[..], 60), (&mut self.h[..], 3600)] {
             let t = ts - ts % len;
             let b = &mut ring[(t / len) as usize % ring.len()];
             if b.t != t {
                 *b = Bucket { t, open: open as f32, ..Default::default() };
             }
-            b.bump(vol, buy);
+            b.bump(vol, buy, thin);
         }
     }
 
@@ -209,7 +256,7 @@ impl Stats {
     pub fn restore(&mut self, res: u32, t: u32, c: &Candle) {
         let ring = if res == 60 { &mut self.m[..] } else { &mut self.h[..] };
         let n = ring.len();
-        ring[(t / res) as usize % n] = Bucket { t, open: c.o, vol: c.v, buys: c.buys, sells: c.sells };
+        ring[(t / res) as usize % n] = Bucket { t, open: c.o, vol: c.v, buys: c.buys, sells: c.sells, thin: c.thin };
     }
 
     /// Activity in the last `secs` seconds (5 min and 1 h use minutes, longer windows hours).
@@ -222,6 +269,7 @@ impl Stats {
             w.vol += b.vol as f64;
             w.buys += b.buys;
             w.sells += b.sells;
+            w.thin += b.thin;
             if b.t < first {
                 first = b.t;
                 w.open = b.open as f64;
@@ -236,11 +284,16 @@ impl Stats {
 }
 
 impl Bucket {
-    fn bump(&mut self, vol: f64, buy: bool) {
+    fn bump(&mut self, vol: f64, buy: bool, thin: bool) {
         if vol.is_finite() {
             self.vol += vol as f32;
         }
-        if buy { self.buys += 1 } else { self.sells += 1 }
+        if buy {
+            self.buys += 1
+        } else {
+            self.sells += 1
+        }
+        self.thin += thin as u32;
     }
 }
 
@@ -322,6 +375,7 @@ impl Token {
             .u32(self.ref_pool)
             .u32(self.best_pool)
             .u32(self.first_block)
+            .u32(self.thin_ts)
             .0
     }
     pub fn decode(b: &[u8]) -> Token {
@@ -336,7 +390,10 @@ impl Token {
             ref_pool: r.u32(),
             best_pool: r.u32(),
             first_block: r.u32(),
+            thin_ts: r.u32(),
             icon: false,
+            usd_was: f64::NAN,
+            usd_block: 0,
         }
     }
 }
@@ -359,6 +416,16 @@ impl Pool {
             .f64(self.price_native)
             .f64(self.price_usd)
             .u32(self.last_ts)
+            .f64(self.liquidity)
+            .u8(match self.stable {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            })
+            .f64(self.spot)
+            .u32(self.thin_ts)
+            .f64(self.tick)
+            .f64(self.drift)
             .0
     }
     pub fn decode(b: &[u8]) -> Pool {
@@ -379,6 +446,15 @@ impl Pool {
             price_native: r.f64(),
             price_usd: r.f64(),
             last_ts: r.u32(),
+            liquidity: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
+            stable: match r.u8() {
+                0 => None,
+                b => Some(b == 2),
+            },
+            spot: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
+            thin_ts: r.u32(),
+            tick: if r.0.len() >= 8 { r.f64() } else { f64::NAN },
+            drift: if r.0.len() >= 8 { r.f64() } else { 1.0 },
         }
     }
 }
@@ -390,6 +466,7 @@ impl Candle {
             .fold(W::default(), |w, &x| w.f32(x))
             .u32(self.buys)
             .u32(self.sells)
+            .u32(self.thin)
             .0
     }
     pub fn decode(b: &[u8]) -> Candle {
@@ -406,6 +483,7 @@ impl Candle {
             v: r.f32(),
             buys: r.u32(),
             sells: r.u32(),
+            thin: r.u32(),
         }
     }
 }
@@ -462,7 +540,10 @@ mod tests {
             ref_pool: 3,
             best_pool: 7,
             first_block: 9,
+            thin_ts: 0,
             icon: false,
+            usd_was: f64::NAN,
+            usd_block: 0,
         };
         let d = Token::decode(&t.encode());
         assert_eq!((d.symbol.as_str(), d.decimals, d.best_pool, d.first_block), ("USDC", 6, 7, 9));
@@ -474,12 +555,13 @@ mod tests {
     fn stats_windows() {
         let mut s = Stats::new();
         let now = 1_800_001_800; // half past an hour
-        s.add(now - 7200, 1.0, 100.0, true); // two hours ago
-        s.add(now - 120, 2.0, 50.0, false); // two minutes ago
-        s.add(now, 3.0, 25.0, true);
+        s.add(now - 7200, 1.0, 100.0, true, true); // two hours ago
+        s.add(now - 120, 2.0, 50.0, false, false); // two minutes ago
+        s.add(now, 3.0, 25.0, true, false);
         let w5 = s.window(now, 300);
         assert_eq!((w5.vol, w5.buys, w5.sells, w5.open), (75.0, 1, 1, 2.0));
         let w24 = s.window(now, 86_400);
         assert_eq!((w24.vol, w24.buys + w24.sells, w24.open), (175.0, 3, 1.0));
+        assert_eq!((w5.thin, w24.thin), (0, 1));
     }
 }
