@@ -9,6 +9,7 @@ mod lists;
 mod model;
 mod og;
 mod pages;
+mod repair;
 mod rpc;
 mod safety;
 mod sqd;
@@ -108,6 +109,8 @@ async fn main() -> Result<()> {
     let started = std::time::Instant::now();
     let state = State::load(&store)?;
     eprintln!("loaded {} pools, {} tokens in {:.1?}", state.pools.len(), state.tokens.len(), started.elapsed());
+    let scale = |t: u32| 10f64.powi(state.tokens[t as usize].decimals as i32);
+    repair::spawn(store.clone(), state.pools.iter().map(|p| (scale(p.base()), scale(p.quote()))).collect());
     let sh = Shared { store, state: Arc::new(RwLock::new(state)), live: broadcast::channel(1024).0 };
     let (js_file, wasm_file) = (format!("app.{}.js", hash(JS.as_bytes())), format!("chart.{}.wasm", hash(WASM)));
     let app = Arc::new(App {

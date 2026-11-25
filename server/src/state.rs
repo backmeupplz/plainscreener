@@ -23,6 +23,10 @@ const DEEP_QUOTE: f64 = 100_000.0;
 const UNPROVEN_DIV: f64 = 4.0;
 /// Pricing pools followed when capping a pool's liquidity (see `quote_liq`).
 const MAX_HOPS: usize = 8;
+/// A swap moving fewer raw units than this on either side is priced by rounding (1 vs
+/// 2 units of USDC against a few wei is a 2x wick), so it keeps the pool's last price.
+// ponytail: also mutes small trades of tokens with 0-2 decimals; per-token if that matters.
+pub const DUST_RAW: f64 = 1_000.0;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
 pub const STABLES: [Addr; 4] = [
@@ -386,7 +390,8 @@ impl State {
             return;
         }
         let (base, quote) = (pool.base(), pool.quote());
-        let native = dq.abs() / db.abs();
+        let dust = (db.abs() * self.scale(base)).min(dq.abs() * self.scale(quote)) < DUST_RAW;
+        let native = if dust { pool.price_native } else { dq.abs() / db.abs() };
         if !native.is_finite() || native <= 0.0 {
             return;
         }
@@ -587,6 +592,12 @@ mod tests {
         let weth = &s.tokens[0];
         assert!((weth.usd - 3000.0).abs() < 1e-6, "WETH priced from USDC: {}", weth.usd);
         assert!(!s.pools[0].quote0, "USDC (token1) is the quote");
+
+        // 1 raw USDC for 23 wei "prices" WETH at $43B: counted, but the price holds.
+        s.apply(&swap(pool_a, 0.0, 1.0, 23.0, 0.0), &store);
+        let c = s.candles[&(0, 0)].1;
+        assert_eq!((c.h, c.l, c.c, c.buys), (3000.0, 3000.0, 3000.0, 2), "dust swap leaves no wick");
+        assert!((s.tokens[0].usd - 3000.0).abs() < 1e-6 && (s.pools[0].price_usd - 3000.0).abs() < 1e-6);
 
         // A contract posing as a bigger WETH/USDC pool can't move WETH's price.
         s.apply(&created_by([1; 20], fake, WETH, usdc), &store);

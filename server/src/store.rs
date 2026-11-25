@@ -10,7 +10,7 @@ pub type Keyed = ((u32, u32), Trade);
 #[derive(Clone)]
 pub struct Store {
     pub db: Database,
-    meta: Keyspace,
+    pub meta: Keyspace,
     pub tokens: Keyspace,
     pub pools: Keyspace,
     /// [pool u32][res u8][t u32] → Candle
