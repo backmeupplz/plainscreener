@@ -26,8 +26,8 @@ const MAX_HOPS: usize = 8;
 /// Quote-side depth a swap needs behind its price move for that move to count on Gainers and
 /// Losers: half their $25k liquidity floor, so as deep as a $25k x·y pool.
 const MIN_BACKED: f64 = 12_500.0;
-/// How far a v2 or Solidly trade's price may sit outside the pool's spot prices before and
-/// after it (fees up to 3%, plus Aerodrome sending its fees out of the reserves).
+/// How far a trade that ends in an empty range may price outside the pool's spot prices before
+/// and after it (fees up to 3%, plus Aerodrome sending its fees out of the reserves).
 const SPOT_SLACK: f64 = 1.05;
 const Q96: f64 = 79_228_162_514_264_337_593_543_950_336.0;
 
@@ -69,6 +69,9 @@ pub struct State {
     touched: HashSet<u32>,
     /// Hour of the last pruning of idle pools' stats.
     pruned_hour: u32,
+    /// The block being applied, and the USD prices tokens had before they changed in it.
+    block: u32,
+    block_usd: HashMap<u32, f64>,
 }
 
 impl State {
@@ -285,12 +288,28 @@ impl State {
         v.min(self.quote_liq(quote.ref_pool).max(0.0))
     }
 
+    /// A quote token's USD price for its pairs' trades: as of the previous block, unless it is
+    /// WETH or a stablecoin. A flash loan can pump a quote token through real depth, price a
+    /// pair at that peak and sell back in one transaction, which would leave the pair a USD
+    /// price nothing holds; it can't span blocks.
+    fn quote_usd(&self, t: u32) -> f64 {
+        let q = &self.tokens[t as usize];
+        match self.block_usd.get(&t) {
+            Some(&usd) if q.addr != WETH && !STABLES.contains(&q.addr) => usd,
+            _ => q.usd,
+        }
+    }
+
     pub fn apply(&mut self, log: &RawLog, store: &Store) {
         let Some((id, ev)) = abi::decode(log) else {
             return;
         };
         let ts = log.ts;
         self.head_ts = self.head_ts.max(ts);
+        if log.block != self.block {
+            self.block = log.block;
+            self.block_usd.clear();
+        }
         if let Event::Created { kind, token0, token1, fee, sqrt_price, tick, origin, stable, .. } = ev {
             return self.create(id, kind, token0, token1, fee, (sqrt_price, tick), origin, stable, log.block, ts);
         }
@@ -438,9 +457,9 @@ impl State {
     }
 
     /// Records a swap given the pool's balance deltas in whole tokens and its spot price
-    /// (quote per base) before and after. The price is what was actually exchanged: a
-    /// concentrated-liquidity pool's spot price after a swap through an empty range sits at the
-    /// protocol limit, which nobody traded at. `keep` is the share of tokens paid in that the
+    /// (quote per base) before and after. The pool's price, which candles, stats and the base
+    /// token's USD price follow, is its spot price after the trade; the trade row keeps what
+    /// was exchanged. `keep` is the share of tokens paid in that the
     /// pool's balances counted (v4 leaves out fees). `liq_before`: a concentrated-liquidity
     /// pool's in-range liquidity before the swap (NaN if unknown or x·y).
     #[allow(clippy::too_many_arguments)]
@@ -477,13 +496,19 @@ impl State {
         if !exec.is_finite() || exec <= 0.0 {
             return;
         }
-        let native = match pool.kind {
-            Kind::Solidly => clamp_spot(exec, spot, pool.stable == Some(true)),
-            // Concentrated liquidity can't be overpaid, but a v4 fee (up to 100%, paid to the LP)
-            // and rounding on a swap of a few wei both price a trade far off the curve.
-            _ => clamp_spot(exec, spot, false),
+        // The pool's price is where the trade left it: overpaying an x·y pool, a v4 fee (up to
+        // 100%, paid to the LP) and rounding on a swap of a few wei all price a trade far off the
+        // curve, and a round trip's closing leg averages a price the pool no longer holds. A swap
+        // that ends in an empty range leaves the protocol limit, which nobody traded at, so it
+        // keeps a price between the spot prices before and after.
+        let stable = pool.stable == Some(true);
+        let empty = matches!(pool.kind, Kind::V3 | Kind::V4) && pool.liquidity == 0.0;
+        let native = if spot.1.is_finite() && spot.1 > 0.0 && !empty {
+            if stable { stable_price(spot.1) } else { spot.1 }
+        } else {
+            clamp_spot(exec, spot, stable)
         };
-        let qusd = self.tokens[quote as usize].usd;
+        let qusd = self.quote_usd(quote);
         let usd = native * qusd;
         let vol = self.quote_value(p, dq.abs());
         let buy = db < 0.0;
@@ -513,7 +538,7 @@ impl State {
             return;
         }
         let (prev_usd, prev_native) = (pool.price_usd, pool.price_native);
-        let (thin, spot_now) = self.thin(p, curve_dq, before, spot, native, liq_before);
+        let (thin, spot_now) = self.thin(p, curve_dq, before, spot, liq_before);
 
         for (ri, res) in RES.iter().enumerate() {
             let t = ts - ts % res;
@@ -550,9 +575,8 @@ impl State {
         pool.price_native = native;
         pool.price_usd = usd;
         pool.last_ts = ts;
-        // The next move is measured from here. After a thin trade that is the price it recorded,
-        // so whatever gap it left to the real spot price counts against the next trade too.
-        pool.spot = if thin || !spot_now.is_finite() { native } else { spot_now };
+        // The next move is measured from here.
+        pool.spot = if spot_now.is_finite() { spot_now } else { native };
         if thin {
             pool.thin_ts = ts;
         }
@@ -568,6 +592,7 @@ impl State {
             && qliq >= MIN_REF_LIQ
             && (tok.ref_pool == p || !tok.usd.is_finite() || self.ref_weight(p) > self.ref_weight(tok.ref_pool))
         {
+            self.block_usd.entry(base).or_insert(self.tokens[base as usize].usd);
             let tok = &mut self.tokens[base as usize];
             tok.usd = usd;
             tok.ref_pool = p;
@@ -592,29 +617,33 @@ impl State {
     /// the pool's spot price after it. The depth is the quote traded over the relative change in
     /// √price: an x·y pool's quote reserve, or L·√P for concentrated liquidity, met along the
     /// way. So a pump through dust liquidity or a nearly empty pool shows as thin even if deep
-    /// liquidity is added at the new price afterwards. The move runs from the spot price the
-    /// pool's last recorded trade left (swaps that exchanged nothing, or reserves changed by a
-    /// bare Sync, count as moved by this trade) to the spot price now, and to this trade's own
-    /// price past fee slack. `dq` is the quote that reached the curve (not a v4 fee). A move too
-    /// small to measure counts the depth at the price, with the lower of the in-range liquidity
-    /// before and after the swap (`liq_before`).
-    fn thin(&self, p: u32, dq: f64, before: f64, spot: (f64, f64), native: f64, liq_before: f64) -> (bool, f64) {
+    /// liquidity is added at the new price afterwards. A concentrated pool's move runs from the
+    /// spot price its last recorded trade left (a swap that exchanged nothing counts as moved by
+    /// this trade). An x·y pool's runs from its reserves before this swap: whatever moved them
+    /// since (a donation, a rebase or a backdoor burn, then a Sync) is backed by the quote
+    /// reserve itself, and a reserve under `MIN_BACKED` makes this trade thin anyway (the cap
+    /// below). `dq` is the quote that reached the curve (not a v4 fee). A move too small to
+    /// measure counts the depth at the price, with the lower of the in-range liquidity before
+    /// and after the swap (`liq_before`).
+    // ponytail: so an x·y pool's price is as real as the quote it holds. Its sole LP can set any
+    // price for free (overpay or donate, then withdraw down to the floor), and only depth under
+    // `MIN_BACKED` at the price stops it ranking.
+    fn thin(&self, p: u32, dq: f64, before: f64, spot: (f64, f64), liq_before: f64) -> (bool, f64) {
         let pool = &self.pools[p as usize];
         let curve = |r: f64| if pool.stable == Some(true) { stable_price(r) } else { r };
         let to = curve(spot.1);
-        let from = if pool.spot.is_finite() {
+        let s0 = curve(spot.0);
+        let ok = |x: f64| x.is_finite() && x > 0.0;
+        let xy = matches!(pool.kind, Kind::V2 | Kind::Solidly);
+        let from = if (xy || !pool.spot.is_finite()) && ok(s0) {
+            s0
+        } else if pool.spot.is_finite() {
             pool.spot
         } else {
-            // Stored before we kept `spot`: the last recorded price, if x·y reserves moved away
-            // from it without a trade (a bare Sync). A concentrated-liquidity price only moves in
-            // swaps, and a v4 pool's last recorded price includes its fee.
-            let (s0, last) = (curve(spot.0), pool.price_native);
-            let ok = |x: f64| x.is_finite() && x > 0.0;
-            let xy = matches!(pool.kind, Kind::V2 | Kind::Solidly);
-            if ok(last) && (!ok(s0) || xy && (last / s0).max(s0 / last) > SPOT_SLACK) { last } else { s0 }
+            // Stored before we kept `spot`, with no price before this swap: the last recorded one.
+            pool.price_native
         };
-        let lo = from.min(to).min(native * SPOT_SLACK);
-        let hi = from.max(to).max(native / SPOT_SLACK);
+        let (lo, hi) = (from.min(to), from.max(to));
         let rel = if hi > lo { (hi / lo).sqrt() - 1.0 } else { 0.0 };
         let mut depth = if rel > 1e-4 {
             self.quote_value(p, dq.abs()) / rel
@@ -634,7 +663,7 @@ impl State {
         };
         // Overpaying moves x·y reserves further than the curve would, which would read as
         // depth; an x·y pool is never deeper than its quote reserve before the trade.
-        if matches!(pool.kind, Kind::V2 | Kind::Solidly) {
+        if xy {
             depth = depth.min(self.quote_value(p, before.max(0.0)));
         }
         if depth.is_nan() || depth < MIN_BACKED {
@@ -688,11 +717,9 @@ impl State {
 }
 
 /// A trade's price, kept within the pool's spot prices (quote per base) before and after it,
-/// give or take fee slack. An x·y pool takes more than its curve asks for and keeps the surplus,
-/// so one trade paying 1,000 USDC for a speck of a token would otherwise set its price a billion
-/// times higher while the reserves barely move. A v4 hook's fee (up to 100%, paid to the LP) and
-/// rounding on a swap of a few wei do the same in concentrated liquidity. `stable`: the stable
-/// curve (x³y + y³x), which prices between the reserve ratio and 1:1.
+/// give or take fee slack: what a swap ending in an empty range records, as its spot price
+/// after sits at the protocol limit. `stable`: the stable curve (x³y + y³x), which prices
+/// between the reserve ratio and 1:1.
 fn clamp_spot(exec: f64, spot: (f64, f64), stable: bool) -> f64 {
     let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
     for r in [spot.0, spot.1].into_iter().filter(|r| r.is_finite() && *r >= 0.0) {
@@ -1009,8 +1036,8 @@ mod tests {
         s.flush(&store, 11).unwrap();
         let mut s = State::load(&store).unwrap();
         s.apply(&buy(80, 1e18, 1e18 / 3e-5), &store); // 1 ETH at $0.09, half of it the fee
-        // The pool's price counts the fee only up to fee slack: $0.045 × 1.05.
-        assert!((s.pools[p as usize].price_usd - 0.04725).abs() < 1e-9, "{}", s.pools[p as usize].price_usd);
+        // The pool's price is where the trade left it, without the fee: $0.045.
+        assert!((s.pools[p as usize].price_usd - 0.045).abs() < 1e-9, "{}", s.pools[p as usize].price_usd);
         let m = crate::pages::metrics(&s, p);
         for w in 0..4 {
             assert!(crate::pages::change(&m, w).abs() < 1e-6, "window {w}: {}", crate::pages::change(&m, w));
@@ -1239,10 +1266,10 @@ mod tests {
         xy(&mut s, st, wq, 10_000.0, 0.0);
         xy(&mut s, st, wq, 1.0, 0.0);
         // J really rises 4× as its USDC doubles, but only $25.2k backs it; Y/J trades flat.
-        xy(&mut s, st, jusdc, 12_600.0, 0.0);
-        xy(&mut s, st, jusdc, 1.0, 0.0);
+        xy_at(&mut s, st, jusdc, 12_600.0, 0.0, 12);
+        xy_at(&mut s, st, jusdc, 1.0, 0.0, 12);
         assert!((s.tokens[1].usd - 0.0504).abs() < 1e-3, "{}", s.tokens[1].usd);
-        wash(&mut s, st, yj, 10.0);
+        wash_at(&mut s, st, yj, 10.0, 13);
         // V/J opens at J's risen price.
         v2_pool(&mut s, st, vj, j, v, 2_000_000.0, 1_000_000.0);
         wash(&mut s, st, vj, 250_000.0);
@@ -1253,10 +1280,11 @@ mod tests {
         v2_pool(&mut s, st, uj2, j2, u, 4_000_000.0, 2_000_000.0);
         wash(&mut s, st, uj2, 500_000.0);
         let r0 = reserves(&s, j2q).0;
-        s.apply(&v2_sync(j2q, r0 * 1e18, r0 / 1e9 * 1e18), st);
-        xy(&mut s, st, j2q, 1.0, 0.0);
+        s.apply(&at(v2_sync(j2q, r0 * 1e18, r0 / 1e9 * 1e18), 12), st);
+        xy_at(&mut s, st, j2q, 1.0, 0.0, 12);
         assert!((s.tokens[3].usd / 1e9 - 1.0).abs() < 1e-3, "{}", s.tokens[3].usd);
-        wash(&mut s, st, uj2, 10.0);
+        // A block later, pairs quoted in J2 trade at that price.
+        wash_at(&mut s, st, uj2, 10.0, 13);
         // Z/USDC: $40k a side, then Z really falls 50% on $11.7k of selling.
         v2_pool(&mut s, st, zusdc, usdc, z, 40_000.0, 40_000.0);
         xy(&mut s, st, zusdc, 1.0, 0.0);
@@ -1275,7 +1303,8 @@ mod tests {
             // J/USDC's own moves were real trading in a stablecoin pair, so it may rank too.
             let gainers: Vec<u32> = list(s, "gainers").into_iter().filter(|p| *p != 0).collect();
             assert_eq!(gainers, vec![4], "only real rises in deep quotes rank");
-            assert_eq!(list(s, "losers"), vec![8], "only Z/USDC's real 50% fall ranks");
+            let losers: Vec<u32> = list(s, "losers").into_iter().filter(|p| *p != 0).collect();
+            assert_eq!(losers, vec![8], "only Z/USDC's real 50% fall ranks");
             // Sorting any list by change, price or FDV ranks pairs quoted in J or J2 last, either way.
             let cols = [("c24h", None), ("c5m", Some("asc")), ("price", None), ("fdv", None), ("price", Some("asc"))];
             for (col, dir) in cols {
@@ -1301,9 +1330,9 @@ mod tests {
         check(&s);
         // J falls back: V/J is down 75%.
         let sold = 1_000_000.0 - reserves(&s, jusdc).1 - 80.0;
-        xy(&mut s, st, jusdc, 0.0, sold);
-        xy(&mut s, st, jusdc, 0.0, 1.0);
-        wash(&mut s, st, vj, 10.0);
+        xy_at(&mut s, st, jusdc, 0.0, sold, 14);
+        xy_at(&mut s, st, jusdc, 0.0, 1.0, 14);
+        wash_at(&mut s, st, vj, 10.0, 15);
         assert!(ch(&s, 5) < -0.7 && m_thin(&s, 5) == 0, "{}", ch(&s, 5));
         check(&s);
         // Stats rebuilt from stored candles rank the same.
@@ -1559,8 +1588,8 @@ mod tests {
                 let m = crate::pages::metrics(s, p);
                 assert!(m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0, "pool {p} passes the list gates");
             }
-            // Each trade's average price: √1.5 and 1/√2 of where they started.
-            assert!((change(s, 0) - 0.2247).abs() < 1e-3 && (change(s, 1) + 0.2929).abs() < 1e-3);
+            // The spot prices the trades left: 1.5 and 0.5 of where they started.
+            assert!((change(s, 0) - 0.5).abs() < 1e-3 && (change(s, 1) + 0.5).abs() < 1e-3);
             assert!(change(s, 2) < 0.11, "the overpay moves J no further than the reserves: {}", change(s, 2));
             assert!(change(s, 3) > 50.0 && change(s, 4) < -0.95, "{} {}", change(s, 3), change(s, 4));
             assert_eq!(lists(s), (vec![0, 2], vec![1]), "Z's and D's thin moves don't rank");
@@ -1644,7 +1673,7 @@ mod tests {
                 let m = crate::pages::metrics(s, p);
                 assert!(m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0, "pool {p} passes the list gates");
             }
-            assert!((change(s, 0) - 0.2247).abs() < 1e-3 && (change(s, 1) + 0.2929).abs() < 1e-3);
+            assert!((change(s, 0) - 0.5).abs() < 1e-3 && (change(s, 1) + 0.5).abs() < 1e-3);
             assert!(change(s, 2) > 1e5, "{}", change(s, 2));
             assert_eq!(lists(s), (vec![0], vec![1]), "J's pump through dust doesn't rank");
         };
@@ -1763,7 +1792,8 @@ mod tests {
     fn cl_thin_pump_counts_after_its_window_rolls() {
         let (store, mut s, dir) = fresh("cl-roll");
         let jp = v3_drained(&mut s, &store, 1e9);
-        // 1 USDC for 0.001 J through dust: spot to $1e6, the trade itself at $1000.
+        // 1 USDC for 0.001 J through dust: spot to $1e6 (the trade's own price, $1000, isn't
+        // where the pool is).
         s.apply(&v3_swap(13, jp, 1e6, -1e15, 1e3, 1e9), &store);
         // Six minutes later: $20k of depth at the new price and a $10k wash.
         s.apply(
@@ -1779,23 +1809,27 @@ mod tests {
         s.apply(&v3_swap(401, jp, 5_000e6, -5e15, 1e3, 2e13 + 1e9), &store);
         s.apply(&v3_swap(402, jp, -5_000e6, 5e15, 1e3, 2e13 + 1e9), &store);
         let m = crate::pages::metrics(&s, 0);
-        assert!(crate::pages::change(&m, 0) > 100.0, "the 5m window opens at the thin trade's price");
+        assert_eq!(crate::pages::change(&m, 0), 0.0, "the 5m window opens where the thin trade left the pool");
         assert_eq!(gated_and_ranked(&s, 0), (true, false));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn v2_move_by_sync_alone_counts_as_unbacked() {
+    fn v2_move_by_sync_in_a_shallow_pool_counts_as_unbacked() {
         let (store, mut s, dir) = fresh("v2-sync");
         let (usdc, j, jp) = (STABLES[0], [12u8; 20], [4u8; 20]);
-        v2_pool(&mut s, &store, jp, usdc, j, 13_000.0, 13_000.0);
+        v2_pool(&mut s, &store, jp, usdc, j, 10_000.0, 10_000.0);
         xy(&mut s, &store, jp, 1.0, 0.0);
-        // J's owner burns 99% of the pair's J (a backdoor, or a rebase) and calls sync(), on a
-        // pool stored before we kept its spot price.
+        // J's owner burns 99% of the pair's J (a backdoor, or a rebase) and calls sync() while the
+        // pool holds k of USDC, under the floor (with more, see the known limit), then adds
+        // k at the new price and wash-trades there.
         s.pools[0].spot = f64::NAN;
         let (r0, r1) = reserves(&s, jp);
         s.apply(&v2_sync(jp, r0 * 1e6, r1 / 100.0 * 1e18), &store);
+        xy(&mut s, &store, jp, 1.0, 0.0);
+        let (r0, r1) = reserves(&s, jp);
+        s.apply(&v2_sync(jp, r0 * 4.0 * 1e6, r1 * 4.0 * 1e18), &store);
         wash(&mut s, &store, jp, 5_000.0);
         assert!(change(&s, 0) > 50.0, "{}", change(&s, 0));
         assert_eq!(gated_and_ranked(&s, 0), (true, false));
@@ -2153,5 +2187,155 @@ mod tests {
         assert_eq!(m_thin(&s, 0), 0);
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn round_trip_records_the_price_the_pool_is_left_at() {
+        // The sole LP of a $13k-a-side USDC/J pool round-trips 130k USDC (a flash loan): the
+        // buy takes J 11×, the sell brings it back, and the sell's average price is far above
+        // where it leaves the pool. Then, an hour on, one tiny trade.
+        for v3 in [false, true] {
+            let (store, mut s, dir) = fresh(if v3 { "rt-v3" } else { "rt-v2" });
+            if v3 {
+                let jp = v3_pool(&mut s, &store);
+                s.apply(&v3_swap(3_700, jp, 1e12, -9.0909e22, 1e6 / 11.0, 1e17), &store);
+                s.apply(&v3_swap(3_700, jp, -1e12, 9.0909e22, 1e6, 1e17), &store);
+                s.apply(&v3_swap(7_300, jp, 1e6, -1e18, 1e6, 1e17), &store);
+            } else {
+                let (usdc, j, jp) = (STABLES[0], [12u8; 20], [4u8; 20]);
+                v2_pool(&mut s, &store, jp, usdc, j, 13_000.0, 13_000.0);
+                xy(&mut s, &store, jp, 1.0, 0.0);
+                wash_at(&mut s, &store, jp, 5_000.0, 12);
+                wash_at(&mut s, &store, jp, 130_000.0, 3_700);
+                let (r0, r1) = reserves(&s, jp);
+                assert!((s.pools[0].price_native / (r0 / r1) - 1.0).abs() < 1e-9);
+                xy_at(&mut s, &store, jp, 1.0, 0.0, 7_300);
+            }
+            let m = crate::pages::metrics(&s, 0);
+            for w in 0..4 {
+                let c = crate::pages::change(&m, w);
+                assert!(c.is_nan() || c.abs() < 1e-3, "v3 {v3} window {w}: {c}");
+            }
+            // The trade rows keep what was paid.
+            s.flush(&store, 7_301).unwrap();
+            let t = &store.trades(0, (u32::MAX, 0), 2)[1].1;
+            assert!(t.price_native > 3.0, "v3 {v3}: {}", t.price_native);
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn quote_round_trip_leaves_no_pair_price_behind() {
+        // X ($200k pricing pool) is flash-pumped through real depth, J/X trades at the peak, and
+        // X is sold back, all in one block. 0: J/X and X traded before; 1: an hour later a tiny
+        // J/X trade; 2: X gets its first price in that block.
+        for case in 0..3 {
+            let (store, mut s, dir) = fresh(&format!("qrt{case}"));
+            let (usdc, x, j) = (STABLES[0], [10u8; 20], [12u8; 20]);
+            let (xp, jxp) = ([2u8; 20], [3u8; 20]);
+            let st = &store;
+            v2_pool(&mut s, st, xp, usdc, x, 200_000.0, 200_000.0);
+            if case < 2 {
+                xy(&mut s, st, xp, 1.0, 0.0);
+            }
+            v2_pool(&mut s, st, jxp, x, j, 20_000.0, 20_000.0);
+            if case < 2 {
+                xy(&mut s, st, jxp, 1.0, 0.0);
+                wash_at(&mut s, st, jxp, 6_000.0, 13);
+            }
+            let before = s.pools[1].price_usd;
+            let x0 = reserves(&s, xp).1;
+            xy_at(&mut s, st, xp, 432_000.0, 0.0, 50);
+            assert!(s.tokens[1].usd > 3.0);
+            xy_at(&mut s, st, jxp, 1.0, 0.0, 50);
+            let bought = x0 - reserves(&s, xp).1;
+            xy_at(&mut s, st, xp, 0.0, bought, 50);
+            xy_at(&mut s, st, xp, 1.0, 0.0, 50);
+            let ju = s.pools[1].price_usd;
+            assert!(
+                if case < 2 { (ju / before - 1.0).abs() < 0.01 } else { ju.is_nan() },
+                "case {case}: {before} -> {ju}"
+            );
+            if case > 0 {
+                wash_at(&mut s, st, jxp, 6_000.0, 60);
+                xy_at(&mut s, st, jxp, 1.0, 0.0, 3_700);
+            }
+            assert!((s.tokens[1].usd - 1.0).abs() < 0.01);
+            let m = crate::pages::metrics(&s, 1);
+            assert!(m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0, "case {case} passes the list gates");
+            for w in 0..4 {
+                let c = crate::pages::change(&m, w);
+                assert!(c.is_nan() || c.abs() < 0.01, "case {case} window {w}: {c}");
+            }
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn donation_into_a_deep_pool_is_no_thin_move() {
+        // Someone donates 0.03% of a deep pool's J (~$150 to its LPs), calls sync() and swaps
+        // 1 USDC. 0: the $1M J/USDC pool itself; 1: X's $2M pricing pool, then J/X trades.
+        for on_quote in [false, true] {
+            let (store, mut s, dir) = fresh(if on_quote { "donate-q" } else { "donate" });
+            let (usdc, x, j) = (STABLES[0], [10u8; 20], [12u8; 20]);
+            let (xp, jxp) = ([2u8; 20], [3u8; 20]);
+            let st = &store;
+            let (pool, p) = if on_quote {
+                v2_pool(&mut s, st, xp, usdc, x, 1_000_000.0, 1_000_000.0);
+                xy(&mut s, st, xp, 1.0, 0.0);
+                v2_pool(&mut s, st, jxp, x, j, 50_000.0, 50_000.0);
+                xy(&mut s, st, jxp, 1.0, 0.0);
+                wash_at(&mut s, st, jxp, 6_000.0, 12);
+                xy_at(&mut s, st, jxp, 3_000.0, 0.0, 13);
+                (xp, 1)
+            } else {
+                v2_pool(&mut s, st, xp, usdc, j, 500_000.0, 500_000.0);
+                xy(&mut s, st, xp, 1.0, 0.0);
+                xy_at(&mut s, st, xp, 20_000.0, 0.0, 12);
+                (xp, 0)
+            };
+            assert_eq!(gated_and_ranked(&s, p), (true, true));
+            let (r0, r1) = reserves(&s, pool);
+            s.apply(&at(v2_sync(pool, r0 * 1e6, r1 * 1.0003 * 1e18), 20), st);
+            xy_at(&mut s, st, pool, 1.0, 0.0, 20);
+            if on_quote {
+                assert_eq!(s.tokens[1].thin_ts, 0);
+                xy_at(&mut s, st, jxp, 3_000.0, 0.0, 30);
+            }
+            assert_eq!((m_thin(&s, p), gated_and_ranked(&s, p)), (0, (true, true)), "on quote {on_quote}");
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn known_limit_a_sole_lp_moves_an_x_y_pool_with_the_floor_parked() {
+        // Not a goal, a documented ceiling (`thin`): an x·y pool's price is as real as the quote
+        // it holds. Its sole LP, with $13k of USDC a side, flash-overpays 130k USDC for a speck
+        // of J (or donates 130k J) and withdraws 90%: J is 11× (or 1/11) with $14.3k (or $13k)
+        // of USDC behind it, and that ranks.
+        for up in [true, false] {
+            let (store, mut s, dir) = fresh(if up { "limit-up" } else { "limit-down" });
+            let (usdc, j, jp) = (STABLES[0], [12u8; 20], [4u8; 20]);
+            v2_pool(&mut s, &store, jp, usdc, j, 13_000.0, 13_000.0);
+            xy(&mut s, &store, jp, 1.0, 0.0);
+            wash_at(&mut s, &store, jp, 1_000.0, 12);
+            let (r0, r1) = reserves(&s, jp);
+            if up {
+                s.apply(&at(v2_sync(jp, (r0 + 130_000.0) * 1e6, (r1 - 1e-6) * 1e18), 3_700), &store);
+                s.apply(&at(v2_swap(jp, 130_000e6, 0.0, 0.0, 1e12), 3_700), &store);
+                let (r0, r1) = reserves(&s, jp);
+                s.apply(&at(v2_sync(jp, r0 * 0.1 * 1e6, r1 * 0.1 * 1e18), 3_700), &store);
+            } else {
+                s.apply(&at(v2_sync(jp, r0 * 1e6, r1 * 11.0 * 1e18), 3_700), &store);
+            }
+            wash_at(&mut s, &store, jp, 4_000.0, 3_800);
+            let c = change(&s, 0);
+            assert!(if up { c > 9.0 } else { c < -0.9 }, "up {up}: {c}");
+            assert_eq!((m_thin(&s, 0), gated_and_ranked(&s, 0)), (0, (true, true)), "up {up}");
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
