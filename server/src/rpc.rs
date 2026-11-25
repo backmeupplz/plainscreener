@@ -106,6 +106,9 @@ impl Rpc {
         for chunk in hashes.chunks(200) {
             let calls = chunk.iter().map(|h| ("eth_getTransactionByHash", json!([hex(h)]))).collect();
             for (h, tx) in chunk.iter().zip(self.batch(calls).await?) {
+                // ponytail: a sender the node can't serve is the zero address, which costs that
+                // swap its wallet in `lists::MIN_MAKERS`; failing the range instead could stall
+                // catch-up on a pruned node for good.
                 senders.insert(*h, addr20(&tx["from"]).unwrap_or_default());
             }
         }

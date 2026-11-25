@@ -52,6 +52,16 @@ const AGE: [(u64, &str); 6] = [(0, "Any"), (1, "1h"), (6, "6h"), (24, "24h"), (7
 /// 24 h volume beyond this many times the liquidity is fake prices, not trading: real pairs
 /// peak around 100x (a USDT/USDC pool). ponytail: fixed bound, tune if busy pairs vanish.
 const MAX_TURNOVER: f64 = 1_000.0;
+/// Wallets that must have swapped in a pool within the window for its move to rank on Gainers
+/// and Losers. A pool's sole LP can move its price through depth it owns and get the capital
+/// back: buy, then burn its LP (one flash-loan transaction), or buy in one block and sell back
+/// in the next so a window opens at the peak. No depth check tells that from a real move, since
+/// the depth is real; the number of wallets behind the window's swaps does.
+// ponytail: a Sybil bar, not a proof. `MIN_MAKERS` wallets trading $1 each cost only gas, and
+// bots or bundlers sharing one sender count once, as do two wallets sharing a bit (`maker_bit`;
+// ~5% of three), so a quiet pool's real 5m move can miss it.
+// Weigh makers by volume, or count LPs, if prod shows abuse or misses.
+pub const MIN_MAKERS: u32 = 3;
 
 /// A list as the URL describes it.
 #[derive(Deserialize, Default, Clone, PartialEq, Eq, Hash)]
@@ -136,12 +146,14 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
             let score = match tab {
                 Tab::Trending if m.liq >= 10_000.0 => m.w[w].vol,
                 Tab::Top if m.liq >= 10_000.0 => m.w[3].vol,
-                // A move made through little depth (see `Candle::thin`) doesn't rank, nor a USD
-                // price its quote token has since left behind (`State::usd_current`).
+                // A move made through little depth (see `Candle::thin`) or by too few wallets
+                // (`MIN_MAKERS`) doesn't rank, nor a USD price its quote token has since left
+                // behind (`State::usd_current`).
                 Tab::Gainers | Tab::Losers
                     if m.liq >= 25_000.0
                         && m.w[3].vol >= 10_000.0
                         && m.w[w].thin == 0
+                        && m.w[w].makers.count_ones() >= MIN_MAKERS
                         && st.deep_quote(pool.quote())
                         && st.usd_current(p) =>
                 {
@@ -169,10 +181,10 @@ pub fn ranked(st: &State, f: &Filter) -> Vec<u32> {
 /// `State::deep_quote`): whoever mints that token sets its USD price, and so all three.
 /// A junk *base* in a deep quote token's pool is not gated: an overpaying trade, or its sole
 /// LP seeding the pool lopsided, sets its price (and so its FDV and change) to anything, and
-/// it can top those sorts. Nothing in the pool's own prices tells that from a real price; only
-/// a depth floor would, and Gainers' ($25k liquidity, $10k 24 h volume) would demote most of
-/// New (its own floor is $5k) while that LP clears it with ~$12.5k of quote it gets back, plus
-/// trading in its own pool.
+/// it can top those sorts. Nothing in the pool's own prices tells that from a real price.
+/// Gainers' gates only raise the cost: their floor ($25k liquidity, $10k 24 h volume) would
+/// demote most of New (its own floor is $5k), while that LP clears it with ~$12.5k of quote it
+/// gets back plus trading in its own pool, and `MIN_MAKERS` with as many wallets.
 pub fn sort(st: &State, f: &Filter, pools: &mut [u32]) {
     let Some(col) = f.sort.as_deref().filter(|c| COLS.iter().any(|(k, _)| k == c)) else { return };
     let asc = f.dir.as_deref() == Some("asc");

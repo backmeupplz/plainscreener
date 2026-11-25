@@ -157,6 +157,15 @@ pub struct Candle {
     pub sells: u32,
     /// Swaps that moved the price with little depth behind it (see `State::trade`).
     pub thin: u32,
+    /// The wallets that swapped, one bit each (see `maker_bit`); 0 in records stored before.
+    pub makers: u64,
+}
+
+/// A wallet's bit in a set of makers: distinct wallets mostly set distinct bits, so a set's
+/// bit count is a lower bound on how many wallets traded. Persisted, so not a std hasher.
+/// The zero address (sender unknown) is no wallet.
+pub fn maker_bit(a: &Addr) -> u64 {
+    if *a == [0; 20] { 0 } else { 1 << (a[19] % 64) }
 }
 
 impl Candle {
@@ -164,7 +173,7 @@ impl Candle {
         let (u, n) = (usd as f32, native as f32);
         Candle { o: u, h: u, l: u, c: u, no: n, nh: n, nl: n, nc: n, ..Default::default() }
     }
-    pub fn add(&mut self, usd: f64, native: f64, vol: f64, buy: bool, thin: bool) {
+    pub fn add(&mut self, usd: f64, native: f64, vol: f64, buy: bool, thin: bool, maker: u64) {
         let (u, n) = (usd as f32, native as f32);
         self.h = self.h.max(u);
         self.l = self.l.min(u);
@@ -181,6 +190,7 @@ impl Candle {
             self.sells += 1
         }
         self.thin += thin as u32;
+        self.makers |= maker;
     }
 }
 
@@ -221,6 +231,7 @@ pub struct Bucket {
     pub buys: u32,
     pub sells: u32,
     pub thin: u32,
+    pub makers: u64,
 }
 
 /// Totals over a window ending now.
@@ -231,6 +242,8 @@ pub struct Window {
     pub sells: u32,
     /// Thin swaps (see `Candle::thin`).
     pub thin: u32,
+    /// Wallets that swapped (see `maker_bit`).
+    pub makers: u64,
     /// Price at the start of the window, if anything traded in it.
     pub open: f64,
 }
@@ -241,14 +254,14 @@ impl Stats {
     }
 
     /// Adds a trade. `open` is the price before it (start of a new bucket).
-    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool, thin: bool) {
+    pub fn add(&mut self, ts: u32, open: f64, vol: f64, buy: bool, thin: bool, maker: u64) {
         for (ring, len) in [(&mut self.m[..], 60), (&mut self.h[..], 3600)] {
             let t = ts - ts % len;
             let b = &mut ring[(t / len) as usize % ring.len()];
             if b.t != t {
                 *b = Bucket { t, open: open as f32, ..Default::default() };
             }
-            b.bump(vol, buy, thin);
+            b.bump(vol, buy, thin, maker);
         }
     }
 
@@ -256,7 +269,8 @@ impl Stats {
     pub fn restore(&mut self, res: u32, t: u32, c: &Candle) {
         let ring = if res == 60 { &mut self.m[..] } else { &mut self.h[..] };
         let n = ring.len();
-        ring[(t / res) as usize % n] = Bucket { t, open: c.o, vol: c.v, buys: c.buys, sells: c.sells, thin: c.thin };
+        ring[(t / res) as usize % n] =
+            Bucket { t, open: c.o, vol: c.v, buys: c.buys, sells: c.sells, thin: c.thin, makers: c.makers };
     }
 
     /// Activity in the last `secs` seconds (5 min and 1 h use minutes, longer windows hours).
@@ -270,6 +284,7 @@ impl Stats {
             w.buys += b.buys;
             w.sells += b.sells;
             w.thin += b.thin;
+            w.makers |= b.makers;
             if b.t < first {
                 first = b.t;
                 w.open = b.open as f64;
@@ -284,7 +299,7 @@ impl Stats {
 }
 
 impl Bucket {
-    fn bump(&mut self, vol: f64, buy: bool, thin: bool) {
+    fn bump(&mut self, vol: f64, buy: bool, thin: bool, maker: u64) {
         if vol.is_finite() {
             self.vol += vol as f32;
         }
@@ -294,6 +309,7 @@ impl Bucket {
             self.sells += 1
         }
         self.thin += thin as u32;
+        self.makers |= maker;
     }
 }
 
@@ -467,6 +483,7 @@ impl Candle {
             .u32(self.buys)
             .u32(self.sells)
             .u32(self.thin)
+            .bytes(&self.makers.to_le_bytes())
             .0
     }
     pub fn decode(b: &[u8]) -> Candle {
@@ -484,6 +501,7 @@ impl Candle {
             buys: r.u32(),
             sells: r.u32(),
             thin: r.u32(),
+            makers: u64::from_le_bytes(r.arr()),
         }
     }
 }
@@ -547,21 +565,23 @@ mod tests {
         };
         let d = Token::decode(&t.encode());
         assert_eq!((d.symbol.as_str(), d.decimals, d.best_pool, d.first_block), ("USDC", 6, 7, 9));
-        let c = Candle { o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 10.0, buys: 3, sells: 4, ..Default::default() };
+        let c = Candle { o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 10.0, buys: 3, sells: 4, makers: 5, ..Default::default() };
         assert_eq!(Candle::decode(&c.encode()), c);
+        assert_eq!((maker_bit(&[0; 20]), maker_bit(&[1; 20])), (0, 2), "the zero address is no wallet");
     }
 
     #[test]
     fn stats_windows() {
         let mut s = Stats::new();
         let now = 1_800_001_800; // half past an hour
-        s.add(now - 7200, 1.0, 100.0, true, true); // two hours ago
-        s.add(now - 120, 2.0, 50.0, false, false); // two minutes ago
-        s.add(now, 3.0, 25.0, true, false);
+        s.add(now - 7200, 1.0, 100.0, true, true, 1); // two hours ago
+        s.add(now - 120, 2.0, 50.0, false, false, 2); // two minutes ago
+        s.add(now, 3.0, 25.0, true, false, 2);
         let w5 = s.window(now, 300);
         assert_eq!((w5.vol, w5.buys, w5.sells, w5.open), (75.0, 1, 1, 2.0));
         let w24 = s.window(now, 86_400);
         assert_eq!((w24.vol, w24.buys + w24.sells, w24.open), (175.0, 3, 1.0));
         assert_eq!((w5.thin, w24.thin), (0, 1));
+        assert_eq!((w5.makers, w24.makers), (2, 3));
     }
 }

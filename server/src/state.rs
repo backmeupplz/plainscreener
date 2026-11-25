@@ -2,7 +2,7 @@
 //! The indexer applies logs in chain order and flushes changes to the store in batches.
 
 use crate::abi::{self, Addr, Event, Id, Kind, RawLog, WETH, hex20};
-use crate::model::{Candle, Pool, RES, Stats, Token, Trade, TradeKind};
+use crate::model::{Candle, Pool, RES, Stats, Token, Trade, TradeKind, maker_bit};
 use crate::store::{Store, candle_key, trade_key};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -564,11 +564,11 @@ impl State {
                 }
                 *entry = (t, c);
             }
-            entry.1.add(usd, native, vol, buy, thin);
+            entry.1.add(usd, native, vol, buy, thin, maker_bit(&log.from));
             self.dirty_candles.insert((p, ri));
         }
         let open = if open_usd.is_finite() && open_usd > 0.0 { open_usd } else { usd };
-        self.stats.entry(p).or_insert_with(Stats::new).add(ts, open, vol, buy, thin);
+        self.stats.entry(p).or_insert_with(Stats::new).add(ts, open, vol, buy, thin, maker_bit(&log.from));
 
         let pool = &mut self.pools[p as usize];
         pool.price_native = native;
@@ -802,7 +802,16 @@ mod tests {
     }
 
     fn log(block: u32, address: Addr, topics: Vec<[u8; 32]>, data: Vec<u8>) -> RawLog {
-        RawLog { block, ts: 1_794_992_700 + block, address, topics, data, ..Default::default() }
+        RawLog { block, ts: 1_794_992_700 + block, address, topics, data, from: wallet(), ..Default::default() }
+    }
+
+    /// A new sender for each log, unless a test pins one (`xy_by`): a test's trades come from
+    /// many wallets (`lists::MIN_MAKERS`).
+    fn wallet() -> Addr {
+        thread_local!(static N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+        let mut a = [0xAA; 20];
+        a[16..].copy_from_slice(&N.with(|n| n.replace(n.get() + 1)).to_be_bytes());
+        a
     }
 
     fn meta(symbol: &str, decimals: u8) -> Meta {
@@ -845,11 +854,17 @@ mod tests {
     /// An x·y trade paying in `in0` of token0 or `in1` of token1 (whole tokens) at `block`,
     /// Sync first as on chain.
     fn xy_at(s: &mut State, store: &Store, pool: Addr, in0: f64, in1: f64, block: u32) {
+        xy_by(s, store, pool, in0, in1, block, wallet())
+    }
+
+    /// `xy_at`, sent by `from`.
+    fn xy_by(s: &mut State, store: &Store, pool: Addr, in0: f64, in1: f64, block: u32, from: Addr) {
         let p = &s.pools[s.pool_ix[&pad(&pool)] as usize];
         let (r0, r1, s0, s1) = (p.bal0, p.bal1, s.scale(p.token0), s.scale(p.token1));
         let (out0, out1) = if in0 > 0.0 { (0.0, r1 * in0 / (r0 + in0)) } else { (r0 * in1 / (r1 + in1), 0.0) };
-        s.apply(&at(v2_sync(pool, (r0 + in0 - out0) * s0, (r1 + in1 - out1) * s1), block), store);
-        s.apply(&at(v2_swap(pool, in0 * s0, in1 * s1, out0 * s0, out1 * s1), block), store);
+        let by = |l: RawLog| RawLog { from, ..at(l, block) };
+        s.apply(&by(v2_sync(pool, (r0 + in0 - out0) * s0, (r1 + in1 - out1) * s1)), store);
+        s.apply(&by(v2_swap(pool, in0 * s0, in1 * s1, out0 * s0, out1 * s1)), store);
     }
 
     fn wash(s: &mut State, store: &Store, pool: Addr, q: f64) {
@@ -1582,7 +1597,7 @@ mod tests {
             s.apply(&sync(pool, (r0 - out) * 1e6, (r1 + b) * 1e18), &store);
             s.apply(&swap(pool, 0.0, b * 1e18, out * 1e6, 0.0), &store);
         };
-        // Pools 0..5: W, L, J, Z and D against USDC, each opened with a $1 trade.
+        // Pools 0..5: W, L, J, Z and D against USDC, each opened with two $1 trades.
         let pools = [[2u8; 20], [3u8; 20], [4u8; 20], [5u8; 20], [6u8; 20]];
         let (wp, lp, jp, zp, dp) = (pools[0], pools[1], pools[2], pools[3], pools[4]);
         for ((pool, t), (r0, r1)) in pools.iter().zip([w, l, j, z, d]).zip([
@@ -1596,6 +1611,7 @@ mod tests {
             data.extend(word(1.0));
             s.apply(&log(10, uniswap, vec![T.v2_pair_created, pad(&usdc), pad(&t)], data), &store);
             s.apply(&sync(*pool, r0 * 1e6, r1 * 1e18), &store);
+            buy(&mut s, *pool, 1.0);
             buy(&mut s, *pool, 1.0);
         }
         // W's spot price really rises 50% and L's really falls 50%, through $100k of depth.
@@ -1682,13 +1698,15 @@ mod tests {
         let full = (-887_220.0, 887_220.0);
         let (wp, lp, jp) = ([2u8; 20], [3u8; 20], [4u8; 20]);
         // W/USDC (USDC is token0) and L/USDC (USDC is token1): $100k a side over the full range,
-        // L = 1e17, both tokens at $1.
+        // L = 1e17, both tokens at $1, each traded $1 twice.
         s.apply(&created(wp, usdc, w), &store);
         s.apply(&mint(wp, full.0, full.1, 1e17, 100_000e6, 100_000e18), &store);
-        s.apply(&swap(wp, 1e6, -1e18, 1e6, 1e17), &store);
         s.apply(&created(lp, l, usdc), &store);
         s.apply(&mint(lp, full.0, full.1, 1e17, 100_000e18, 100_000e6), &store);
-        s.apply(&swap(lp, -1e18, 1e6, 1e-6, 1e17), &store);
+        for _ in 0..2 {
+            s.apply(&swap(wp, 1e6, -1e18, 1e6, 1e17), &store);
+            s.apply(&swap(lp, -1e18, 1e6, 1e-6, 1e17), &store);
+        }
         assert!(
             (s.liq(0) - 200_000.0).abs() < 10.0 && (s.liq(1) - 200_000.0).abs() < 10.0,
             "{} {}",
@@ -1729,6 +1747,60 @@ mod tests {
         assert!(s.liq(2) < 10.0, "{}", s.liq(2));
         drop(store);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The sole LP of a $13.5k-a-side pool flash-borrows 30k USDC, buys J through its own depth,
+    /// burns 69% of its LP pro rata (no price change) and repays from the burn: a 10x move backed
+    /// by real depth, one wallet's. Another wallet's $1 trade after it doesn't make it rank; it
+    /// takes `lists::MIN_MAKERS` wallets (the Sybil ceiling noted there).
+    #[test]
+    fn sole_lp_flash_buy_then_burn_needs_more_wallets_to_rank() {
+        for strangers in 0..3u32 {
+            let (store, mut s, dir) = fresh("burn");
+            let (usdc, j, jp, me) = (STABLES[0], [12u8; 20], [4u8; 20], [0xEE; 20]);
+            v2_pool(&mut s, &store, jp, usdc, j, 13_500.0, 13_500.0);
+            xy_by(&mut s, &store, jp, 1.0, 0.0, 11, me);
+            xy_by(&mut s, &store, jp, 30_000.0, 0.0, 100, me);
+            let (r0, r1) = reserves(&s, jp);
+            let keep = 1.0 - 30_000.0 / r0;
+            s.apply(&at(v2_sync(jp, r0 * keep * 1e6, r1 * keep * 1e18), 100), &store);
+            xy_by(&mut s, &store, jp, 1.0, 0.0, 200, me);
+            for i in 0..strangers {
+                xy_at(&mut s, &store, jp, 1.0, 0.0, 201 + i);
+            }
+            assert!(change(&s, 0) > 9.0 && m_thin(&s, 0) == 0, "{}", change(&s, 0));
+            assert_eq!(gated_and_ranked(&s, 0), (true, strangers == 2), "{strangers} other wallets");
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The sole LP of a $13k-a-side pool buys 28k USDC worth in the last block of a minute and
+    /// sells it all back in the first block of the next: four minutes later the 5m window opens
+    /// at the peak, −90%, with no thin trade. One wallet's doing, so it doesn't rank.
+    #[test]
+    fn sole_lp_round_trip_across_a_bucket_needs_more_wallets_to_rank() {
+        use crate::lists::{Filter, ranked};
+        for strangers in 0..3u32 {
+            let (store, mut s, dir) = fresh("2block");
+            let (usdc, j, jp, me) = (STABLES[0], [12u8; 20], [4u8; 20], [0xEE; 20]);
+            v2_pool(&mut s, &store, jp, usdc, j, 13_000.0, 13_000.0);
+            xy_by(&mut s, &store, jp, 1.0, 0.0, 11, me);
+            let r1 = reserves(&s, jp).1;
+            xy_by(&mut s, &store, jp, 28_000.0, 0.0, 3_659, me);
+            let bought = r1 - reserves(&s, jp).1;
+            xy_by(&mut s, &store, jp, 0.0, bought, 3_660, me);
+            for i in 0..strangers {
+                xy_at(&mut s, &store, jp, 1.0, 0.0, 3_900 + i);
+            }
+            xy_by(&mut s, &store, jp, 1.0, 0.0, 3_920, me);
+            let m = crate::pages::metrics(&s, 0);
+            assert!(crate::pages::change(&m, 0) < -0.85 && m.w[0].thin == 0);
+            let f = Filter { tab: Some("losers".into()), w: Some("5m".into()), ..Default::default() };
+            assert_eq!(ranked(&s, &f).contains(&0), strangers == 2, "{strangers} other wallets");
+            drop(store);
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// Whether pool `p` would pass the Gainers/Losers gates on liquidity and volume, and whether
@@ -2029,6 +2101,9 @@ mod tests {
         let c = Candle { thin: 2, ..Default::default() };
         assert_eq!(Candle::decode(&c.encode()).thin, 2);
         assert_eq!(Candle::decode(&c.encode()[..44]).thin, 0);
+        let c = Candle { makers: 6, ..Default::default() };
+        assert_eq!(Candle::decode(&c.encode()).makers, 6);
+        assert_eq!(Candle::decode(&c.encode()[..48]).makers, 0);
     }
 
     #[test]
@@ -2046,21 +2121,25 @@ mod tests {
         let init = vec![word(fee), word(1.0), word(0.0), word(1e6 * Q96), word(276_324.0)];
         s.apply(&pm(10, T.v4_initialize, init), &store);
         s.apply(&pm(10, T.v4_modify, vec![iword(-887_220.0), word(887_220.0), word(2e11), word(0.0)]), &store);
-        let sw = |b: u32, usdc_in: f64, j_out: f64, sqrt: f64| {
-            let data = vec![iword(-usdc_in), iword(j_out), word(sqrt * Q96), word(2e11), tick_at(sqrt), word(fee)];
+        let sw = |b: u32, usdc_in: f64, j_out: f64, sqrt: f64, l: f64| {
+            let data = vec![iword(-usdc_in), iword(j_out), word(sqrt * Q96), word(l), tick_at(sqrt), word(fee)];
             pm(b, T.v4_swap, data)
         };
-        s.apply(&sw(10, 0.01e6, 1e10, 1e6 * (1.0 - 1e-9)), &store);
+        s.apply(&sw(10, 0.01e6, 1e10, 1e6 * (1.0 - 1e-9), 2e11), &store);
         let b = 10 + 90_000;
-        s.apply(&sw(b, 120_000e6, 1.8e17, 1e5), &store);
+        s.apply(&sw(b, 120_000e6, 1.8e17, 1e5, 2e11), &store);
         // Real depth arrives at the new price afterwards: ±10k ticks, L = 6e15.
         let tick = (2.0 * (1e5f64).ln() / 1.0001f64.ln()).floor();
         s.apply(
             &pm(b + 1, T.v4_modify, vec![iword(tick - 10_000.0), iword(tick + 10_000.0), word(6e15), word(0.0)]),
             &store,
         );
+        // Two more wallets trade dust, so only the thin move keeps it off the lists.
+        s.apply(&sw(b + 2, 100.0, 1.0, 1e5, 6e15 + 2e11), &store);
+        s.apply(&sw(b + 3, 100.0, 1.0, 1e5, 6e15 + 2e11), &store);
         let m = crate::pages::metrics(&s, 0);
         assert!(m.liq >= 25_000.0 && m.w[3].vol >= 10_000.0 && change(&s, 0) > 50.0);
+        assert!(m.w[3].makers.count_ones() >= crate::lists::MIN_MAKERS);
         assert!(m.w[3].thin > 0);
         assert_eq!(gated_and_ranked(&s, 0), (true, false));
         drop(store);
@@ -2326,6 +2405,7 @@ mod tests {
         v2_pool(&mut s, &store, jp, usdc, j, 500_000.0, 500_000.0);
         xy(&mut s, &store, jp, 1.0, 0.0);
         xy_at(&mut s, &store, jp, 20_000.0, 0.0, 12);
+        xy_at(&mut s, &store, jp, 1.0, 0.0, 12);
         assert_eq!(gated_and_ranked(&s, 0), (true, true));
         let (r0, r1) = reserves(&s, jp);
         s.apply(&at(v2_sync(jp, r0 * 1e6, r1 * 1.0003 * 1e18), 20), &store);
